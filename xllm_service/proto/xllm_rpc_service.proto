@@ -61,11 +61,31 @@ message LatencyMetrics {
   map<string, ModelLatencyMetrics> model_metrics = 1;
 }
 
+// A single weight segment in GlobalXtensor
+message WeightSegmentInfo {
+  uint64 offset = 1; // Byte offset from GlobalXtensor base
+  uint64 size = 2;   // Segment size in bytes
+}
+
+// List of weight segments for a model
+message WeightSegmentList {
+  repeated WeightSegmentInfo segments = 1;
+}
+
+// XTensor info for heartbeat updates
+message XTensorHeartbeatInfo {
+  // Per-worker free physical pages (index = worker rank)
+  repeated uint64 worker_free_phy_pages = 1;
+  // Model weight segments in GlobalXtensor (key: model_id)
+  map<string, WeightSegmentList> model_weight_segments = 2;
+}
+
 message HeartbeatRequest {
   string name = 1;
   KvCacheEvent cache_event = 2;
   LoadMetrics load_metrics = 3;
   LatencyMetrics latency_metrics = 4;
+  XTensorHeartbeatInfo xtensor_info = 5; // XTensor memory info
 }
 
 message InstanceID {

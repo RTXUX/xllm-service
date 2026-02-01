@@ -1245,20 +1245,31 @@ std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::str
 }
 
 // Select models to evict out >= required_space, meanwhile minimizing sum(heat)
-EvictionPlanInfo InstanceMgr::select_eviction_candidates(const std::string& instance_name, 
-                                                         double required_space) {    
+// and considering memory fragmentation when XTensor info is available
+EvictionPlanInfo InstanceMgr::select_eviction_candidates(const std::string& instance_name,
+                                                         double required_space) {
 
-  // Get all awake models on this instance
+  // 1. Try to get XTensor info for fragmentation-aware eviction
+  std::optional<InstanceXTensorInfo> xtensor_info;
+  {
+    std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
+    auto it = instance_xtensor_infos_.find(instance_name);
+    if (it != instance_xtensor_infos_.end()) {
+      xtensor_info = it->second;
+    }
+  }
+
+  // 2. Get all awake models on this instance
   std::vector<std::string> awake_models;
-  
+
   // Iterate all models to check status on this instance
   std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
   for (const auto& pair : model_instance_mgrs_) {
     const std::string& model_id = pair.first;
     auto model_mgr = pair.second;
-    
+
     ModelState state = model_mgr->get_model_state(instance_name);
-    
+
     if (state == ModelState::WAKEUP) {
       if (model_mgr->get_wakeup_count() > 1) {
         awake_models.push_back(model_id);
@@ -1270,47 +1281,132 @@ EvictionPlanInfo InstanceMgr::select_eviction_candidates(const std::string& inst
       }
     }
   }
+  mgr_lock.unlock();
 
-  // take snapshot of the current model heats
+  // 3. Take snapshot of the current model heats
   std::vector<uint64_t> awake_model_heats;
   for (const auto& model_id : awake_models) {
     auto model_mgr = get_model_instance_mgr(model_id);
     awake_model_heats.push_back(model_mgr->get_model_heat());
   }
 
-  // Select models to evict enough space for the new model, meanwhile minimizing sum(heat)
+  // 4. Exhaustive search for the optimal eviction set
+  uint64_t required_bytes = static_cast<uint64_t>(required_space * 1024 * 1024 * 1024);
   uint64_t min_sum_heat = std::numeric_limits<uint64_t>::max();
+  uint64_t best_contiguous_space = 0;
   size_t best_subset = 0;
-  for (size_t subset = 0; subset < 1 << awake_models.size(); ++subset) {
+
+  for (size_t subset = 1; subset < (1ULL << awake_models.size()); ++subset) {
     double current_sum_space = 0;
     uint64_t current_sum_heat = 0;
+    std::vector<std::string> current_evict_models;
+
     for (size_t i = 0; i < awake_models.size(); ++i) {
-      if (subset & (1 << i)) {
+      if (subset & (1ULL << i)) {
         current_sum_space += get_model_memory_size(awake_models[i]);
         current_sum_heat += awake_model_heats[i];
+        current_evict_models.push_back(awake_models[i]);
       }
     }
-    if (current_sum_space >= required_space && 
-        current_sum_heat < min_sum_heat) {
-      min_sum_heat = current_sum_heat;
-      best_subset = subset;
+
+    // Basic condition: freed space must be sufficient
+    if (current_sum_space < required_space) {
+      continue;
+    }
+
+    // If we have XTensor info, check if contiguous space is sufficient
+    if (xtensor_info.has_value()) {
+      uint64_t contiguous_space = compute_max_contiguous_free_space(
+          xtensor_info.value(),
+          current_evict_models,
+          static_cast<uint64_t>(kMaxInstanceMemoryGB * 1024 * 1024 * 1024));
+
+      if (contiguous_space < required_bytes) {
+        continue;  // Contiguous space not enough, skip this plan
+      }
+
+      // Optimization goal: 1. Satisfy contiguous space requirement 2. Minimize heat
+      // If heat is the same, prefer the plan with larger contiguous space
+      if (current_sum_heat < min_sum_heat ||
+          (current_sum_heat == min_sum_heat &&
+           contiguous_space > best_contiguous_space)) {
+        min_sum_heat = current_sum_heat;
+        best_contiguous_space = contiguous_space;
+        best_subset = subset;
+      }
+    } else {
+      // No XTensor info, fallback to original logic (heat-only)
+      if (current_sum_heat < min_sum_heat) {
+        min_sum_heat = current_sum_heat;
+        best_subset = subset;
+      }
     }
   }
 
+  // 5. Build result
   if (best_subset == 0) {
-    return EvictionPlanInfo();// Cannot free enough space even if we evict everything
+    return EvictionPlanInfo();  // Cannot find a valid plan
   }
 
   EvictionPlanInfo best_plan;
   best_plan.instance_name = instance_name;
   best_plan.heat_sum = min_sum_heat;
   for (size_t i = 0; i < awake_models.size(); ++i) {
-    if (best_subset & (1 << i)) {
+    if (best_subset & (1ULL << i)) {
       best_plan.models_to_evict.push_back(awake_models[i]);
     }
   }
 
   return best_plan;
+}
+
+// Compute the maximum contiguous free space after evicting specified models
+uint64_t InstanceMgr::compute_max_contiguous_free_space(
+    const InstanceXTensorInfo& xtensor_info,
+    const std::vector<std::string>& models_to_evict,
+    uint64_t total_memory_bytes) {
+
+  // Collect all remaining model segments (models NOT being evicted)
+  std::vector<WeightSegment> remaining_segments;
+  std::unordered_set<std::string> evict_set(
+      models_to_evict.begin(), models_to_evict.end());
+
+  for (const auto& [model_id, segments] : xtensor_info.model_weight_segments) {
+    if (evict_set.find(model_id) == evict_set.end()) {
+      for (const auto& seg : segments) {
+        remaining_segments.push_back(seg);
+      }
+    }
+  }
+
+  // Sort by offset
+  std::sort(remaining_segments.begin(), remaining_segments.end(),
+            [](const WeightSegment& a, const WeightSegment& b) {
+              return a.offset < b.offset;
+            });
+
+  // Compute all free gaps, find the maximum
+  uint64_t max_free = 0;
+
+  // If no remaining segments, the entire space is free
+  if (remaining_segments.empty()) {
+    return total_memory_bytes;
+  }
+
+  // Free space before the first segment
+  max_free = std::max(max_free, remaining_segments[0].offset);
+
+  // Free space between adjacent segments
+  for (size_t i = 1; i < remaining_segments.size(); ++i) {
+    uint64_t gap = remaining_segments[i].offset - remaining_segments[i-1].end();
+    max_free = std::max(max_free, gap);
+  }
+
+  // Free space after the last segment
+  max_free = std::max(max_free,
+                      total_memory_bytes - remaining_segments.back().end());
+
+  return max_free;
 }
 
 void InstanceMgr::auto_scaling() {
@@ -1386,6 +1482,40 @@ ModelInstanceMgr* InstanceMgr::get_model_instance_mgr(const std::string& model_i
   }
   LOG(ERROR) << "Model instance manager not found for model " << model_id;
   return nullptr;
+}
+
+void InstanceMgr::update_xtensor_info(
+    const std::string& instance_name,
+    const proto::XTensorHeartbeatInfo& xtensor_info) {
+  std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
+
+  InstanceXTensorInfo info;
+
+  // Copy worker_free_phy_pages
+  for (auto pages : xtensor_info.worker_free_phy_pages()) {
+    info.worker_free_phy_pages.push_back(pages);
+  }
+
+  // Copy model_weight_segments
+  for (const auto& [model_id, segment_list] : xtensor_info.model_weight_segments()) {
+    std::vector<WeightSegment> segments;
+    for (const auto& seg : segment_list.segments()) {
+      segments.push_back({seg.offset(), seg.size()});
+    }
+    info.model_weight_segments[model_id] = std::move(segments);
+  }
+
+  instance_xtensor_infos_[instance_name] = std::move(info);
+}
+
+std::optional<InstanceXTensorInfo> InstanceMgr::get_instance_xtensor_info(
+    const std::string& instance_name) {
+  std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
+  auto it = instance_xtensor_infos_.find(instance_name);
+  if (it != instance_xtensor_infos_.end()) {
+    return it->second;
+  }
+  return std::nullopt;
 }
 
 }  // namespace xllm_service

@@ -454,6 +454,22 @@ struct EvictionPlanInfo {
   EvictionPlanInfo() = default;
 };
 
+// Single weight segment in GlobalXtensor memory
+struct WeightSegment {
+  uint64_t offset;  // Byte offset from GlobalXtensor base
+  uint64_t size;    // Segment size in bytes
+
+  uint64_t end() const { return offset + size; }
+};
+
+// XTensor memory information for an instance
+struct InstanceXTensorInfo {
+  // Per-worker free physical pages (index = worker rank)
+  std::vector<uint64_t> worker_free_phy_pages;
+  // model_id -> segments (each model may have multiple non-contiguous segments)
+  std::unordered_map<std::string, std::vector<WeightSegment>> model_weight_segments;
+};
+
 // Function call related types
 struct JsonFunction {
   std::string name;

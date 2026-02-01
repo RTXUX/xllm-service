@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <brpc/channel.h>
 
+#include <optional>
 #include <shared_mutex>
 #include <thread>
 #include <unordered_map>
@@ -120,11 +121,25 @@ class InstanceMgr final {
 
   ModelInstanceMgr* get_model_instance_mgr(const std::string& model_id);
 
+  // Update XTensor info for an instance from heartbeat
+  void update_xtensor_info(const std::string& instance_name,
+                           const proto::XTensorHeartbeatInfo& xtensor_info);
+
+  // Get XTensor info for an instance
+  std::optional<InstanceXTensorInfo> get_instance_xtensor_info(
+      const std::string& instance_name);
+
  private:
   void init_model_memory_specs();
   double get_model_memory_size(const std::string& model_id);
   // Select models to evict on a specific instance to free up required_space
   EvictionPlanInfo select_eviction_candidates(const std::string& instance_name, double required_space);
+
+  // Compute max contiguous free space after evicting specified models
+  uint64_t compute_max_contiguous_free_space(
+      const InstanceXTensorInfo& xtensor_info,
+      const std::vector<std::string>& models_to_evict,
+      uint64_t total_memory_bytes);
 
  private:
 
@@ -218,6 +233,10 @@ class InstanceMgr final {
   std::unordered_map<std::string, RequestMetrics> request_metrics_;  
   
   std::mutex allocation_mutex_;
+
+  // XTensor memory info per instance
+  std::mutex xtensor_info_mutex_;
+  std::unordered_map<std::string, InstanceXTensorInfo> instance_xtensor_infos_;
 
   ThreadPool threadpool_;
 };

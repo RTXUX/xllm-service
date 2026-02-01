@@ -229,6 +229,11 @@ void Scheduler::handle_instance_heartbeat(const proto::HeartbeatRequest* req) {
   global_kvcache_mgr_->record_updated_kvcaches(req->name(), req->cache_event());
   instance_mgr_->record_load_metrics_update(req->name(), req->load_metrics());
   instance_mgr_->update_latency_metrics(req->name(), req->latency_metrics());
+
+  // Update XTensor info if present
+  if (req->has_xtensor_info()) {
+    instance_mgr_->update_xtensor_info(req->name(), req->xtensor_info());
+  }
 }
 
 void Scheduler::handle_master_service_watch(const etcd::Response& response,
