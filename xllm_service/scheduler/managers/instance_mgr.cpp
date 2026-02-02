@@ -944,7 +944,7 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
   }
 
   auto model_mgr = get_model_instance_mgr(model_id);
-  
+
   std::shared_ptr<brpc::Channel> channel = get_channel(instance_name);
 
   if (model_mgr->send_model_sleep(instance_name, channel)) {
@@ -956,7 +956,6 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
                    << " memory usage negative, reset to 0.";
       instance_memory_usage_[instance_name] = 0;
     }
-    
   }
 }
 
@@ -973,7 +972,29 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
 
   std::shared_ptr<brpc::Channel> channel = get_channel(instance_name);
 
-  if (model_mgr->send_model_wakeup(instance_name, channel)) {
+  // Try to find a D2D source instance (also acquires D2D lock if found)
+  auto d2d_info = find_d2d_source(model_id, instance_name);
+
+  bool wakeup_success = false;
+  if (d2d_info.has_value()) {
+    // Use D2D wakeup
+    wakeup_success = model_mgr->send_model_wakeup_d2d(instance_name, channel, d2d_info.value());
+
+    // Release D2D lock on the source instance (whether success or failure)
+    model_mgr->release_d2d_lock(d2d_info->source_instance_name);
+
+    if (!wakeup_success) {
+      LOG(WARNING) << "D2D wakeup failed for model " << model_id
+                   << " on " << instance_name << ", falling back to H2D";
+      // Fallback to H2D
+      wakeup_success = model_mgr->send_model_wakeup(instance_name, channel);
+    }
+  } else {
+    // Use H2D wakeup
+    wakeup_success = model_mgr->send_model_wakeup(instance_name, channel);
+  }
+
+  if (wakeup_success) {
     if (!memory_increased_in_advance) {
       std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
       instance_memory_usage_[instance_name] += get_model_memory_size(model_id);
@@ -1259,7 +1280,7 @@ EvictionPlanInfo InstanceMgr::select_eviction_candidates(const std::string& inst
     }
   }
 
-  // 2. Get all awake models on this instance
+  // 2. Get all awake models on this instance that can be evicted (not D2D locked)
   std::vector<std::string> awake_models;
 
   // Iterate all models to check status on this instance
@@ -1271,6 +1292,13 @@ EvictionPlanInfo InstanceMgr::select_eviction_candidates(const std::string& inst
     ModelState state = model_mgr->get_model_state(instance_name);
 
     if (state == ModelState::WAKEUP) {
+      // Skip if this model on this instance is D2D locked
+      if (!model_mgr->can_sleep(instance_name)) {
+        LOG(INFO) << "Model " << model_id << " on " << instance_name
+                  << " is D2D locked, skipping for eviction";
+        continue;
+      }
+
       if (model_mgr->get_wakeup_count() > 1) {
         awake_models.push_back(model_id);
       } else if (model_mgr->get_wakeup_count() == 1) {
@@ -1515,6 +1543,114 @@ std::optional<InstanceXTensorInfo> InstanceMgr::get_instance_xtensor_info(
   if (it != instance_xtensor_infos_.end()) {
     return it->second;
   }
+  return std::nullopt;
+}
+
+std::optional<D2DWakeupInfo> InstanceMgr::find_d2d_source(
+    const std::string& model_id,
+    const std::string& target_instance_name) {
+  // Find instances that have the model in WAKEUP state
+  auto model_mgr = get_model_instance_mgr(model_id);
+  if (!model_mgr) {
+    LOG(WARNING) << "Model manager not found for " << model_id;
+    return std::nullopt;
+  }
+
+  // Atomically get awake instances and lock all of them
+  auto locked_instances = model_mgr->get_awake_instances_and_lock();
+  if (locked_instances.empty()) {
+    LOG(INFO) << "No awake instances found for model " << model_id
+              << ", will use H2D wakeup";
+    return std::nullopt;
+  }
+
+  // Track which instance we select as source (to keep it locked)
+  std::string selected_source;
+
+  // Find a suitable source instance (not the target itself)
+  for (const auto& source_instance_name : locked_instances) {
+    if (source_instance_name == target_instance_name) {
+      continue;
+    }
+
+    // Check if we have XTensor info for this source instance
+    std::optional<InstanceXTensorInfo> xtensor_info;
+    {
+      std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
+      auto it = instance_xtensor_infos_.find(source_instance_name);
+      if (it != instance_xtensor_infos_.end()) {
+        xtensor_info = it->second;
+      }
+    }
+
+    if (!xtensor_info.has_value()) {
+      LOG(INFO) << "No XTensor info for source instance " << source_instance_name
+                << ", skipping for D2D";
+      continue;
+    }
+
+    // Check if the source has weight segments for this model
+    auto seg_it = xtensor_info->model_weight_segments.find(model_id);
+    if (seg_it == xtensor_info->model_weight_segments.end() ||
+        seg_it->second.empty()) {
+      LOG(INFO) << "No weight segments for model " << model_id
+                << " on source instance " << source_instance_name;
+      continue;
+    }
+
+    // Get the device addresses from InstanceMetaInfo
+    InstanceMetaInfo source_meta;
+    {
+      std::shared_lock<std::shared_mutex> lock(inst_mutex_);
+      auto meta_it = instances_.find(source_instance_name);
+      if (meta_it == instances_.end()) {
+        LOG(WARNING) << "InstanceMetaInfo not found for " << source_instance_name;
+        continue;
+      }
+      source_meta = meta_it->second;
+    }
+
+    if (source_meta.addrs.empty()) {
+      LOG(INFO) << "No device addresses for source instance " << source_instance_name
+                << ", skipping for D2D";
+      continue;
+    }
+
+    // Found a suitable source - build D2DWakeupInfo
+    D2DWakeupInfo d2d_info;
+    d2d_info.source_instance_name = source_instance_name;
+    d2d_info.remote_addrs = source_meta.addrs;
+
+    // For each remote addr, add the weight segments
+    // Currently assuming all workers have the same weight segments
+    for (size_t i = 0; i < source_meta.addrs.size(); ++i) {
+      d2d_info.src_weight_segments.push_back(seg_it->second);
+    }
+
+    selected_source = source_instance_name;
+
+    LOG(INFO) << "Found D2D source instance " << source_instance_name
+              << " for model " << model_id
+              << " with " << d2d_info.remote_addrs.size() << " remote addrs"
+              << " and " << seg_it->second.size() << " weight segments";
+
+    // Unlock all instances except the selected source
+    std::vector<std::string> instances_to_unlock;
+    for (const auto& inst : locked_instances) {
+      if (inst != selected_source) {
+        instances_to_unlock.push_back(inst);
+      }
+    }
+    model_mgr->release_d2d_locks(instances_to_unlock);
+
+    return d2d_info;
+  }
+
+  // No suitable source found - unlock all instances
+  model_mgr->release_d2d_locks(locked_instances);
+
+  LOG(INFO) << "No suitable D2D source found for model " << model_id
+            << ", will use H2D wakeup";
   return std::nullopt;
 }
 

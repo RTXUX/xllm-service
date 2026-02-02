@@ -129,6 +129,11 @@ class InstanceMgr final {
   std::optional<InstanceXTensorInfo> get_instance_xtensor_info(
       const std::string& instance_name);
 
+  // Find a suitable source instance for D2D weight transfer
+  // Returns D2DWakeupInfo with source instance info, or empty if no suitable source found
+  std::optional<D2DWakeupInfo> find_d2d_source(const std::string& model_id,
+                                                const std::string& target_instance_name);
+
  private:
   void init_model_memory_specs();
   double get_model_memory_size(const std::string& model_id);

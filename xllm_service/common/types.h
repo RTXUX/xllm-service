@@ -470,6 +470,20 @@ struct InstanceXTensorInfo {
   std::unordered_map<std::string, std::vector<WeightSegment>> model_weight_segments;
 };
 
+// D2D wakeup information for device-to-device weight transfer
+struct D2DWakeupInfo {
+  // Source instance name (for logging/tracking)
+  std::string source_instance_name;
+  // Remote device addresses for D2D transfer (e.g., "192.168.1.10:40000")
+  std::vector<std::string> remote_addrs;
+  // Weight segments from source instance (per remote addr, index matches remote_addrs)
+  std::vector<std::vector<WeightSegment>> src_weight_segments;
+
+  bool is_valid() const {
+    return !remote_addrs.empty() && !src_weight_segments.empty();
+  }
+};
+
 // Function call related types
 struct JsonFunction {
   std::string name;

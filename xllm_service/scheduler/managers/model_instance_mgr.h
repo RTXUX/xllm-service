@@ -54,12 +54,28 @@ class ModelInstanceMgr {
 
   bool send_model_sleep(const std::string& instance_name, std::shared_ptr<brpc::Channel> channel);
   bool send_model_wakeup(const std::string& instance_name, std::shared_ptr<brpc::Channel> channel);
+  // D2D wakeup: transfer weights from remote device instead of host
+  bool send_model_wakeup_d2d(const std::string& instance_name,
+                             std::shared_ptr<brpc::Channel> channel,
+                             const D2DWakeupInfo& d2d_info);
   bool set_model_state(const std::string& instance_name, ModelState state);
   ModelState get_model_state(const std::string& instance_name);
   bool is_model_waking_up();
   int32_t get_wakeup_count();
   int32_t get_allocation_count();
   std::vector<std::string> get_awake_instances();
+  // Get awake instances that are not locked (can be evicted)
+  std::vector<std::string> get_unlocked_instances();
+  // Atomically get awake instances and lock all of them, returns locked instance list
+  std::vector<std::string> get_awake_instances_and_lock();
+
+  // D2D reference counting - protect source instances from being slept during D2D transfer
+  void acquire_d2d_lock(const std::string& instance_name);
+  void release_d2d_lock(const std::string& instance_name);
+  // Batch unlock multiple instances
+  void release_d2d_locks(const std::vector<std::string>& instance_names);
+  bool can_sleep(const std::string& instance_name);
+  int32_t get_d2d_ref_count(const std::string& instance_name);
 
   void update_model_heat(int64_t token_count);
   int64_t get_model_heat();
@@ -110,6 +126,10 @@ class ModelInstanceMgr {
   std::mutex model_heat_mutex_;
   std::deque<HeatRecord> model_heat_records_;
   int64_t model_heat_ = 0;
+
+  // D2D reference counting - protects source instances during D2D transfer
+  std::mutex d2d_ref_mutex_;
+  std::unordered_map<std::string, int32_t> d2d_ref_counts_;
 
 };
 

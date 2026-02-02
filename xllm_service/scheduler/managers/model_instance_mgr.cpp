@@ -186,13 +186,75 @@ bool ModelInstanceMgr::send_model_wakeup(const std::string& instance_name, std::
   // TODO: add retries
   if (send_http_request(channel, "/wakeup", wakeup_body.dump())) {
     LOG(INFO) << "Model " << model_id_ << " on " << instance_name
-              << " trigger wakeup success.";
+              << " trigger wakeup (H2D) success.";
     set_model_state(instance_name, ModelState::WAKEUP);
     return true;
   } else {
     LOG(ERROR) << "Failed to wakeup model " << model_id_
                << " on " << instance_name;
     set_model_state(instance_name, ModelState::SLEEP);// or revert to ALLOCATED?
+    return false;
+  }
+
+  return false;
+}
+
+bool ModelInstanceMgr::send_model_wakeup_d2d(const std::string& instance_name,
+                                              std::shared_ptr<brpc::Channel> channel,
+                                              const D2DWakeupInfo& d2d_info) {
+  std::shared_mutex* instance_state_single_mutex = get_instance_state_single_mutex(instance_name);
+  std::unique_lock<std::shared_mutex> single_lock(*instance_state_single_mutex);
+
+  if (instance_states_.count(instance_name) &&
+      instance_states_[instance_name] != ModelState::ALLOCATED) {
+    LOG(INFO) << "Model " << model_id_
+              << " on " << instance_name
+              << " is not suitable for wakeup. ModelState : " << static_cast<int32_t>(instance_states_[instance_name]);
+    return false;
+  }
+
+  if (!d2d_info.is_valid()) {
+    LOG(ERROR) << "Invalid D2D wakeup info for model " << model_id_
+               << " on " << instance_name;
+    return false;
+  }
+
+  nlohmann::json wakeup_body;
+  wakeup_body["model_id"] = model_id_;
+  wakeup_body["master_status"] = 0;
+  wakeup_body["remote_addrs"] = d2d_info.remote_addrs;
+
+  // Build src_weight_segments array (per remote addr)
+  nlohmann::json segments_array = nlohmann::json::array();
+  for (const auto& segments : d2d_info.src_weight_segments) {
+    nlohmann::json segment_list;
+    nlohmann::json segs = nlohmann::json::array();
+    for (const auto& seg : segments) {
+      nlohmann::json seg_json;
+      seg_json["offset"] = seg.offset;
+      seg_json["size"] = seg.size;
+      segs.push_back(seg_json);
+    }
+    segment_list["segments"] = segs;
+    segments_array.push_back(segment_list);
+  }
+  wakeup_body["src_weight_segments"] = segments_array;
+
+  LOG(INFO) << "Sending D2D wakeup for model " << model_id_
+            << " on " << instance_name
+            << " from source " << d2d_info.source_instance_name
+            << " with " << d2d_info.remote_addrs.size() << " remote addrs";
+
+  // TODO: add retries
+  if (send_http_request(channel, "/wakeup", wakeup_body.dump())) {
+    LOG(INFO) << "Model " << model_id_ << " on " << instance_name
+              << " trigger wakeup (D2D) success.";
+    set_model_state(instance_name, ModelState::WAKEUP);
+    return true;
+  } else {
+    LOG(ERROR) << "Failed to wakeup model " << model_id_
+               << " on " << instance_name << " with D2D transfer";
+    set_model_state(instance_name, ModelState::SLEEP);
     return false;
   }
 
@@ -288,6 +350,37 @@ std::vector<std::string> ModelInstanceMgr::get_awake_instances() {
       awake_instances.push_back(pair.first);
     }
   }
+  return awake_instances;
+}
+
+std::vector<std::string> ModelInstanceMgr::get_unlocked_instances() {
+  std::shared_lock<std::shared_mutex> all_lock(instance_state_all_mutex_);
+  std::lock_guard<std::mutex> d2d_lock(d2d_ref_mutex_);
+  std::vector<std::string> unlocked_instances;
+  for (const auto& pair : instance_states_) {
+    if (pair.second == ModelState::WAKEUP) {
+      // Only include if not locked (ref_count == 0)
+      if (d2d_ref_counts_.count(pair.first) == 0 ||
+          d2d_ref_counts_[pair.first] == 0) {
+        unlocked_instances.push_back(pair.first);
+      }
+    }
+  }
+  return unlocked_instances;
+}
+
+std::vector<std::string> ModelInstanceMgr::get_awake_instances_and_lock() {
+  std::shared_lock<std::shared_mutex> all_lock(instance_state_all_mutex_);
+  std::lock_guard<std::mutex> d2d_lock(d2d_ref_mutex_);
+  std::vector<std::string> awake_instances;
+  for (const auto& pair : instance_states_) {
+    if (pair.second == ModelState::WAKEUP) {
+      awake_instances.push_back(pair.first);
+      d2d_ref_counts_[pair.first]++;
+    }
+  }
+  LOG(INFO) << "Model " << model_id_ << " get_awake_instances_and_lock: locked "
+            << awake_instances.size() << " instances";
   return awake_instances;
 }
 
@@ -394,12 +487,58 @@ void ModelInstanceMgr::auto_flipping(const std::unordered_map<std::string, Laten
   if (next_decode_index_ >= decode_index_.size()) next_decode_index_ = 0;
 }
 
-std::shared_mutex* ModelInstanceMgr::get_instance_state_single_mutex(const std::string& instance_name) {  
+std::shared_mutex* ModelInstanceMgr::get_instance_state_single_mutex(const std::string& instance_name) {
   std::unique_lock<std::shared_mutex> all_lock(instance_state_all_mutex_);
   if (instance_state_single_mutexes_.find(instance_name) == instance_state_single_mutexes_.end()) {
     instance_state_single_mutexes_[instance_name] = std::make_unique<std::shared_mutex>();
   }
   return instance_state_single_mutexes_[instance_name].get();
+}
+
+void ModelInstanceMgr::acquire_d2d_lock(const std::string& instance_name) {
+  std::lock_guard<std::mutex> lock(d2d_ref_mutex_);
+  d2d_ref_counts_[instance_name]++;
+  LOG(INFO) << "Model " << model_id_ << " on " << instance_name
+            << " D2D lock acquired, ref_count=" << d2d_ref_counts_[instance_name];
+}
+
+void ModelInstanceMgr::release_d2d_lock(const std::string& instance_name) {
+  std::lock_guard<std::mutex> lock(d2d_ref_mutex_);
+  if (d2d_ref_counts_.count(instance_name) && d2d_ref_counts_[instance_name] > 0) {
+    d2d_ref_counts_[instance_name]--;
+    LOG(INFO) << "Model " << model_id_ << " on " << instance_name
+              << " D2D lock released, ref_count=" << d2d_ref_counts_[instance_name];
+  } else {
+    LOG(WARNING) << "Model " << model_id_ << " on " << instance_name
+                 << " D2D lock release called but ref_count is already 0";
+  }
+}
+
+void ModelInstanceMgr::release_d2d_locks(const std::vector<std::string>& instance_names) {
+  std::lock_guard<std::mutex> lock(d2d_ref_mutex_);
+  for (const auto& instance_name : instance_names) {
+    if (d2d_ref_counts_.count(instance_name) && d2d_ref_counts_[instance_name] > 0) {
+      d2d_ref_counts_[instance_name]--;
+    }
+  }
+  LOG(INFO) << "Model " << model_id_ << " batch released D2D locks for "
+            << instance_names.size() << " instances";
+}
+
+bool ModelInstanceMgr::can_sleep(const std::string& instance_name) {
+  std::lock_guard<std::mutex> lock(d2d_ref_mutex_);
+  if (d2d_ref_counts_.count(instance_name) == 0) {
+    return true;
+  }
+  return d2d_ref_counts_[instance_name] == 0;
+}
+
+int32_t ModelInstanceMgr::get_d2d_ref_count(const std::string& instance_name) {
+  std::lock_guard<std::mutex> lock(d2d_ref_mutex_);
+  if (d2d_ref_counts_.count(instance_name) == 0) {
+    return 0;
+  }
+  return d2d_ref_counts_[instance_name];
 }
 
 }  // namespace xllm_service
