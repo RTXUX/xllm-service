@@ -119,7 +119,7 @@ class InstanceMgr final {
                                                        int32_t target_model_count);
   void auto_scaling();
 
-  ModelInstanceMgr* get_model_instance_mgr(const std::string& model_id);
+  std::shared_ptr<ModelInstanceMgr> get_model_instance_mgr(const std::string& model_id);
 
   // Update XTensor info for an instance from heartbeat
   void update_xtensor_info(const std::string& instance_name,
@@ -176,6 +176,22 @@ class InstanceMgr final {
 
  private:
   DISALLOW_COPY_AND_ASSIGN(InstanceMgr);
+
+  // Lock hierarchy (acquire in this order to prevent deadlocks):
+  //   1. allocation_mutex_           — outermost, serializes allocation decisions
+  //   2. inst_mutex_                 — protects instances_, cached_channels_
+  //   3. model_instance_mgr_mutex_  — protects model_instance_mgrs_ map
+  //   4. xtensor_info_mutex_         — protects instance_xtensor_infos_
+  //   5. pending_mutex_              — protects pending_infos_
+  //   6. time_predictor_mutex_       — protects time_predictors_
+  //   7. request_metrics_mutex_      — protects request_metrics_
+  //   8. latency_metrics_mutex_      — protects latency_metrics_
+  //   9. update_mutex_               — protects updated_metrics_, removed_instance_
+  //  10. load_metric_mutex_          — protects load_metrics_
+  //
+  // ModelInstanceMgr internal locks (mutex_, instance_state_all_mutex_,
+  // d2d_ref_mutex_, model_heat_mutex_) are leaf-level locks and must not
+  // be held when acquiring any InstanceMgr mutex.
 
   void init();
 

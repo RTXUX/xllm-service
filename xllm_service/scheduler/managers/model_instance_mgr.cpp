@@ -62,20 +62,41 @@ void ModelInstanceMgr::update_instance_info(const std::string& instance_name, co
 
 bool ModelInstanceMgr::get_next_instance_pair(Routing* routing) {
   std::shared_lock<std::shared_mutex> lock(mutex_);
-  
+
   if (prefill_index_.empty() || decode_index_.empty()) {
     return false;
   }
-    
+
   if (next_prefill_index_ >= prefill_index_.size()) next_prefill_index_ = 0;
   if (next_decode_index_ >= decode_index_.size()) next_decode_index_ = 0;
 
   std::shared_lock<std::shared_mutex> all_lock(instance_state_all_mutex_);
-  while (instance_states_[prefill_index_[next_prefill_index_]] != ModelState::WAKEUP) {
+
+  // Bounded search to prevent infinite loop when no WAKEUP instances exist
+  bool found_prefill = false;
+  for (size_t i = 0; i < prefill_index_.size(); ++i) {
+    if (instance_states_[prefill_index_[next_prefill_index_]] == ModelState::WAKEUP) {
+      found_prefill = true;
+      break;
+    }
     next_prefill_index_ = (next_prefill_index_ + 1) % prefill_index_.size();
   }
-  while (instance_states_[decode_index_[next_decode_index_]] != ModelState::WAKEUP) {
+  if (!found_prefill) {
+    LOG(WARNING) << "No WAKEUP prefill instance found for model " << model_id_;
+    return false;
+  }
+
+  bool found_decode = false;
+  for (size_t i = 0; i < decode_index_.size(); ++i) {
+    if (instance_states_[decode_index_[next_decode_index_]] == ModelState::WAKEUP) {
+      found_decode = true;
+      break;
+    }
     next_decode_index_ = (next_decode_index_ + 1) % decode_index_.size();
+  }
+  if (!found_decode) {
+    LOG(WARNING) << "No WAKEUP decode instance found for model " << model_id_;
+    return false;
   }
 
   routing->prefill_name = prefill_index_[next_prefill_index_];
@@ -83,7 +104,7 @@ bool ModelInstanceMgr::get_next_instance_pair(Routing* routing) {
 
   next_prefill_index_ = (next_prefill_index_ + 1) % prefill_index_.size();
   next_decode_index_ = (next_decode_index_ + 1) % decode_index_.size();
-  
+
   return true;
 }
 
@@ -280,12 +301,25 @@ bool ModelInstanceMgr::set_model_state(const std::string& instance_name, ModelSt
       return false;
     }
   } else if (new_state == ModelState::SLEEP) {
+    if (current_state == ModelState::SLEEP) {
+      // Already SLEEP, idempotent (e.g. fork_master_and_sleep on newly added instance)
+      return true;
+    }
     if (current_state == ModelState::DRAINING || current_state == ModelState::WAKEUP) {
       instance_states_[instance_name] = ModelState::SLEEP;
       if (current_state == ModelState::WAKEUP) {
         wakeup_count_ -= 1;
         allocation_count_ -= 1;
       }
+      if (current_state == ModelState::DRAINING) {
+        // DRAINING was already decremented from wakeup_count_ and allocation_count_
+        // when transitioning WAKEUP -> DRAINING
+      }
+      return true;
+    } else if (current_state == ModelState::ALLOCATED) {
+      // ALLOCATED -> SLEEP: wakeup failed (e.g. D2D fallback failure), revert allocation
+      instance_states_[instance_name] = ModelState::SLEEP;
+      allocation_count_ -= 1;
       return true;
     } else {
       LOG(ERROR) << "ModelInstanceMgr::set_model_state: invalid state transition to SLEEP from " << static_cast<int32_t>(current_state);

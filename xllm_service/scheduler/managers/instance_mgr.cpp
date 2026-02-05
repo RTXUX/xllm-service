@@ -221,6 +221,7 @@ void InstanceMgr::fork_master_and_sleep(
     fork_body["model_path"] = model.second;
     fork_body["master_node_addr"] = "127.0.0.1:" + std::to_string(++master_node_port);
     fork_body["master_status"] = 1;
+    fork_body["nnodes"] = kTensorParallelSize;
 
     auto model_id = model.first;
 
@@ -485,12 +486,15 @@ void InstanceMgr::register_instance(const std::string& instance_name,
     fork_master_and_sleep(instance_name, channel);
   });
 
-  // Initialize xtensor info as invalid (waiting for first heartbeat)
+  // Initialize xtensor info as invalid only if not already set
+  // (update_xtensor_info from the same heartbeat may have already set a valid entry)
   {
     std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
-    InstanceXTensorInfo info;
-    info.is_valid = false;  // Mark as not yet received valid data
-    instance_xtensor_infos_[instance_name] = std::move(info);
+    if (instance_xtensor_infos_.find(instance_name) == instance_xtensor_infos_.end()) {
+      InstanceXTensorInfo info;
+      info.is_valid = false;  // Mark as not yet received valid data
+      instance_xtensor_infos_[instance_name] = std::move(info);
+    }
   }
 
   {
@@ -984,6 +988,8 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
     if (!wakeup_success) {
       LOG(WARNING) << "D2D wakeup failed for model " << model_id
                    << " on " << instance_name << ", falling back to H2D";
+      // D2D failure sets state to SLEEP, reset to ALLOCATED for H2D fallback
+      model_mgr->set_model_state(instance_name, ModelState::ALLOCATED);
       // Fallback to H2D
       wakeup_success = model_mgr->send_model_wakeup(instance_name, channel);
     }
@@ -1221,6 +1227,16 @@ std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::str
           });
 
           request_metrics_lock.unlock();
+
+          // Double-check can_sleep() to handle D2D lock race condition
+          // (a D2D lock could have been acquired after eviction planning)
+          auto evict_mgr = get_model_instance_mgr(model_to_sleep);
+          if (evict_mgr && !evict_mgr->can_sleep(instance_name)) {
+            LOG(WARNING) << "Model " << model_to_sleep << " on " << instance_name
+                         << " became D2D locked, skipping sleep";
+            return;
+          }
+
           send_model_sleep(instance_name, model_to_sleep);
 
         });
@@ -1490,10 +1506,11 @@ void InstanceMgr::auto_scaling() {
   }
 }
 
-ModelInstanceMgr* InstanceMgr::get_model_instance_mgr(const std::string& model_id) {
+std::shared_ptr<ModelInstanceMgr> InstanceMgr::get_model_instance_mgr(const std::string& model_id) {
   std::shared_lock<std::shared_mutex> lock(model_instance_mgr_mutex_);
-  if (model_instance_mgrs_.count(model_id)) {
-    return model_instance_mgrs_[model_id].get();
+  auto it = model_instance_mgrs_.find(model_id);
+  if (it != model_instance_mgrs_.end()) {
+    return it->second;
   }
   LOG(ERROR) << "Model instance manager not found for model " << model_id;
   return nullptr;

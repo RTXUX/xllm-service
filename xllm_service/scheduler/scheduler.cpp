@@ -181,7 +181,6 @@ void Scheduler::process_request_queue(const std::string& model_name) {
         continue;
       }
 
-      LOG(INFO) << "@@ routing to awake_instance: " << awake_instance;
       request->routing.prefill_name = awake_instance;
       request->routing.decode_name = awake_instance;
     }

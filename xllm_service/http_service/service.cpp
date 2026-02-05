@@ -331,10 +331,18 @@ void XllmHttpServiceImpl::get_serving(
                                         done]() {
     auto service_request = weak_service_request.lock();
     if (service_request == nullptr) {
+      LOG(ERROR) << "Service request expired before dispatch (get_serving)";
+      call_data->finish_with_error("Internal error: request expired.");
       return;
     }
     brpc::Channel* channel_ptr =
         scheduler_->get_channel(service_request->routing.prefill_name).get();
+    if (channel_ptr == nullptr) {
+      LOG(ERROR) << "Get channel failed for target: "
+                 << service_request->routing.prefill_name;
+      call_data->finish_with_error("Internal error: channel not found.");
+      return;
+    }
     std::string target_uri =
         service_request->routing.prefill_name + serving_method;
 
@@ -409,6 +417,8 @@ void XllmHttpServiceImpl::Completions(
                                         cntl]() {
     auto service_request = weak_service_request.lock();
     if (service_request == nullptr) {
+      LOG(ERROR) << "Service request expired before dispatch (Completions)";
+      call_data->finish_with_error("Internal error: request expired.");
       return;
     }
 
@@ -494,6 +504,8 @@ void XllmHttpServiceImpl::ChatCompletions(
                                         cntl]() {
     auto service_request = weak_service_request.lock();
     if (service_request == nullptr) {
+      LOG(ERROR) << "Service request expired before dispatch (ChatCompletions)";
+      call_data->finish_with_error("Internal error: request expired.");
       return;
     }
     // update request protobuf
@@ -596,8 +608,13 @@ void XllmHttpServiceImpl::ModelTriggers(
     LOG(INFO) << "Sending model wakeup request: " << trigger_type
               << " for model " << model_id << " on instance "
               << instance_name;
-    scheduler_->get_instance_mgr()->get_model_instance_mgr(model_id)->set_model_state(
-        instance_name, ModelState::ALLOCATED);
+    auto model_mgr = scheduler_->get_instance_mgr()->get_model_instance_mgr(model_id);
+    if (!model_mgr) {
+      LOG(ERROR) << "Model instance manager not found for model " << model_id;
+      cntl->SetFailed("Model instance manager not found for model " + model_id);
+      return;
+    }
+    model_mgr->set_model_state(instance_name, ModelState::ALLOCATED);
     scheduler_->get_instance_mgr()->send_model_wakeup(
         instance_name, model_id, /*memory_increased_in_advance*/ false);
   } else {

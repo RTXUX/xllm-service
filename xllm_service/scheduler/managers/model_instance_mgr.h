@@ -79,8 +79,7 @@ class ModelInstanceMgr {
 
   void update_model_heat(int64_t token_count);
   int64_t get_model_heat();
-  void prune_model_heat_locked();
-  
+
   std::shared_mutex* get_instance_state_single_mutex(const std::string& instance_name);
 
   void auto_flipping(const std::unordered_map<std::string, LatencyMetrics>& latency_metrics);
@@ -90,7 +89,20 @@ class ModelInstanceMgr {
                          const std::string& uri,
                          const std::string& request_body);
 
+  // Must be called while holding model_heat_mutex_
+  void prune_model_heat_locked();
+
   std::string model_id_;
+
+  // Lock hierarchy within ModelInstanceMgr (acquire in this order):
+  //   1. mutex_                       — protects instances_, prefill_index_, decode_index_
+  //   2. instance_state_all_mutex_   — protects instance_states_, wakeup_count_, allocation_count_
+  //   3. d2d_ref_mutex_               — protects d2d_ref_counts_
+  //   4. model_heat_mutex_            — protects model_heat_records_, model_heat_
+  //   5. wakeup_mutex_                — protects wakeup_cv_, wakeup_instance_name_
+  //
+  // These are all leaf-level locks relative to InstanceMgr's locks.
+  // Do not hold any of these when acquiring InstanceMgr locks.
   
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, InstanceMetaInfo> instances_;
