@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <shared_mutex>
 #include <condition_variable>
 #include <chrono>
@@ -454,6 +455,9 @@ struct EvictionPlanInfo {
   EvictionPlanInfo() = default;
 };
 
+// XTensor page size constant (2MB)
+static constexpr uint64_t kXTensorPageSizeBytes = 2 * 1024 * 1024;
+
 // Single weight segment in GlobalXtensor memory
 struct WeightSegment {
   uint64_t offset;  // Byte offset from GlobalXtensor base
@@ -464,10 +468,36 @@ struct WeightSegment {
 
 // XTensor memory information for an instance
 struct InstanceXTensorInfo {
+  // Flag indicating whether valid heartbeat data has been received
+  bool is_valid = false;
+
   // Per-worker free physical pages (index = worker rank)
   std::vector<uint64_t> worker_free_phy_pages;
   // model_id -> segments (each model may have multiple non-contiguous segments)
   std::unordered_map<std::string, std::vector<WeightSegment>> model_weight_segments;
+
+  // Get minimum free bytes across all workers (supports TP)
+  uint64_t get_min_free_bytes() const {
+    if (worker_free_phy_pages.empty()) {
+      return 0;
+    }
+    uint64_t min_pages = *std::min_element(
+        worker_free_phy_pages.begin(), worker_free_phy_pages.end());
+    return min_pages * kXTensorPageSizeBytes;
+  }
+
+  // Get model size from weight segments
+  uint64_t get_model_size_bytes(const std::string& model_id) const {
+    auto it = model_weight_segments.find(model_id);
+    if (it == model_weight_segments.end()) {
+      return 0;
+    }
+    uint64_t total_size = 0;
+    for (const auto& seg : it->second) {
+      total_size += seg.size;
+    }
+    return total_size;
+  }
 };
 
 // D2D wakeup information for device-to-device weight transfer

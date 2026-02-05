@@ -484,9 +484,13 @@ void InstanceMgr::register_instance(const std::string& instance_name,
   threadpool_.schedule([this, instance_name, channel]() {
     fork_master_and_sleep(instance_name, channel);
   });
+
+  // Initialize xtensor info as invalid (waiting for first heartbeat)
   {
-    std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
-    instance_memory_usage_[instance_name] = 0.0;
+    std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
+    InstanceXTensorInfo info;
+    info.is_valid = false;  // Mark as not yet received valid data
+    instance_xtensor_infos_[instance_name] = std::move(info);
   }
 
   {
@@ -948,14 +952,8 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
   std::shared_ptr<brpc::Channel> channel = get_channel(instance_name);
 
   if (model_mgr->send_model_sleep(instance_name, channel)) {
-    // trigger sleep success, decrease memory usage
-    std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
-    instance_memory_usage_[instance_name] -= get_model_memory_size(model_id);
-    if (instance_memory_usage_[instance_name] < 0) {
-      LOG(WARNING) << "Instance " << instance_name
-                   << " memory usage negative, reset to 0.";
-      instance_memory_usage_[instance_name] = 0;
-    }
+    LOG(INFO) << "Model " << model_id << " on " << instance_name
+              << " sleep successful. Memory freed will be reflected in next heartbeat.";
   }
 }
 
@@ -995,22 +993,11 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
   }
 
   if (wakeup_success) {
-    if (!memory_increased_in_advance) {
-      std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
-      instance_memory_usage_[instance_name] += get_model_memory_size(model_id);
-    }
-    if (instance_memory_usage_[instance_name] > kMaxInstanceMemoryGB) {
-      LOG(WARNING) << "Instance " << instance_name
-                   << " memory usage exceeds max limit after waking up model "
-                   << model_id << ".";
-    }
+    LOG(INFO) << "Model " << model_id << " wakeup successful on " << instance_name
+              << ". Memory usage will be reflected in next heartbeat.";
   } else {
     LOG(ERROR) << "Failed to wakeup model " << model_id
                << " on " << instance_name;
-    if (memory_increased_in_advance) {
-      std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
-      instance_memory_usage_[instance_name] -= get_model_memory_size(model_id);
-    }
   }
 }
 
@@ -1067,7 +1054,7 @@ int32_t InstanceMgr::get_wakeup_count(const std::string& model_id) {
 // returns the instance_names of newly allocated(already wakeup or is waking_up) models
 std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::string& model_id,
                                                                   int32_t target_model_count) {
-  
+
   std::unique_lock<std::mutex> allocation_lock(allocation_mutex_);
   // check for race conditions
   // (multiple entrance in allocate_instance_for_model)
@@ -1083,40 +1070,44 @@ std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::str
     }
   }
 
-  double model_size = get_model_memory_size(model_id);
-  
-  LOG(INFO) << "Allocating instance for model " << model_id 
-            << " with size " << model_size << " GB."
+  uint64_t model_size_bytes = get_model_size_bytes(model_id);
+
+  LOG(INFO) << "Allocating instance for model " << model_id
+            << " with size " << (model_size_bytes / (1024.0 * 1024 * 1024)) << " GB."
             << " Model count margin: " << model_count_margin;
 
   std::vector<std::thread> wakeup_threads;
   int newly_allocated_count = 0;
   std::vector<std::string> newly_allocated_instances;
 
-  // First, try to instances with enough free space
+  // First, try instances with enough free space (using xtensor info)
   {
-    std::unique_lock<std::mutex> mem_lock(instance_memory_mutex_);
-    for (const auto& pair : instance_memory_usage_) {
-      const std::string& instance_name = pair.first;
+    std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_);
+    for (const auto& inst_pair : instances_) {
+      const std::string& instance_name = inst_pair.first;
       auto model_mgr = get_model_instance_mgr(model_id);
-      
+
       if (model_mgr->get_model_state(instance_name) != ModelState::SLEEP) {
         // Model not ready to wake up.
-        // Note that DRAINING does not contribute to model_waking_up_counts,
-        // but expecting DRAINING->SLEEP->WAKEUP_AGAIN yields too much race conditions.
-        // We would rather expect a temporary -1 margin on model_waking_up_counts,
-        // which is to be fixed by triggering allocate_instance_for_model again during the next auto_scaling.
         continue;
       }
 
-      double current_usage = pair.second;
+      // Skip instances without valid xtensor info
+      if (!has_valid_xtensor_info(instance_name)) {
+        LOG(INFO) << "Instance " << instance_name << " has no valid xtensor info, skipping";
+        continue;
+      }
 
-      LOG(INFO) << "Instance " << instance_name 
-                << " current memory usage: " << current_usage << " GB.";
+      uint64_t free_bytes = get_instance_free_bytes(instance_name);
 
-      if (current_usage + model_size <= kMaxInstanceMemoryGB) {
-        instance_memory_usage_[instance_name] += model_size;
+      LOG(INFO) << "Instance " << instance_name
+                << " free space: " << (free_bytes / (1024.0 * 1024 * 1024)) << " GB.";
+
+      if (free_bytes >= model_size_bytes) {
         model_mgr->set_model_state(instance_name, ModelState::ALLOCATED);
+
+        // Locally deduct free pages to prevent double allocation before next heartbeat
+        deduct_free_pages(instance_name, model_size_bytes);
 
         wakeup_threads.emplace_back([this, instance_name, model_id]() {
           send_model_wakeup(instance_name, model_id, /*memory_increased_in_advance*/ true);
@@ -1141,23 +1132,21 @@ std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::str
       auto model_mgr = get_model_instance_mgr(model_id);
 
       if (model_mgr->get_model_state(instance_name) != ModelState::SLEEP) {
-        // Model not ready.
-        // This double check is for race conditions. (After allocation_lock, are there race conditions?)
         continue;
       }
-      
-      // Check current usage
-      double current_usage = 0;
-      {
-        std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
-        if (instance_memory_usage_.count(instance_name)) {
-          current_usage = instance_memory_usage_[instance_name];
-        }
+
+      // Skip instances without valid xtensor info
+      if (!has_valid_xtensor_info(instance_name)) {
+        LOG(INFO) << "Instance " << instance_name << " has no valid xtensor info, skipping for eviction";
+        continue;
       }
 
-      double space_needed = model_size - (kMaxInstanceMemoryGB - current_usage);
+      uint64_t free_bytes = get_instance_free_bytes(instance_name);
+      // space_needed is how many more bytes we need beyond what's already free
+      int64_t space_needed_bytes = static_cast<int64_t>(model_size_bytes) - static_cast<int64_t>(free_bytes);
+      double space_needed_gb = space_needed_bytes / (1024.0 * 1024.0 * 1024.0);
 
-      EvictionPlanInfo current_plan = select_eviction_candidates(instance_name, space_needed);
+      EvictionPlanInfo current_plan = select_eviction_candidates(instance_name, space_needed_gb);
       if (current_plan.instance_name.empty()) {
         continue; // Cannot free enough space on this instance
       }
@@ -1187,7 +1176,7 @@ std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::str
 
     {
       auto model_mgr = get_model_instance_mgr(model_id);
-      
+
       // early mark as ALLOCATED, for race conditions
       // (multiple entrance in allocate_instance_for_model)
       model_mgr->set_model_state(instance_name, ModelState::ALLOCATED);
@@ -1201,7 +1190,7 @@ std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::str
     LOG(INFO) << "Preparing to wake up model " << model_id
               << " on instance " << instance_name;
 
-    wakeup_threads.emplace_back([this, model_id, model_size, instance_name, models_to_evict]() {
+    wakeup_threads.emplace_back([this, model_id, model_size_bytes, instance_name, models_to_evict]() {
       std::vector<std::thread> sleep_threads;
 
       for (const auto& model_to_sleep : models_to_evict) {
@@ -1225,12 +1214,12 @@ std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::str
                       << instance_name << " during eviction.";
             return;
           }
-          
+
           auto& metrics = model_it->second;
           metrics.cv_idle.wait(request_metrics_lock, [&metrics]() {
             return metrics.prefill_request_num == 0 && metrics.decode_request_num == 0;
           });
-          
+
           request_metrics_lock.unlock();
           send_model_sleep(instance_name, model_to_sleep);
 
@@ -1244,10 +1233,8 @@ std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::str
         }
       }
 
-      {
-        std::lock_guard<std::mutex> mem_lock(instance_memory_mutex_);
-        instance_memory_usage_[instance_name] += model_size;
-      }
+      // Locally deduct free pages for the model being woken up
+      deduct_free_pages(instance_name, model_size_bytes);
 
       send_model_wakeup(instance_name, model_id, /*memory_increased_in_advance*/ true);
 
@@ -1260,9 +1247,9 @@ std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::str
       thread.join();
     }
   }
-  
+
   return newly_allocated_instances;
-  
+
 }
 
 // Select models to evict out >= required_space, meanwhile minimizing sum(heat)
@@ -1275,7 +1262,7 @@ EvictionPlanInfo InstanceMgr::select_eviction_candidates(const std::string& inst
   {
     std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
     auto it = instance_xtensor_infos_.find(instance_name);
-    if (it != instance_xtensor_infos_.end()) {
+    if (it != instance_xtensor_infos_.end() && it->second.is_valid) {
       xtensor_info = it->second;
     }
   }
@@ -1325,20 +1312,20 @@ EvictionPlanInfo InstanceMgr::select_eviction_candidates(const std::string& inst
   size_t best_subset = 0;
 
   for (size_t subset = 1; subset < (1ULL << awake_models.size()); ++subset) {
-    double current_sum_space = 0;
+    uint64_t current_sum_space_bytes = 0;
     uint64_t current_sum_heat = 0;
     std::vector<std::string> current_evict_models;
 
     for (size_t i = 0; i < awake_models.size(); ++i) {
       if (subset & (1ULL << i)) {
-        current_sum_space += get_model_memory_size(awake_models[i]);
+        current_sum_space_bytes += get_model_size_bytes(awake_models[i]);
         current_sum_heat += awake_model_heats[i];
         current_evict_models.push_back(awake_models[i]);
       }
     }
 
     // Basic condition: freed space must be sufficient
-    if (current_sum_space < required_space) {
+    if (current_sum_space_bytes < required_bytes) {
       continue;
     }
 
@@ -1512,12 +1499,67 @@ ModelInstanceMgr* InstanceMgr::get_model_instance_mgr(const std::string& model_i
   return nullptr;
 }
 
+bool InstanceMgr::has_valid_xtensor_info(const std::string& instance_name) {
+  std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
+  auto it = instance_xtensor_infos_.find(instance_name);
+  return it != instance_xtensor_infos_.end() && it->second.is_valid;
+}
+
+uint64_t InstanceMgr::get_model_size_bytes(const std::string& model_id) {
+  // Priority 1: Get from any instance's xtensor info
+  {
+    std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
+    for (const auto& [inst_name, info] : instance_xtensor_infos_) {
+      if (!info.is_valid) continue;
+      uint64_t size = info.get_model_size_bytes(model_id);
+      if (size > 0) return size;
+    }
+  }
+
+  // Priority 2: Fallback to model_memory_specs_
+  if (model_memory_specs_.count(model_id)) {
+    return static_cast<uint64_t>(model_memory_specs_[model_id] * 1024 * 1024 * 1024);
+  }
+
+  // Default fallback: 20GB
+  LOG(WARNING) << "Unknown model size for " << model_id << ", using default 20GB";
+  return 20ULL * 1024 * 1024 * 1024;
+}
+
+uint64_t InstanceMgr::get_instance_free_bytes(const std::string& instance_name) {
+  std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
+  auto it = instance_xtensor_infos_.find(instance_name);
+  if (it == instance_xtensor_infos_.end() || !it->second.is_valid) {
+    return 0;  // No valid info, cannot allocate
+  }
+  return it->second.get_min_free_bytes();
+}
+
+bool InstanceMgr::has_enough_space_for_model(const std::string& instance_name,
+                                              const std::string& model_id) {
+  uint64_t free_bytes = get_instance_free_bytes(instance_name);
+  uint64_t model_size = get_model_size_bytes(model_id);
+  return free_bytes >= model_size;
+}
+
+void InstanceMgr::deduct_free_pages(const std::string& instance_name, uint64_t bytes) {
+  std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
+  auto it = instance_xtensor_infos_.find(instance_name);
+  if (it == instance_xtensor_infos_.end() || !it->second.is_valid) return;
+
+  uint64_t pages_to_deduct = (bytes + kXTensorPageSizeBytes - 1) / kXTensorPageSizeBytes;
+  for (auto& pages : it->second.worker_free_phy_pages) {
+    pages = (pages > pages_to_deduct) ? (pages - pages_to_deduct) : 0;
+  }
+}
+
 void InstanceMgr::update_xtensor_info(
     const std::string& instance_name,
     const proto::XTensorHeartbeatInfo& xtensor_info) {
   std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
 
   InstanceXTensorInfo info;
+  info.is_valid = true;  // Mark as valid heartbeat data
 
   // Copy worker_free_phy_pages
   for (auto pages : xtensor_info.worker_free_phy_pages()) {
@@ -1578,13 +1620,13 @@ std::optional<D2DWakeupInfo> InstanceMgr::find_d2d_source(
     {
       std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
       auto it = instance_xtensor_infos_.find(source_instance_name);
-      if (it != instance_xtensor_infos_.end()) {
+      if (it != instance_xtensor_infos_.end() && it->second.is_valid) {
         xtensor_info = it->second;
       }
     }
 
     if (!xtensor_info.has_value()) {
-      LOG(INFO) << "No XTensor info for source instance " << source_instance_name
+      LOG(INFO) << "No valid XTensor info for source instance " << source_instance_name
                 << ", skipping for D2D";
       continue;
     }

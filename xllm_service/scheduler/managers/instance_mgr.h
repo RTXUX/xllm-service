@@ -134,6 +134,19 @@ class InstanceMgr final {
   std::optional<D2DWakeupInfo> find_d2d_source(const std::string& model_id,
                                                 const std::string& target_instance_name);
 
+  // Check if an instance has valid xtensor info from heartbeat
+  bool has_valid_xtensor_info(const std::string& instance_name);
+
+  // Get model size in bytes (prefers xtensor info, fallback to specs)
+  uint64_t get_model_size_bytes(const std::string& model_id);
+
+  // Get instance free space in bytes from xtensor info
+  uint64_t get_instance_free_bytes(const std::string& instance_name);
+
+  // Check if instance has enough space to load a model
+  bool has_enough_space_for_model(const std::string& instance_name,
+                                   const std::string& model_id);
+
  private:
   void init_model_memory_specs();
   double get_model_memory_size(const std::string& model_id);
@@ -145,6 +158,9 @@ class InstanceMgr final {
       const InstanceXTensorInfo& xtensor_info,
       const std::vector<std::string>& models_to_evict,
       uint64_t total_memory_bytes);
+
+  // Locally adjust free pages after allocation (before next heartbeat)
+  void deduct_free_pages(const std::string& instance_name, uint64_t bytes);
 
  private:
 
