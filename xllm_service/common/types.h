@@ -475,6 +475,8 @@ struct InstanceXTensorInfo {
   std::vector<uint64_t> worker_free_phy_pages;
   // model_id -> segments (each model may have multiple non-contiguous segments)
   std::unordered_map<std::string, std::vector<WeightSegment>> model_weight_segments;
+  // Per-worker device addresses for D2D transfer (format: "IP:port")
+  std::vector<std::string> device_addrs;
 
   // Get minimum free bytes across all workers (supports TP)
   uint64_t get_min_free_bytes() const {

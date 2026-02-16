@@ -275,6 +275,10 @@ class InstanceMgr final {
   std::mutex xtensor_info_mutex_;
   std::unordered_map<std::string, InstanceXTensorInfo> instance_xtensor_infos_;
 
+  // Instances that have completed fork_master for all models (ready for D2D linking)
+  std::mutex fork_done_mutex_;
+  std::unordered_set<std::string> fork_done_instances_;
+
   ThreadPool threadpool_;
 };
 

@@ -282,6 +282,61 @@ bool ModelInstanceMgr::send_model_wakeup_d2d(const std::string& instance_name,
   return false;
 }
 
+bool ModelInstanceMgr::send_link_d2d(std::shared_ptr<brpc::Channel> channel,
+                                     const std::vector<std::string>& device_addrs) {
+  nlohmann::json body;
+  body["model_id"] = model_id_;
+  body["device_ips"] = device_addrs;
+
+  LOG(INFO) << "Sending link_d2d for model " << model_id_
+            << " with " << device_addrs.size() << " device addrs";
+
+  if (!send_http_request(channel, "/link_d2d", body.dump())) {
+    LOG(ERROR) << "Failed to send link_d2d for model " << model_id_;
+    return false;
+  }
+  return true;
+}
+
+bool ModelInstanceMgr::send_unlink_d2d(std::shared_ptr<brpc::Channel> channel,
+                                       const std::vector<std::string>& device_addrs) {
+  nlohmann::json body;
+  body["model_id"] = model_id_;
+  body["device_ips"] = device_addrs;
+
+  LOG(INFO) << "Sending unlink_d2d for model " << model_id_
+            << " with " << device_addrs.size() << " device addrs";
+
+  if (!send_http_request(channel, "/unlink_d2d", body.dump())) {
+    LOG(ERROR) << "Failed to send unlink_d2d for model " << model_id_;
+    return false;
+  }
+  return true;
+}
+
+void ModelInstanceMgr::link_d2d_bidirectional(
+    std::shared_ptr<brpc::Channel> new_channel,
+    const std::vector<std::string>& new_device_addrs,
+    const std::vector<std::pair<std::shared_ptr<brpc::Channel>,
+                                 std::vector<std::string>>>& peers) {
+  LOG(INFO) << "Bidirectional D2D linking for model " << model_id_
+            << " with " << peers.size() << " peers";
+
+  for (const auto& [peer_channel, peer_addrs] : peers) {
+    // new → peer
+    if (!send_link_d2d(new_channel, peer_addrs)) {
+      LOG(WARNING) << "Failed to link new instance -> peer for model "
+                   << model_id_;
+    }
+
+    // peer → new
+    if (!send_link_d2d(peer_channel, new_device_addrs)) {
+      LOG(WARNING) << "Failed to link peer -> new instance for model "
+                   << model_id_;
+    }
+  }
+}
+
 bool ModelInstanceMgr::set_model_state(const std::string& instance_name, ModelState new_state) {
   std::unique_lock<std::shared_mutex> all_lock(instance_state_all_mutex_);
   
@@ -385,6 +440,16 @@ std::vector<std::string> ModelInstanceMgr::get_awake_instances() {
     }
   }
   return awake_instances;
+}
+
+std::vector<std::string> ModelInstanceMgr::get_all_instance_names() {
+  std::shared_lock<std::shared_mutex> all_lock(instance_state_all_mutex_);
+  std::vector<std::string> names;
+  names.reserve(instance_states_.size());
+  for (const auto& pair : instance_states_) {
+    names.push_back(pair.first);
+  }
+  return names;
 }
 
 std::vector<std::string> ModelInstanceMgr::get_unlocked_instances() {

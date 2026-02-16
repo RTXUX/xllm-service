@@ -276,22 +276,62 @@ void InstanceMgr::fork_master_and_sleep(
     auto mgr = get_model_instance_mgr(model.first);
     mgr->set_model_state(instance_name, ModelState::SLEEP);
 
-    continue;
-
-    // 2. Sleep
+    // 2. force sleep (the initial model of xllm instance fails to fork_master)
     nlohmann::json sleep_body;
     sleep_body["model_id"] = model.first;
     sleep_body["master_status"] = 1;
+    
+    send_http_request(channel, "/sleep", sleep_body.dump());
+  }
 
-    if (send_http_request(channel, "/sleep", sleep_body.dump())) {
-      // update state in ModelInstanceMgr
-      auto mgr = get_model_instance_mgr(model.first);
-      mgr->set_model_state(instance_name, ModelState::SLEEP);
-      LOG(INFO) << "Model " << model.first << " on " << instance_name
-                << " is now SLEEPING";
+  // All models fork_master'd — bidirectional D2D linking with all ready instances
+  {
+    auto new_info = get_instance_xtensor_info(instance_name);
+    if (new_info && !new_info->device_addrs.empty()) {
+      // Snapshot fork_done instances (release lock before acquiring xtensor_info_mutex_)
+      std::vector<std::string> done_peers;
+      {
+        std::lock_guard<std::mutex> lock(fork_done_mutex_);
+        done_peers.assign(fork_done_instances_.begin(),
+                          fork_done_instances_.end());
+      }
+
+      // Gather peer channels and device addrs
+      std::vector<std::pair<std::shared_ptr<brpc::Channel>,
+                             std::vector<std::string>>> peers;
+      {
+        std::lock_guard<std::mutex> xt_lock(xtensor_info_mutex_);
+        for (const auto& peer_name : done_peers) {
+          auto it = instance_xtensor_infos_.find(peer_name);
+          if (it != instance_xtensor_infos_.end() && it->second.is_valid &&
+              !it->second.device_addrs.empty()) {
+            auto peer_channel = get_channel(peer_name);
+            if (peer_channel) {
+              peers.emplace_back(peer_channel, it->second.device_addrs);
+            }
+          }
+        }
+      }
+
+      // Use first model's mgr for the link call (mooncake session is model-agnostic)
+      auto mgr = get_model_instance_mgr(MODELS[0].first);
+      if (mgr) {
+        mgr->link_d2d_bidirectional(channel, new_info->device_addrs, peers);
+      }
+
+      // Mark self as fork_done
+      {
+        std::lock_guard<std::mutex> lock(fork_done_mutex_);
+        fork_done_instances_.insert(instance_name);
+      }
+      LOG(INFO) << "Instance " << instance_name
+                << " completed all model forks and D2D linking";
     } else {
-      LOG(ERROR) << "Failed to sleep model " << model.first << " on "
-                 << instance_name;
+      LOG(WARNING) << "No device addrs for instance " << instance_name
+                   << ", skipping D2D linking";
+      // Still mark as fork_done so others can link to us later
+      std::lock_guard<std::mutex> lock(fork_done_mutex_);
+      fork_done_instances_.insert(instance_name);
     }
   }
 }
@@ -979,7 +1019,7 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
 
   bool wakeup_success = false;
   if (d2d_info.has_value()) {
-    // Use D2D wakeup
+    // Use D2D wakeup (mooncake connections already established at fork_master time)
     wakeup_success = model_mgr->send_model_wakeup_d2d(instance_name, channel, d2d_info.value());
 
     // Release D2D lock on the source instance (whether success or failure)
@@ -1592,6 +1632,11 @@ void InstanceMgr::update_xtensor_info(
     info.model_weight_segments[model_id] = std::move(segments);
   }
 
+  // Copy device addresses for D2D transfer
+  for (const auto& addr : xtensor_info.device_addrs()) {
+    info.device_addrs.push_back(addr);
+  }
+
   instance_xtensor_infos_[instance_name] = std::move(info);
 }
 
@@ -1657,19 +1702,21 @@ std::optional<D2DWakeupInfo> InstanceMgr::find_d2d_source(
       continue;
     }
 
-    // Get the device addresses from InstanceMetaInfo
-    InstanceMetaInfo source_meta;
-    {
+    // Get device addresses for D2D transfer
+    // Prefer xtensor heartbeat addresses; fall back to registration addrs
+    std::vector<std::string> device_addrs;
+    if (!xtensor_info->device_addrs.empty()) {
+      device_addrs = xtensor_info->device_addrs;
+    } else {
+      // Fallback: try InstanceMetaInfo.addrs from registration
       std::shared_lock<std::shared_mutex> lock(inst_mutex_);
       auto meta_it = instances_.find(source_instance_name);
-      if (meta_it == instances_.end()) {
-        LOG(WARNING) << "InstanceMetaInfo not found for " << source_instance_name;
-        continue;
+      if (meta_it != instances_.end()) {
+        device_addrs = meta_it->second.addrs;
       }
-      source_meta = meta_it->second;
     }
 
-    if (source_meta.addrs.empty()) {
+    if (device_addrs.empty()) {
       LOG(INFO) << "No device addresses for source instance " << source_instance_name
                 << ", skipping for D2D";
       continue;
@@ -1678,11 +1725,11 @@ std::optional<D2DWakeupInfo> InstanceMgr::find_d2d_source(
     // Found a suitable source - build D2DWakeupInfo
     D2DWakeupInfo d2d_info;
     d2d_info.source_instance_name = source_instance_name;
-    d2d_info.remote_addrs = source_meta.addrs;
+    d2d_info.remote_addrs = device_addrs;
 
     // For each remote addr, add the weight segments
     // Currently assuming all workers have the same weight segments
-    for (size_t i = 0; i < source_meta.addrs.size(); ++i) {
+    for (size_t i = 0; i < device_addrs.size(); ++i) {
       d2d_info.src_weight_segments.push_back(seg_it->second);
     }
 

@@ -68,6 +68,23 @@ class ModelInstanceMgr {
   std::vector<std::string> get_unlocked_instances();
   // Atomically get awake instances and lock all of them, returns locked instance list
   std::vector<std::string> get_awake_instances_and_lock();
+  // Get all instances that have been fork_master'd for this model (any state)
+  std::vector<std::string> get_all_instance_names();
+
+  // D2D link/unlink: establish/tear down mooncake connections on target instance
+  bool send_link_d2d(std::shared_ptr<brpc::Channel> channel,
+                     const std::vector<std::string>& device_addrs);
+  bool send_unlink_d2d(std::shared_ptr<brpc::Channel> channel,
+                       const std::vector<std::string>& device_addrs);
+
+  // Bidirectional D2D linking: link new instance with all peers
+  // new_channel/new_device_addrs: the newly fork_master'd instance
+  // peers: list of (channel, device_addrs) for each existing peer instance
+  void link_d2d_bidirectional(
+      std::shared_ptr<brpc::Channel> new_channel,
+      const std::vector<std::string>& new_device_addrs,
+      const std::vector<std::pair<std::shared_ptr<brpc::Channel>,
+                                   std::vector<std::string>>>& peers);
 
   // D2D reference counting - protect source instances from being slept during D2D transfer
   void acquire_d2d_lock(const std::string& instance_name);

@@ -175,8 +175,6 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
     }
   }
 
-  LOG(INFO) << "@@@ In handle()";
-
   // sync redistribute the request and wait the response.
   // because this handle is aysnc called in dispatch_callback.
   auto& target_uri = request->routing.prefill_name;
@@ -422,8 +420,6 @@ void XllmHttpServiceImpl::Completions(
       return;
     }
 
-    LOG(INFO) << "@@ In dispatch_callback";
-
     // update request protobuf
     req_pb->set_service_request_id(service_request->service_request_id);
     req_pb->mutable_token_ids()->Add(service_request->token_ids.begin(),
@@ -440,8 +436,6 @@ void XllmHttpServiceImpl::Completions(
       call_data->finish_with_error("proto to json failed");
       return;
     }
-
-    LOG(INFO) << "@@ Dispatch_callback before handle.";
 
     handle(call_data, req_attachment, service_request, "/v1/completions");
   };
