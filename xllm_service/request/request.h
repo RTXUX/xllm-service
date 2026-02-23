@@ -57,11 +57,27 @@ struct Request {
   // the estimated TTFT obtained from the TTFT predictor
   int64_t estimated_ttft = 0;
 
+  // arrival timestamp (milliseconds since epoch)
+  int64_t arrival_time_ms = 0;
+
+  // TTFT SLO from request JSON (milliseconds)
+  int64_t ttft_slo_ms = 0;
+
+  // estimated prefill processing time from TimePredictor (milliseconds)
+  int64_t estimated_processing_time_ms = 0;
+
   // output callback
   OutputCallback output_callback;
 
+  // timeout callback, called when request is discarded due to TTFT SLO expiration
+  std::function<void()> timeout_callback = nullptr;
+
   // trace callback
   std::function<void(const std::string&)> trace_callback = nullptr;
+
+  // Expected absolute wall-clock time (ms since epoch) when this request's prefill
+  // will complete. Set at dispatch time, used for PREFILL_DONE correction feedback.
+  int64_t expected_prefill_done_ms = 0;
 
   // dispatch callback
   // This callback will be called in a new thread after the request is scheduled.

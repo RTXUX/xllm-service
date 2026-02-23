@@ -95,10 +95,11 @@ double TimePredictor::predict_ttft(const std::string& model_id, int32_t length) 
     } else if (!ttft_coefficients_.empty()) {
       it = ttft_coefficients_.begin();
     } else {
-      return 0.0;
+      // Default: ttft_ms = 0.0678 * length + 19.63 (fitted from profiling)
+      return 0.0678 * length + 19.63;
     }
   }
-  
+
   const Eigen::VectorXd& coefficients = it->second;
   double result = 0.0;
   double power = 1.0;

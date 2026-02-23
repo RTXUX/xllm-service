@@ -64,3 +64,7 @@ DECLARE_bool(enable_request_trace);
 DECLARE_int32(target_ttft);
 
 DECLARE_int32(target_tpot);
+
+DECLARE_int32(default_ttft_slo_ms);
+
+DECLARE_int32(lst_imh_pre_pull_ms);

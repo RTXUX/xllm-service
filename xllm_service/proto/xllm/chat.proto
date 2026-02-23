@@ -20,7 +20,7 @@ message ChatMessage {
 }
 
 
-// Next Id: 28
+// Next Id: 30
 message ChatRequest {
 
   // ID of the model to use. You can use the ListModels endpoint to list available models.
@@ -115,6 +115,9 @@ message ChatRequest {
   Routing routing = 27;
 
   optional bool offline = 28;
+
+  // TTFT SLO (Time-To-First-Token Service Level Objective) in milliseconds
+  optional uint32 ttft_slo = 29;
 }
 
 message ChatLogProbData {

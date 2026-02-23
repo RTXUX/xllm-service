@@ -83,9 +83,13 @@ void handle_non_stream_response(brpc::Controller* cntl,
                                 std::shared_ptr<T> call_data) {
   std::unique_ptr<brpc::Controller> cntl_guard(cntl);
   if (cntl->Failed()) {
-    LOG(WARNING) << "Fail to send stream generation, " << cntl->ErrorText();
+    LOG(ERROR) << "handle_non_stream_response: redirect failed, "
+               << cntl->ErrorText();
+    call_data->finish_with_error(
+        std::string("Redirect failed: ") + cntl->ErrorText());
     return;
   }
+  auto status = cntl->http_response().status_code();
   call_data->write_and_finish(cntl->response_attachment().to_string());
 }
 
@@ -101,9 +105,11 @@ void handle_first_response(brpc::Controller* cntl,
 
   std::unique_ptr<brpc::Controller> cntl_guard(cntl);
   if (cntl->Failed()) {
-    LOG(WARNING) << "Fail to send stream generation, " << cntl->ErrorText();
+    call_data->finish_with_error(
+        std::string("Redirect failed: ") + cntl->ErrorText());
     return;
   }
+  auto status = cntl->http_response().status_code();
 
   // 1. If enable disagg pd mode, we only receive the first token from prefill
   // instance. The rest of tokens will be received via rpc service.
@@ -181,7 +187,6 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
   brpc::Channel* channel_ptr = scheduler_->get_channel(target_uri).get();
 
   if (channel_ptr == nullptr) {
-    LOG(ERROR) << "Get channel failed for target: " << target_uri;
     call_data->finish_with_error("Internal error: channel not found.");
     return;
   }
@@ -208,8 +213,6 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
                           instance_info.enable_disagg_pd);
     channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, done);
     if (redirect_cntl->Failed()) {
-      LOG(ERROR) << "Redirect to instance error: "
-                  << redirect_cntl->ErrorText();
       call_data->finish_with_error(redirect_cntl->ErrorText());
       scheduler_->finish_request(request->service_request_id, /*error=*/true);
       delete done;
@@ -229,8 +232,6 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
     // the response comes back or error occurs(including timeout).
     channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, NULL);
     if (redirect_cntl->Failed()) {
-      LOG(ERROR) << "Redirect to instance error: "
-                  << redirect_cntl->ErrorText();
       call_data->finish_with_error(redirect_cntl->ErrorText());
       delete redirect_cntl;
       return;
@@ -243,8 +244,6 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
         &handle_non_stream_response<T>, redirect_cntl, call_data);
     channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, done);
     if (redirect_cntl->Failed()) {
-      LOG(ERROR) << "Redirect to instance error: "
-                  << redirect_cntl->ErrorText();
       call_data->finish_with_error(redirect_cntl->ErrorText());
       delete done;
       delete redirect_cntl;
@@ -278,6 +277,14 @@ std::shared_ptr<Request> XllmHttpServiceImpl::generate_request(
             const std::string& message) {
           request_tracer_->log(service_request_id, message);
         };
+  }
+
+  // Set arrival time and TTFT SLO
+  request->arrival_time_ms = absl::ToUnixMillis(absl::Now());
+  if (req_pb->has_ttft_slo()) {
+    request->ttft_slo_ms = req_pb->ttft_slo();
+  } else {
+    request->ttft_slo_ms = options_.default_ttft_slo_ms();
   }
 
   return request;
@@ -329,7 +336,6 @@ void XllmHttpServiceImpl::get_serving(
                                         done]() {
     auto service_request = weak_service_request.lock();
     if (service_request == nullptr) {
-      LOG(ERROR) << "Service request expired before dispatch (get_serving)";
       call_data->finish_with_error("Internal error: request expired.");
       return;
     }
@@ -415,7 +421,6 @@ void XllmHttpServiceImpl::Completions(
                                         cntl]() {
     auto service_request = weak_service_request.lock();
     if (service_request == nullptr) {
-      LOG(ERROR) << "Service request expired before dispatch (Completions)";
       call_data->finish_with_error("Internal error: request expired.");
       return;
     }
@@ -442,6 +447,12 @@ void XllmHttpServiceImpl::Completions(
 
   if (!req_pb->prompt().empty()) {
     service_request->prompt = req_pb->prompt();
+
+    // Set timeout callback for TTFT SLO expiration
+    service_request->timeout_callback = [call_data]() {
+      call_data->finish_with_error("Request timed out: TTFT SLO exceeded", 408);
+    };
+
     // select instance for request
     if (!scheduler_->schedule(service_request)) {
       cntl->SetFailed("Schedule request failed!");
@@ -498,7 +509,6 @@ void XllmHttpServiceImpl::ChatCompletions(
                                         cntl]() {
     auto service_request = weak_service_request.lock();
     if (service_request == nullptr) {
-      LOG(ERROR) << "Service request expired before dispatch (ChatCompletions)";
       call_data->finish_with_error("Internal error: request expired.");
       return;
     }
@@ -527,6 +537,11 @@ void XllmHttpServiceImpl::ChatCompletions(
     for (const auto& message : req_pb->messages()) {
       service_request->messages.emplace_back(message.role(), message.content());
     }
+
+    // Set timeout callback for TTFT SLO expiration
+    service_request->timeout_callback = [call_data]() {
+      call_data->finish_with_error("Request timed out: TTFT SLO exceeded", 408);
+    };
 
     if (!scheduler_->schedule(service_request)) {
       cntl->SetFailed("Schedule request failed!");

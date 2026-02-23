@@ -134,8 +134,10 @@ class StreamCallData : public CallData {
   }
 
   // For non stream response
-  bool finish_with_error(const std::string& error_message) {
+  bool finish_with_error(const std::string& error_message,
+                         int http_status_code = 500) {
     if (!stream_) {
+      controller_->http_response().set_status_code(http_status_code);
       controller_->SetFailed(error_message);
     } else {
       io_buf_.clear();

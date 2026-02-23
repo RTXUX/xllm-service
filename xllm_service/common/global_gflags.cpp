@@ -92,6 +92,16 @@ DEFINE_string(tokenizer_path, "", "tokenizer config path.");
 
 DEFINE_bool(enable_request_trace, false, "Whether to enable request trace");
 
+DEFINE_int32(default_ttft_slo_ms,
+             30000,
+             "Default TTFT SLO in milliseconds when request doesn't specify one.");
+
+DEFINE_int32(lst_imh_pre_pull_ms,
+             0,
+             "LST-IMH pre-pull threshold in ms. Dispatch coordinator pulls "
+             "requests when instance estimated remaining time <= this value. "
+             "0 means wait until instance is completely idle (default).");
+
 DEFINE_int32(target_ttft,
              1000,
              "Target Time to First Token (TTFT), in milliseconds.");

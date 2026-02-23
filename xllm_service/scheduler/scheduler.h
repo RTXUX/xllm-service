@@ -30,7 +30,23 @@ limitations under the License.
 #include "tokenizer/tokenizer.h"
 #include "tokenizer/tokenizer_args.h"
 
+#include <condition_variable>
+#include <queue>
+
 namespace xllm_service {
+
+// Job representation for the scheduling algorithm
+struct SchedulingJob {
+  std::shared_ptr<Request> request;
+  int64_t processing_time_ms;  // p_j: estimated prefill time
+  int64_t deadline_ms;         // d_j: arrival_time + ttft_slo
+};
+
+// Machine (instance) representation for the scheduling algorithm
+struct MachineInfo {
+  std::string instance_name;
+  int64_t availability_time_ms;  // T_i: estimated time until free
+};
 
 // A scheduler for scheduling requests and instances
 class Scheduler final {
@@ -85,6 +101,23 @@ class Scheduler final {
 
   void process_request_queue(const std::string& model_name);
 
+  // LST-IMH dispatch coordinator (runs in dedicated thread)
+  void dispatch_coordinator();
+
+  // Signal the dispatch coordinator to wake up
+  void signal_dispatch();
+
+  // Run LST-IMH algorithm: assign jobs to machines maximizing on-time completions
+  // Returns: instance_name -> vector of assigned jobs (sorted by EDD)
+  std::unordered_map<std::string, std::vector<SchedulingJob>>
+      run_lst_imh(std::vector<SchedulingJob>& jobs,
+                  std::vector<MachineInfo>& machines);
+
+  // Moore-Hodgson algorithm for single machine: maximize on-time jobs
+  // Returns jobs that can be completed on-time, sorted by EDD
+  std::vector<SchedulingJob> moore_hodgson(
+      const std::vector<SchedulingJob>& jobs, int64_t T);
+
   Tokenizer* get_tls_tokenizer();
 
  private:
@@ -138,6 +171,23 @@ class Scheduler final {
 
   // used when receive token from decode instance.
   ResponseHandler response_handler_;
+
+  // === LST-IMH mode members ===
+
+  // Pending request queue (requests waiting to be dispatched)
+  std::mutex pending_queue_mutex_;
+  std::vector<std::shared_ptr<Request>> pending_queue_;
+
+  // Dispatch coordinator synchronization
+  std::mutex dispatch_mutex_;
+  std::condition_variable dispatch_cv_;
+  bool dispatch_signal_ = false;
+
+  // Dispatch coordinator thread
+  std::unique_ptr<std::thread> dispatch_coordinator_thread_;
+
+  // Model name for LST-IMH mode (single model assumption)
+  std::string lst_imh_model_name_;
 };
 
 }  // namespace xllm_service

@@ -71,6 +71,12 @@ class Options {
 
   // trace options
   PROPERTY(bool, enable_request_trace) = false;
+
+  // default TTFT SLO in milliseconds (used when request doesn't specify one)
+  PROPERTY(int32_t, default_ttft_slo_ms) = 30000;
+
+  // LST-IMH pre-pull threshold in milliseconds
+  PROPERTY(int32_t, lst_imh_pre_pull_ms) = 0;
 };
 
 }  // namespace xllm_service

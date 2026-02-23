@@ -164,9 +164,10 @@ struct RequestMetrics {
   // model_id -> metrics
   std::unordered_map<std::string, ModelRequestMetrics> model_metrics;
 
-  // Estimated execution time for all prefill requests for all models on the instance.
-  // The unit is milliseconds.
-  int64_t estimated_prefill_time;
+  // Estimated absolute wall-clock time (ms since epoch) when all queued prefills
+  // on this instance will complete. Updated on SCHEDULE/FINISH_PREFILL/CANCEL and
+  // corrected by actual PREFILL_DONE feedback.
+  int64_t estimated_prefill_done_time = 0;
 };
 
 struct InstanceMetaInfo {
@@ -192,6 +193,10 @@ struct InstanceMetaInfo {
   std::vector<uint64_t> v_cache_ids;
   int32_t dp_size;
   bool enable_disagg_pd = false;
+  // Per-worker device addresses for D2D transfer (format: "IP:port")
+  std::vector<std::string> device_addrs;
+  // P2P addresses for mooncake transfer engine (format: "IP:port")
+  std::vector<std::string> p2p_addrs;
 
   // ttft profiling data per model: model_id -> profiling_data
   std::unordered_map<std::string, std::vector<std::pair<int32_t, double>>> ttft_profiling_data;
@@ -218,6 +223,8 @@ struct InstanceMetaInfo {
     json_val["v_cache_ids"] = v_cache_ids;
     json_val["dp_size"] = dp_size;
     json_val["enable_disagg_pd"] = enable_disagg_pd;
+    json_val["device_addrs"] = device_addrs;
+    json_val["p2p_addrs"] = p2p_addrs;
     
     // Serialize ttft_profiling_data as object with model_id keys
     nlohmann::json ttft_json;
@@ -269,6 +276,20 @@ struct InstanceMetaInfo {
 
       if (json_value.contains("enable_disagg_pd")) {
         enable_disagg_pd = json_value.at("enable_disagg_pd").get<bool>();
+      }
+
+      // Parse device_ips and ports, combine into device_addrs ("IP:port")
+      if (json_value.contains("device_ips") && json_value.contains("ports")) {
+        auto ips = json_value["device_ips"].get<std::vector<std::string>>();
+        auto ports = json_value["ports"].get<std::vector<uint16_t>>();
+        for (size_t i = 0; i < ips.size() && i < ports.size(); ++i) {
+          device_addrs.push_back(ips[i] + ":" + std::to_string(ports[i]));
+        }
+      }
+
+      // Parse P2P addresses for mooncake transfer engine
+      if (json_value.contains("p2p_addrs")) {
+        p2p_addrs = json_value["p2p_addrs"].get<std::vector<std::string>>();
       }
 
       // Parse ttft_profiling_data as object with model_id keys
@@ -477,6 +498,8 @@ struct InstanceXTensorInfo {
   std::unordered_map<std::string, std::vector<WeightSegment>> model_weight_segments;
   // Per-worker device addresses for D2D transfer (format: "IP:port")
   std::vector<std::string> device_addrs;
+  // P2P addresses for mooncake transfer engine (format: "IP:port")
+  std::vector<std::string> p2p_addrs;
 
   // Get minimum free bytes across all workers (supports TP)
   uint64_t get_min_free_bytes() const {

@@ -533,7 +533,14 @@ void InstanceMgr::register_instance(const std::string& instance_name,
     if (instance_xtensor_infos_.find(instance_name) == instance_xtensor_infos_.end()) {
       InstanceXTensorInfo info;
       info.is_valid = false;  // Mark as not yet received valid data
+      // Populate device_addrs from registration info for early D2D linking
+      info.device_addrs = metainfo.device_addrs;
+      info.p2p_addrs = metainfo.p2p_addrs;
       instance_xtensor_infos_[instance_name] = std::move(info);
+    } else if (instance_xtensor_infos_[instance_name].device_addrs.empty()) {
+      // Entry exists but missing device_addrs — fill from registration
+      instance_xtensor_infos_[instance_name].device_addrs = metainfo.device_addrs;
+      instance_xtensor_infos_[instance_name].p2p_addrs = metainfo.p2p_addrs;
     }
   }
 
@@ -839,13 +846,63 @@ void InstanceMgr::update_request_metrics(std::shared_ptr<Request> request,
 
       decode_model_it->second.decode_request_num += 1;
       decode_model_it->second.decode_token_num += num_prompt_tokens;
+
+      // Update estimated_prefill_done_time if not already set by SLO_AWARE selection
+      if (request->expected_prefill_done_ms == 0) {
+        int64_t now_ms = absl::ToUnixMillis(absl::Now());
+        auto& epdt = prefill_instance_it->second.estimated_prefill_done_time;
+        epdt = std::max(epdt, now_ms) + request->estimated_ttft;
+        request->expected_prefill_done_ms = epdt;
+      }
+
+      // Track this request for EPDT correction propagation
+      inflight_prefill_requests_[request->routing.prefill_name].push_back(request);
       break;
     case RequestAction::FINISH_PREFILL:
       // update the request metrics for prefill and decode instance when request
       // finishes the prefill phase
       prefill_model_it->second.prefill_request_num -= 1;
       prefill_model_it->second.prefill_token_num -= num_prompt_tokens;
-      prefill_instance_it->second.estimated_prefill_time -= request->estimated_ttft;
+
+      // Apply correction feedback to estimated_prefill_done_time
+      {
+        int64_t now_ms = absl::ToUnixMillis(absl::Now());
+        auto& epdt = prefill_instance_it->second.estimated_prefill_done_time;
+        if (request->expected_prefill_done_ms > 0) {
+          // Shift EPDT by the difference between actual and expected completion
+          int64_t correction = now_ms - request->expected_prefill_done_ms;
+          LOG(INFO) << "[EPDT] FINISH_PREFILL correction: instance="
+                    << request->routing.prefill_name
+                    << " expected=" << request->expected_prefill_done_ms
+                    << " actual=" << now_ms
+                    << " correction=" << correction << "ms";
+          epdt += correction;
+
+          // Propagate correction to all remaining inflight requests on this
+          // instance so their future FINISH_PREFILL won't double-count.
+          auto& inflight =
+              inflight_prefill_requests_[request->routing.prefill_name];
+          for (auto& req : inflight) {
+            if (req->service_request_id != request->service_request_id) {
+              req->expected_prefill_done_ms += correction;
+            }
+          }
+        }
+        // Clamp: EPDT should never be in the past
+        epdt = std::max(epdt, now_ms);
+
+        // Remove this request from inflight list
+        auto& inflight =
+            inflight_prefill_requests_[request->routing.prefill_name];
+        inflight.erase(
+            std::remove_if(
+                inflight.begin(), inflight.end(),
+                [&](const std::shared_ptr<Request>& r) {
+                  return r->service_request_id ==
+                         request->service_request_id;
+                }),
+            inflight.end());
+      }
 
       decode_model_it->second.decode_token_num += 1;
       break;
@@ -866,7 +923,36 @@ void InstanceMgr::update_request_metrics(std::shared_ptr<Request> request,
       // request is cancelled
       prefill_model_it->second.prefill_request_num -= 1;
       prefill_model_it->second.prefill_token_num -= num_prompt_tokens;
-      prefill_instance_it->second.estimated_prefill_time -= request->estimated_ttft;
+
+      // Remove this request's contribution from EPDT
+      {
+        auto& epdt = prefill_instance_it->second.estimated_prefill_done_time;
+        int64_t removed_ttft = request->estimated_ttft;
+        epdt -= removed_ttft;
+        int64_t now_ms = absl::ToUnixMillis(absl::Now());
+        // Clamp: EPDT should never be in the past
+        epdt = std::max(epdt, now_ms);
+
+        // Propagate removal to remaining inflight requests: their expected
+        // times shift earlier by the cancelled request's contribution.
+        auto& inflight =
+            inflight_prefill_requests_[request->routing.prefill_name];
+        for (auto& req : inflight) {
+          if (req->service_request_id != request->service_request_id) {
+            req->expected_prefill_done_ms -= removed_ttft;
+          }
+        }
+
+        // Remove this request from inflight list
+        inflight.erase(
+            std::remove_if(
+                inflight.begin(), inflight.end(),
+                [&](const std::shared_ptr<Request>& r) {
+                  return r->service_request_id ==
+                         request->service_request_id;
+                }),
+            inflight.end());
+      }
 
       decode_model_it->second.decode_request_num -= 1;
       decode_model_it->second.decode_token_num -=
@@ -913,25 +999,41 @@ bool InstanceMgr::select_instance_pair_on_slo(
     return false;
   }
 
-  // get min prefill time instance from request metrics
+  // get earliest estimated_prefill_done_time instance from request metrics
   auto best_instance = awake_instances[0];
-  int64_t min_prefill_time = std::numeric_limits<int64_t>::max();
+  int64_t min_done_time = std::numeric_limits<int64_t>::max();
   for (auto& instance : awake_instances) {
-    int64_t prefill_time = request_metrics_[instance].estimated_prefill_time;
-    if (prefill_time < min_prefill_time) {
+    int64_t done_time = request_metrics_[instance].estimated_prefill_done_time;
+    if (done_time < min_done_time) {
       best_instance = instance;
-      min_prefill_time = prefill_time;
+      min_done_time = done_time;
     }
   }
 
   request->routing.prefill_name = best_instance;
-  auto& time_predictor = get_time_predictor(best_instance);
+  request->routing.decode_name = best_instance;
   request->estimated_ttft =
-      time_predictor.predict_ttft(request->model, request->token_ids.size());
-  request_metrics_[best_instance].estimated_prefill_time +=
-      request->estimated_ttft;
+      predict_ttft(best_instance, request->model, request->token_ids.size());
+
+  // Update EPDT immediately to prevent concurrent selections picking same instance
+  {
+    int64_t now_ms = absl::ToUnixMillis(absl::Now());
+    auto& epdt = request_metrics_[best_instance].estimated_prefill_done_time;
+    epdt = std::max(epdt, now_ms) + request->estimated_ttft;
+    request->expected_prefill_done_ms = epdt;
+  }
 
   return true;
+}
+
+int64_t InstanceMgr::get_estimated_prefill_done_time(
+    const std::string& instance_name) {
+  std::lock_guard<std::mutex> lock(request_metrics_mutex_);
+  auto it = request_metrics_.find(instance_name);
+  if (it != request_metrics_.end()) {
+    return it->second.estimated_prefill_done_time;
+  }
+  return 0;
 }
 
 // flip all models
@@ -982,6 +1084,34 @@ TimePredictor& InstanceMgr::get_time_predictor(
                << instance_name;
   }
   return it->second;
+}
+
+double InstanceMgr::predict_ttft(const std::string& instance_name,
+                                  const std::string& model_id,
+                                  int32_t token_count) {
+  std::lock_guard<std::mutex> lock(time_predictor_mutex_);
+  auto it = time_predictors_.find(instance_name);
+  if (it != time_predictors_.end()) {
+    double ttft = it->second.predict_ttft(model_id, token_count);
+    if (ttft > 0) {
+      return ttft;
+    }
+  }
+  // Fallback: ttft_ms = 0.0678 * tokens + 19.63 (fitted from profiling)
+  return static_cast<double>(token_count) * 0.0678 + 19.63;
+}
+
+double InstanceMgr::predict_ttft_any_instance(const std::string& model_id,
+                                               int32_t token_count) {
+  std::lock_guard<std::mutex> lock(time_predictor_mutex_);
+  for (auto& [instance_name, predictor] : time_predictors_) {
+    double ttft = predictor.predict_ttft(model_id, token_count);
+    if (ttft > 0) {
+      return ttft;
+    }
+  }
+  // Fallback: ttft_ms = 0.0678 * tokens + 19.63 (fitted from profiling)
+  return static_cast<double>(token_count) * 0.0678 + 19.63;
 }
 
 void InstanceMgr::send_model_sleep(const std::string& instance_name,
@@ -1633,8 +1763,24 @@ void InstanceMgr::update_xtensor_info(
   }
 
   // Copy device addresses for D2D transfer
-  for (const auto& addr : xtensor_info.device_addrs()) {
-    info.device_addrs.push_back(addr);
+  // Prefer heartbeat-reported addresses; preserve registration-time addresses if heartbeat doesn't include them
+  if (xtensor_info.device_addrs_size() > 0) {
+    for (const auto& addr : xtensor_info.device_addrs()) {
+      info.device_addrs.push_back(addr);
+    }
+  } else {
+    auto it = instance_xtensor_infos_.find(instance_name);
+    if (it != instance_xtensor_infos_.end()) {
+      info.device_addrs = it->second.device_addrs;
+    }
+  }
+
+  // Preserve p2p_addrs from registration (not reported via heartbeat)
+  {
+    auto it = instance_xtensor_infos_.find(instance_name);
+    if (it != instance_xtensor_infos_.end()) {
+      info.p2p_addrs = it->second.p2p_addrs;
+    }
   }
 
   instance_xtensor_infos_[instance_name] = std::move(info);
@@ -1702,22 +1848,22 @@ std::optional<D2DWakeupInfo> InstanceMgr::find_d2d_source(
       continue;
     }
 
-    // Get device addresses for D2D transfer
-    // Prefer xtensor heartbeat addresses; fall back to registration addrs
-    std::vector<std::string> device_addrs;
-    if (!xtensor_info->device_addrs.empty()) {
-      device_addrs = xtensor_info->device_addrs;
+    // Get P2P addresses for D2D weight transfer
+    // P2P addresses are mooncake transfer engine addresses (different from device_addrs)
+    std::vector<std::string> p2p_addrs;
+    if (!xtensor_info->p2p_addrs.empty()) {
+      p2p_addrs = xtensor_info->p2p_addrs;
     } else {
-      // Fallback: try InstanceMetaInfo.addrs from registration
+      // Fallback: try InstanceMetaInfo.p2p_addrs from registration
       std::shared_lock<std::shared_mutex> lock(inst_mutex_);
       auto meta_it = instances_.find(source_instance_name);
       if (meta_it != instances_.end()) {
-        device_addrs = meta_it->second.addrs;
+        p2p_addrs = meta_it->second.p2p_addrs;
       }
     }
 
-    if (device_addrs.empty()) {
-      LOG(INFO) << "No device addresses for source instance " << source_instance_name
+    if (p2p_addrs.empty()) {
+      LOG(INFO) << "No P2P addresses for source instance " << source_instance_name
                 << ", skipping for D2D";
       continue;
     }
@@ -1725,11 +1871,11 @@ std::optional<D2DWakeupInfo> InstanceMgr::find_d2d_source(
     // Found a suitable source - build D2DWakeupInfo
     D2DWakeupInfo d2d_info;
     d2d_info.source_instance_name = source_instance_name;
-    d2d_info.remote_addrs = device_addrs;
+    d2d_info.remote_addrs = p2p_addrs;
 
     // For each remote addr, add the weight segments
     // Currently assuming all workers have the same weight segments
-    for (size_t i = 0; i < device_addrs.size(); ++i) {
+    for (size_t i = 0; i < p2p_addrs.size(); ++i) {
       d2d_info.src_weight_segments.push_back(seg_it->second);
     }
 

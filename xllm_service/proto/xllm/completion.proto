@@ -5,7 +5,7 @@ option cc_enable_arenas = true;
 
 import "common.proto";
 
-// Next ID: 28
+// Next ID: 30
 message CompletionRequest {
   // ID of the model to use. (required)
   // You can use the ListModels endpoint to list available models.
@@ -92,6 +92,9 @@ message CompletionRequest {
   Routing routing = 27;
 
   optional bool offline = 28;
+
+  // TTFT SLO (Time-To-First-Token Service Level Objective) in milliseconds
+  optional uint32 ttft_slo = 29;
 }
 
 message LogProbs {

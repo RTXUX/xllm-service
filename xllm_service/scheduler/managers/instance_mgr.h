@@ -41,10 +41,10 @@ class InstanceMgr final {
  public:
 
   const std::vector<std::pair<std::string, std::string>> MODELS = {
-    {"Qwen3-8B", "/export/home/models/Qwen3-8B"},
-    {"Qwen2-7B", "/export/home/models/Qwen2-7B"},
-    {"Qwen2.5-14B", "/export/home/models/Qwen2.5-14B"},
-    {"Qwen3-4B", "/export/home/models/Qwen3-4B"}
+    {"Qwen3-8B", "/export/home/models/Qwen3-8B"}
+    // {"Qwen2-7B", "/export/home/models/Qwen2-7B"},
+    // {"Qwen2.5-14B", "/export/home/models/Qwen2.5-14B"},
+    // {"Qwen3-4B", "/export/home/models/Qwen3-4B"}
     // {"Qwen2.5-3b", "/export/home/models/Qwen2.5-3b"}
     // {"Qwen3-30B-A3B-Instruct-2507", "/export/home/models/Qwen3-30B-A3B-Instruct-2507"}
     // {"Qwen3-30B-A3B-W8A8", "/export/home/models/Qwen3-30B-A3B-W8A8"},
@@ -55,7 +55,7 @@ class InstanceMgr final {
   
   static constexpr int kMaxWakeupTimeoutms = 10000;
 
-  static constexpr int kTensorParallelSize = 2;
+  static constexpr int kTensorParallelSize = 1;
 
  public:
   explicit InstanceMgr(const Options& options,
@@ -92,6 +92,9 @@ class InstanceMgr final {
 
   // select instances based on the SLO
   bool select_instance_pair_on_slo(std::shared_ptr<Request> request);
+
+  // Get the estimated prefill done time (absolute ms since epoch) for an instance
+  int64_t get_estimated_prefill_done_time(const std::string& instance_name);
 
   void set_as_master();
 
@@ -146,6 +149,13 @@ class InstanceMgr final {
   // Check if instance has enough space to load a model
   bool has_enough_space_for_model(const std::string& instance_name,
                                    const std::string& model_id);
+
+  // Predict TTFT for a specific instance (heterogeneous instances, for SLO_AWARE)
+  double predict_ttft(const std::string& instance_name,
+                      const std::string& model_id, int32_t token_count);
+
+  // Predict TTFT using any available instance (homogeneous instances, for LST_IMH)
+  double predict_ttft_any_instance(const std::string& model_id, int32_t token_count);
 
  private:
   void init_model_memory_specs();
@@ -267,7 +277,14 @@ class InstanceMgr final {
   // count, prefill request count, estimated prefill execution time, decode
   // token count, and decode request count.
   std::mutex request_metrics_mutex_;
-  std::unordered_map<std::string, RequestMetrics> request_metrics_;  
+  std::unordered_map<std::string, RequestMetrics> request_metrics_;
+
+  // Per-instance list of inflight prefill requests (dispatched but not yet
+  // FINISH_PREFILL / CANCEL). Used to propagate EPDT corrections to all
+  // remaining requests so that later FINISH_PREFILL does not double-count.
+  // Protected by request_metrics_mutex_.
+  std::unordered_map<std::string, std::vector<std::shared_ptr<Request>>>
+      inflight_prefill_requests_;  
   
   std::mutex allocation_mutex_;
 
