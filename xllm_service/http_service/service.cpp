@@ -29,6 +29,7 @@ limitations under the License.
 #include "chat.pb.h"
 #include "common/call_data.h"
 #include "common/closure_guard.h"
+#include "common/global_gflags.h"
 #include "common/utils.h"
 #include "common/xllm/uuid.h"
 #include "completion.pb.h"
@@ -434,6 +435,10 @@ void XllmHttpServiceImpl::Completions(
     req_pb->mutable_routing()->set_decode_name(
         service_request->routing.decode_name);
 
+    if (FLAGS_enable_prefill_only_mode) {
+      req_pb->set_max_tokens(1);
+    }
+
     std::string req_attachment;
     if (!json2pb::ProtoMessageToJson(*req_pb, &req_attachment)) {
       // cntl->SetFailed("proto to json failed");
@@ -520,6 +525,10 @@ void XllmHttpServiceImpl::ChatCompletions(
         service_request->routing.prefill_name);
     req_pb->mutable_routing()->set_decode_name(
         service_request->routing.decode_name);
+
+    if (FLAGS_enable_prefill_only_mode) {
+      req_pb->set_max_tokens(1);
+    }
 
     std::string req_attachment;
     if (!json2pb::ProtoMessageToJson(*req_pb, &req_attachment)) {

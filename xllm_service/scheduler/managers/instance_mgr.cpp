@@ -24,8 +24,12 @@ limitations under the License.
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <cmath>
 #include <limits>
+#include <numeric>
 #include <shared_mutex>
+
+#include "scheduler/resource_model/linear_resource_model.h"
 
 #include "common/global_gflags.h"
 #include "common/types.h"
@@ -69,6 +73,7 @@ InstanceMgr::InstanceMgr(const Options& options,
 
 void InstanceMgr::init() {
   init_model_memory_specs();
+  init_model_resource_coefficients();
 
   {
     std::unique_lock<std::shared_mutex> lock(inst_mutex_);
@@ -584,6 +589,7 @@ void InstanceMgr::register_instance(const std::string& instance_name,
   LOG(INFO) << "Registered instance " << instance_name << " type " << (int)metainfo.type;
 
   instances_.insert(std::make_pair(instance_name, std::move(metainfo)));
+  total_available_gpus_.fetch_add(kTensorParallelSize);
 }
 
 std::shared_ptr<brpc::Channel> InstanceMgr::get_channel(
@@ -714,6 +720,7 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
 
         instances_.erase(iter);
         cached_channels_.erase(iter);
+        total_available_gpus_.fetch_sub(kTensorParallelSize);
         {
           std::lock_guard<std::mutex> time_predictor_lock(
               time_predictor_mutex_);
@@ -1197,6 +1204,21 @@ void InstanceMgr::init_model_memory_specs() {
     // model_memory_specs_["Qwen3-32B-W8A8"] = 40.0 + 5.0;// 45.0GB
 }
 
+void InstanceMgr::init_model_resource_coefficients() {
+  gpu_hw_spec_.hbm_per_gpu_gb = FLAGS_gpu_hbm_per_gpu_gb;
+  gpu_hw_spec_.compute_sm_per_gpu = FLAGS_gpu_compute_sm_per_gpu;
+
+  // Hardcoded resource coefficients per model
+  model_resource_models_["Qwen3-8B"] = std::make_unique<LinearResourceModel>(
+      /*hbm_a=*/0.001, /*hbm_b=*/20.0,
+      /*compute_a=*/0.0005, /*compute_b=*/0.0);
+
+  LOG(INFO) << "Initialized model resource models for "
+            << model_resource_models_.size() << " models, "
+            << "GPU HBM=" << gpu_hw_spec_.hbm_per_gpu_gb << "GB, "
+            << "GPU compute SM=" << gpu_hw_spec_.compute_sm_per_gpu;
+}
+
 // TODO: support dynamic instance memory specs, rather than hardcoded.
 double InstanceMgr::get_model_memory_size(const std::string& model_id) {
     if (model_memory_specs_.count(model_id)) {
@@ -1610,68 +1632,194 @@ uint64_t InstanceMgr::compute_max_contiguous_free_space(
   return max_free;
 }
 
-void InstanceMgr::auto_scaling() {
+std::vector<ModelScalingTarget> InstanceMgr::compute_scaling_plan() {
+  std::vector<ModelScalingTarget> targets;
 
-  LOG(INFO) << "~~ Auto scaling disabled.";
-  return;
+  int32_t total_gpus = total_available_gpus_.load();
+  int32_t budget = total_gpus;  // All GPUs available for elastic pool
 
-  // Part 1: Distribute instances among models (Scaling Up/Down)
-  const std::vector<int> rank_targets = {4, 3}; // Target counts for Top 1, Top 2, etc.
-
-  struct ModelHeat {
-    std::string id;
-    int64_t heat;
-  };
-  std::vector<ModelHeat> sorted_models;
-
+  // Collect per-model heat and compute raw GPU targets
   {
     std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
     for (const auto& pair : model_instance_mgrs_) {
-      sorted_models.push_back({pair.first, pair.second->get_model_heat()});
-      LOG(INFO) << "Model " << pair.first << ": Heat = " << pair.second->get_model_heat();
+      ModelScalingTarget t;
+      t.model_id = pair.first;
+      t.model_heat = pair.second->get_model_heat();
+      auto it = model_resource_models_.find(t.model_id);
+      t.gpu_target = (t.model_heat == 0) ? 0
+          : (it != model_resource_models_.end())
+              ? it->second->compute_gpu_target(t.model_heat, gpu_hw_spec_)
+              : 1;
+      targets.push_back(t);
     }
   }
 
-  std::sort(sorted_models.begin(), sorted_models.end(),
-            [](const ModelHeat& a, const ModelHeat& b) {
-              return a.heat > b.heat;
-            });
+  // Compute total elastic demand
+  int32_t elastic_needed = 0;
+  for (auto& t : targets) {
+    elastic_needed += t.gpu_target;
+  }
 
-  for (size_t i = 0; i < sorted_models.size(); ++i) {
-    if (i >= rank_targets.size()) break;
-
-    const auto& model_info = sorted_models[i];
-    if (model_info.heat == 0) continue; // Skip if no heat
-
-    int target_count = rank_targets[i];
-    auto model_mgr = get_model_instance_mgr(model_info.id);
-    int count_margin = target_count - model_mgr->get_allocation_count();
-
-    if (count_margin > 0) {
-      LOG(INFO) << "Auto scaling: model " << model_info.id << " (Rank " << i + 1
-                << ", Heat " << model_info.heat << ") needs " << count_margin << " more instances.";
-      auto instance_names = allocate_instance_for_model(model_info.id, target_count);
-      
-      if (!instance_names.empty()) {
-        LOG(INFO) << "Allocated " << instance_names.size() << " instances for " << model_info.id << ":";
-        for (const auto& name : instance_names) {
-          LOG(INFO) << "  " << name;
-        }
+  // Apply budget constraint with proportional scaling
+  if (elastic_needed <= budget) {
+    // Enough GPUs for all models
+    for (auto& t : targets) {
+      t.gpu_allocated = t.gpu_target;
+    }
+  } else if (elastic_needed > 0) {
+    // Proportional scaling: scale down proportionally
+    double ratio = std::min(1.0, static_cast<double>(budget) / elastic_needed);
+    int32_t allocated_sum = 0;
+    for (auto& t : targets) {
+      if (t.gpu_target > 0) {
+        t.gpu_allocated = std::max(1,
+            static_cast<int32_t>(std::floor(t.gpu_target * ratio)));
       } else {
-        LOG(ERROR) << "Failed to allocate instances for " << model_info.id;
+        t.gpu_allocated = 0;
       }
-    } else {
-      LOG(INFO) << "Model " << model_info.id << " (Rank " << i + 1 << ") satisfied with "
-                << model_mgr->get_allocation_count() << " instances (Target: " << target_count << ").";
+      allocated_sum += t.gpu_allocated;
+    }
+
+    // Trim rounding overshoot: remove excess from lowest-heat models
+    // Sort by heat ascending for trimming
+    std::vector<size_t> indices(targets.size());
+    std::iota(indices.begin(), indices.end(), 0);
+    std::sort(indices.begin(), indices.end(), [&targets](size_t a, size_t b) {
+      return targets[a].model_heat < targets[b].model_heat;
+    });
+
+    while (allocated_sum > budget) {
+      bool trimmed = false;
+      for (size_t idx : indices) {
+        if (targets[idx].gpu_allocated > 1) {
+          targets[idx].gpu_allocated--;
+          allocated_sum--;
+          trimmed = true;
+          if (allocated_sum <= budget) break;
+        }
+      }
+      // If we couldn't trim anything above 1, trim to 0
+      if (!trimmed) {
+        for (size_t idx : indices) {
+          if (targets[idx].gpu_allocated > 0) {
+            targets[idx].gpu_allocated--;
+            allocated_sum--;
+            if (allocated_sum <= budget) break;
+          }
+        }
+        if (allocated_sum <= budget) break;
+      }
     }
   }
 
-  // Part 2: Internal Prefill/Decode Instance Distribution (PD Separation)
-  {
-    std::lock_guard<std::mutex> lock(latency_metrics_mutex_);
-    std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
-    for (const auto& pair : model_instance_mgrs_) {
-      pair.second->auto_flipping(latency_metrics_);
+  // Log the scaling plan
+  for (const auto& t : targets) {
+    LOG(INFO) << "Scaling plan: model=" << t.model_id
+              << " heat=" << t.model_heat
+              << " gpu_target=" << t.gpu_target
+              << " gpu_allocated=" << t.gpu_allocated;
+  }
+
+  return targets;
+}
+
+void InstanceMgr::scale_down_model(const std::string& model_id,
+                                    int32_t target_count) {
+  auto model_mgr = get_model_instance_mgr(model_id);
+  if (!model_mgr) {
+    LOG(ERROR) << "scale_down_model: model manager not found for " << model_id;
+    return;
+  }
+
+  // Get awake unlocked instances (safe to scale down)
+  auto unlocked = model_mgr->get_unlocked_instances();
+  int32_t current_count = static_cast<int32_t>(unlocked.size());
+  int32_t to_remove = current_count - target_count;
+
+  if (to_remove <= 0) return;
+
+  LOG(INFO) << "Scaling down model " << model_id
+            << ": current=" << current_count
+            << " target=" << target_count
+            << " removing=" << to_remove;
+
+  // Mark excess instances as DRAINING
+  std::vector<std::string> instances_to_sleep;
+  for (int32_t i = 0; i < to_remove && i < static_cast<int32_t>(unlocked.size()); ++i) {
+    model_mgr->set_model_state(unlocked[i], ModelState::DRAINING);
+    instances_to_sleep.push_back(unlocked[i]);
+  }
+
+  // Spawn threads to wait for drain then sleep
+  std::vector<std::thread> drain_threads;
+  for (const auto& instance_name : instances_to_sleep) {
+    drain_threads.emplace_back([this, instance_name, model_id]() {
+      // Wait for all requests to finish on this model/instance
+      {
+        std::unique_lock<std::mutex> request_metrics_lock(request_metrics_mutex_);
+        auto instance_it = request_metrics_.find(instance_name);
+        if (instance_it == request_metrics_.end()) {
+          LOG(ERROR) << "scale_down_model: no request metrics for " << instance_name;
+          return;
+        }
+        auto model_it = instance_it->second.model_metrics.find(model_id);
+        if (model_it == instance_it->second.model_metrics.end()) {
+          LOG(ERROR) << "scale_down_model: no model metrics for " << model_id
+                     << " on " << instance_name;
+          return;
+        }
+        auto& metrics = model_it->second;
+        metrics.cv_idle.wait(request_metrics_lock, [&metrics]() {
+          return metrics.prefill_request_num == 0 &&
+                 metrics.decode_request_num == 0;
+        });
+      }
+
+      // Double-check can_sleep for D2D lock race
+      auto mgr = get_model_instance_mgr(model_id);
+      if (mgr && !mgr->can_sleep(instance_name)) {
+        LOG(WARNING) << "scale_down_model: " << model_id << " on "
+                     << instance_name << " became D2D locked, skipping sleep";
+        return;
+      }
+
+      send_model_sleep(instance_name, model_id);
+      LOG(INFO) << "scale_down_model: slept model " << model_id
+                << " on " << instance_name;
+    });
+  }
+
+  for (auto& thread : drain_threads) {
+    if (thread.joinable()) {
+      thread.join();
+    }
+  }
+}
+
+void InstanceMgr::auto_scaling() {
+  // Two-pool auto-scaling: compute per-model GPU targets and scale up/down
+
+  auto scaling_plan = compute_scaling_plan();
+
+  for (const auto& target : scaling_plan) {
+    auto model_mgr = get_model_instance_mgr(target.model_id);
+    if (!model_mgr) continue;
+
+    int32_t current_wakeup = model_mgr->get_wakeup_count();
+    int32_t current_alloc = model_mgr->get_allocation_count();
+
+    if (target.gpu_allocated > current_alloc) {
+      // Scale up
+      LOG(INFO) << "Auto scaling UP: model=" << target.model_id
+                << " current_alloc=" << current_alloc
+                << " target=" << target.gpu_allocated;
+      allocate_instance_for_model(target.model_id, target.gpu_allocated);
+    } else if (target.gpu_allocated < current_wakeup) {
+      // Scale down
+      LOG(INFO) << "Auto scaling DOWN: model=" << target.model_id
+                << " current_wakeup=" << current_wakeup
+                << " target=" << target.gpu_allocated;
+      scale_down_model(target.model_id, target.gpu_allocated);
     }
   }
 }

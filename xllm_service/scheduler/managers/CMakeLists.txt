@@ -17,6 +17,7 @@ cc_library(
     :common
     :etcd_client
     :request
+    :resource_model
     absl::random_random
     absl::strings
     glog::glog

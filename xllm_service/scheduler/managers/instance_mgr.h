@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <brpc/channel.h>
 
+#include <memory>
 #include <optional>
 #include <shared_mutex>
 #include <thread>
@@ -33,6 +34,7 @@ limitations under the License.
 #include "request/request.h"
 #include "scheduler/etcd_client/etcd_client.h"
 #include "scheduler/managers/model_instance_mgr.h"
+#include "scheduler/resource_model/resource_model.h"
 #include "xllm_rpc_service.pb.h"
 
 namespace xllm_service {
@@ -122,6 +124,8 @@ class InstanceMgr final {
                                                        int32_t target_model_count);
   void auto_scaling();
 
+  void scale_down_model(const std::string& model_id, int32_t target_count);
+
   std::shared_ptr<ModelInstanceMgr> get_model_instance_mgr(const std::string& model_id);
 
   // Update XTensor info for an instance from heartbeat
@@ -159,6 +163,8 @@ class InstanceMgr final {
 
  private:
   void init_model_memory_specs();
+  void init_model_resource_coefficients();
+  std::vector<ModelScalingTarget> compute_scaling_plan();
   double get_model_memory_size(const std::string& model_id);
   // Select models to evict on a specific instance to free up required_space
   EvictionPlanInfo select_eviction_candidates(const std::string& instance_name, double required_space);
@@ -287,6 +293,13 @@ class InstanceMgr final {
       inflight_prefill_requests_;  
   
   std::mutex allocation_mutex_;
+
+  // Two-pool auto-scaling state
+  std::atomic<int32_t> total_available_gpus_{0};
+  // model_id -> resource model (read-only after init)
+  std::unordered_map<std::string, std::unique_ptr<ResourceModel>> model_resource_models_;
+  // GPU hardware spec (read-only after init)
+  GpuHardwareSpec gpu_hw_spec_;
 
   // XTensor memory info per instance
   std::mutex xtensor_info_mutex_;

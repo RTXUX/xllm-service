@@ -113,3 +113,16 @@ DEFINE_int32(target_tpot,
              "Target Time Per Output Token (TPOT), in milliseconds.");
 
 BRPC_VALIDATE_GFLAG(target_tpot, brpc::NonNegativeInteger);
+
+DEFINE_bool(enable_prefill_only_mode,
+            false,
+            "When true, all forwarded requests have max_tokens overridden to 1 "
+            "(prefill-only elastic pool mode).");
+
+DEFINE_double(gpu_hbm_per_gpu_gb,
+              80.0,
+              "HBM capacity per GPU in GB, used for auto-scaling resource model.");
+
+DEFINE_double(gpu_compute_sm_per_gpu,
+              1.0,
+              "Compute SM units per GPU, used for auto-scaling resource model.");

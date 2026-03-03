@@ -1,0 +1,45 @@
+/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/jd-opensource/xllm-service/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "linear_resource_model.h"
+
+#include <algorithm>
+#include <cmath>
+
+namespace xllm_service {
+
+LinearResourceModel::LinearResourceModel(double hbm_a, double hbm_b,
+                                         double compute_a, double compute_b)
+    : hbm_a_(hbm_a),
+      hbm_b_(hbm_b),
+      compute_a_(compute_a),
+      compute_b_(compute_b) {}
+
+int32_t LinearResourceModel::compute_gpu_target(
+    int64_t model_heat, const GpuHardwareSpec& hw) const {
+  double hbm_need = hbm_a_ * model_heat + hbm_b_;
+  double compute_need = compute_a_ * model_heat + compute_b_;
+
+  double hbm_gpus = hbm_need / hw.hbm_per_gpu_gb;
+  double compute_gpus = compute_need / hw.compute_sm_per_gpu;
+
+  int32_t target = static_cast<int32_t>(
+      std::ceil(std::max(hbm_gpus, compute_gpus)));
+  return std::max(target, 1);
+}
+
+std::string LinearResourceModel::name() const { return "linear"; }
+
+}  // namespace xllm_service

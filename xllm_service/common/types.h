@@ -539,6 +539,18 @@ struct D2DWakeupInfo {
   }
 };
 
+struct GpuHardwareSpec {
+  double hbm_per_gpu_gb = 80.0;
+  double compute_sm_per_gpu = 1.0;
+};
+
+struct ModelScalingTarget {
+  std::string model_id;
+  int32_t gpu_target = 0;      // Raw GPU target from resource model
+  int32_t gpu_allocated = 0;   // After budget constraint
+  int64_t model_heat = 0;      // Current heat (tokens in window)
+};
+
 // Function call related types
 struct JsonFunction {
   std::string name;
