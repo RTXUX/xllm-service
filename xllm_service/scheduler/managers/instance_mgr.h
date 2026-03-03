@@ -120,11 +120,10 @@ class InstanceMgr final {
   std::vector<std::string> get_awake_instances(const std::string& model_id);
   bool is_model_waking_up(const std::string& model_id);
 
-  std::vector<std::string> allocate_instance_for_model(const std::string& model_id,
-                                                       int32_t target_model_count);
-  void auto_scaling();
-
-  void scale_down_model(const std::string& model_id, int32_t target_count);
+  // Trigger per-request auto-scaling. Computes GPU targets for all models
+  // using resource_model, then directly wakes/sleeps instances.
+  // Scale-up is blocking; scale-down spawns async drain threads.
+  void dynamic_part_auto_scaling();
 
   std::shared_ptr<ModelInstanceMgr> get_model_instance_mgr(const std::string& model_id);
 
@@ -161,18 +160,9 @@ class InstanceMgr final {
   // Predict TTFT using any available instance (homogeneous instances, for LST_IMH)
   double predict_ttft_any_instance(const std::string& model_id, int32_t token_count);
 
-  // --- Methods used by ModelInstanceMgr::scale_up/scale_down ---
-
-  // Snapshot of all registered instance names (thread-safe)
-  std::vector<std::string> get_all_instance_names();
-
   // Block until model on instance has 0 inflight requests. Returns false on error.
   bool wait_for_model_drain(const std::string& instance_name,
                              const std::string& model_id);
-
-  // Select models to evict on a specific instance to free up required_space (GB)
-  EvictionPlanInfo select_eviction_candidates(const std::string& instance_name,
-                                               double required_space);
 
   // Locally adjust free pages after allocation (before next heartbeat)
   void deduct_free_pages(const std::string& instance_name, uint64_t bytes);
@@ -180,14 +170,7 @@ class InstanceMgr final {
  private:
   void init_model_memory_specs();
   void init_model_resource_coefficients();
-  std::vector<ModelScalingTarget> compute_scaling_plan();
   double get_model_memory_size(const std::string& model_id);
-
-  // Compute max contiguous free space after evicting specified models
-  uint64_t compute_max_contiguous_free_space(
-      const InstanceXTensorInfo& xtensor_info,
-      const std::vector<std::string>& models_to_evict,
-      uint64_t total_memory_bytes);
 
  private:
 
@@ -252,10 +235,8 @@ class InstanceMgr final {
   // model_id -> memory_spec (GB)
   std::unordered_map<std::string, double> model_memory_specs_;
 
-  // instances_, instance_model_states_, model_count_ use shared_mutex
-  // because they only change when instance registration or model state changes
-  // global_model_heat_ and instance_memory_usage_ use mutex
-  // because they change frequently when requests come
+  // instances_ use shared_mutex because they only change when
+  // instance registration or model state changes.
   // pending_infos_ use mutex because there's no read-only operations
   
   std::shared_mutex inst_mutex_;
@@ -263,10 +244,6 @@ class InstanceMgr final {
 
   std::shared_mutex model_instance_mgr_mutex_;
   std::unordered_map<std::string, std::shared_ptr<ModelInstanceMgr>> model_instance_mgrs_;
-
-  // instance_name -> current_memory_usage (GB)
-  std::mutex instance_memory_mutex_;
-  std::unordered_map<std::string, double> instance_memory_usage_;
 
   // stores InstanceMetaInfo before receiving heartbeat
   std::mutex pending_mutex_;

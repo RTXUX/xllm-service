@@ -97,8 +97,6 @@ class Scheduler final {
   void handle_master_service_watch(const etcd::Response& response,
                                    const uint64_t& prefix_len);
 
-  void auto_scaling_task();
-
   void process_request_queue(const std::string& model_name);
 
   // LST-IMH dispatch coordinator (runs in dedicated thread)
@@ -143,7 +141,6 @@ class Scheduler final {
   std::unique_ptr<LoadBalancePolicy> lb_policy_;
 
   std::unique_ptr<std::thread> heartbeat_thread_;
-  std::unique_ptr<std::thread> auto_scaling_thread_;
 
   // `model name` -> `request queue` map
   std::unordered_map<std::string,

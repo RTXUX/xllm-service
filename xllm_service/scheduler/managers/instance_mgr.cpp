@@ -26,7 +26,6 @@ limitations under the License.
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <numeric>
 #include <shared_mutex>
 
 #include "scheduler/resource_model/linear_resource_model.h"
@@ -132,7 +131,6 @@ void InstanceMgr::init() {
           std::string model_id = model_pair.first;
           if (model_instance_mgrs_.find(model_id) == model_instance_mgrs_.end()) {
              model_instance_mgrs_[model_id] = std::make_shared<ModelInstanceMgr>(model_id);
-             model_instance_mgrs_[model_id]->set_instance_mgr(this);
           }
           model_instance_mgrs_[model_id]->add_instance(ist.first, ist.second);
         }
@@ -572,7 +570,6 @@ void InstanceMgr::register_instance(const std::string& instance_name,
       std::string model_id = model_pair.first;
       if (model_instance_mgrs_.find(model_id) == model_instance_mgrs_.end()) {
           model_instance_mgrs_[model_id] = std::make_shared<ModelInstanceMgr>(model_id);
-          model_instance_mgrs_[model_id]->set_instance_mgr(this);
       }
       model_instance_mgrs_[model_id]->add_instance(instance_name, metainfo);
     }
@@ -1251,300 +1248,6 @@ int32_t InstanceMgr::get_wakeup_count(const std::string& model_id) {
   return model_mgr->get_wakeup_count();
 }
 
-// returns the instance_names of newly allocated(already wakeup or is waking_up) models
-std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::string& model_id,
-                                                                  int32_t target_model_count) {
-  std::unique_lock<std::mutex> allocation_lock(allocation_mutex_);
-  auto model_mgr = get_model_instance_mgr(model_id);
-  if (!model_mgr) {
-    LOG(ERROR) << "allocate_instance_for_model: model manager not found for " << model_id;
-    return {};
-  }
-  return model_mgr->scale_up(target_model_count);
-}
-
-// Select models to evict out >= required_space, meanwhile minimizing sum(heat)
-// and considering memory fragmentation when XTensor info is available
-EvictionPlanInfo InstanceMgr::select_eviction_candidates(const std::string& instance_name,
-                                                         double required_space) {
-
-  // 1. Try to get XTensor info for fragmentation-aware eviction
-  std::optional<InstanceXTensorInfo> xtensor_info;
-  {
-    std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
-    auto it = instance_xtensor_infos_.find(instance_name);
-    if (it != instance_xtensor_infos_.end() && it->second.is_valid) {
-      xtensor_info = it->second;
-    }
-  }
-
-  // 2. Get all awake models on this instance that can be evicted (not D2D locked)
-  std::vector<std::string> awake_models;
-
-  // Iterate all models to check status on this instance
-  std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
-  for (const auto& pair : model_instance_mgrs_) {
-    const std::string& model_id = pair.first;
-    auto model_mgr = pair.second;
-
-    ModelState state = model_mgr->get_model_state(instance_name);
-
-    if (state == ModelState::WAKEUP) {
-      // Skip if this model on this instance is D2D locked
-      if (!model_mgr->can_sleep(instance_name)) {
-        LOG(INFO) << "Model " << model_id << " on " << instance_name
-                  << " is D2D locked, skipping for eviction";
-        continue;
-      }
-
-      if (model_mgr->get_wakeup_count() > 1) {
-        awake_models.push_back(model_id);
-      } else if (model_mgr->get_wakeup_count() == 1) {
-        // if this is the only instance for this model, only evict if heat is 0
-        if (model_mgr->get_model_heat() == 0) {
-          awake_models.push_back(model_id);
-        }
-      }
-    }
-  }
-  mgr_lock.unlock();
-
-  // 3. Take snapshot of the current model heats
-  std::vector<uint64_t> awake_model_heats;
-  for (const auto& model_id : awake_models) {
-    auto model_mgr = get_model_instance_mgr(model_id);
-    awake_model_heats.push_back(model_mgr->get_model_heat());
-  }
-
-  // 4. Exhaustive search for the optimal eviction set
-  uint64_t required_bytes = static_cast<uint64_t>(required_space * 1024 * 1024 * 1024);
-  uint64_t min_sum_heat = std::numeric_limits<uint64_t>::max();
-  uint64_t best_contiguous_space = 0;
-  size_t best_subset = 0;
-
-  for (size_t subset = 1; subset < (1ULL << awake_models.size()); ++subset) {
-    uint64_t current_sum_space_bytes = 0;
-    uint64_t current_sum_heat = 0;
-    std::vector<std::string> current_evict_models;
-
-    for (size_t i = 0; i < awake_models.size(); ++i) {
-      if (subset & (1ULL << i)) {
-        current_sum_space_bytes += get_model_size_bytes(awake_models[i]);
-        current_sum_heat += awake_model_heats[i];
-        current_evict_models.push_back(awake_models[i]);
-      }
-    }
-
-    // Basic condition: freed space must be sufficient
-    if (current_sum_space_bytes < required_bytes) {
-      continue;
-    }
-
-    // If we have XTensor info, check if contiguous space is sufficient
-    if (xtensor_info.has_value()) {
-      uint64_t contiguous_space = compute_max_contiguous_free_space(
-          xtensor_info.value(),
-          current_evict_models,
-          static_cast<uint64_t>(kMaxInstanceMemoryGB * 1024 * 1024 * 1024));
-
-      if (contiguous_space < required_bytes) {
-        continue;  // Contiguous space not enough, skip this plan
-      }
-
-      // Optimization goal: 1. Satisfy contiguous space requirement 2. Minimize heat
-      // If heat is the same, prefer the plan with larger contiguous space
-      if (current_sum_heat < min_sum_heat ||
-          (current_sum_heat == min_sum_heat &&
-           contiguous_space > best_contiguous_space)) {
-        min_sum_heat = current_sum_heat;
-        best_contiguous_space = contiguous_space;
-        best_subset = subset;
-      }
-    } else {
-      // No XTensor info, fallback to original logic (heat-only)
-      if (current_sum_heat < min_sum_heat) {
-        min_sum_heat = current_sum_heat;
-        best_subset = subset;
-      }
-    }
-  }
-
-  // 5. Build result
-  if (best_subset == 0) {
-    return EvictionPlanInfo();  // Cannot find a valid plan
-  }
-
-  EvictionPlanInfo best_plan;
-  best_plan.instance_name = instance_name;
-  best_plan.heat_sum = min_sum_heat;
-  for (size_t i = 0; i < awake_models.size(); ++i) {
-    if (best_subset & (1ULL << i)) {
-      best_plan.models_to_evict.push_back(awake_models[i]);
-    }
-  }
-
-  return best_plan;
-}
-
-// Compute the maximum contiguous free space after evicting specified models
-uint64_t InstanceMgr::compute_max_contiguous_free_space(
-    const InstanceXTensorInfo& xtensor_info,
-    const std::vector<std::string>& models_to_evict,
-    uint64_t total_memory_bytes) {
-
-  // Collect all remaining model segments (models NOT being evicted)
-  std::vector<WeightSegment> remaining_segments;
-  std::unordered_set<std::string> evict_set(
-      models_to_evict.begin(), models_to_evict.end());
-
-  for (const auto& [model_id, segments] : xtensor_info.model_weight_segments) {
-    if (evict_set.find(model_id) == evict_set.end()) {
-      for (const auto& seg : segments) {
-        remaining_segments.push_back(seg);
-      }
-    }
-  }
-
-  // Sort by offset
-  std::sort(remaining_segments.begin(), remaining_segments.end(),
-            [](const WeightSegment& a, const WeightSegment& b) {
-              return a.offset < b.offset;
-            });
-
-  // Compute all free gaps, find the maximum
-  uint64_t max_free = 0;
-
-  // If no remaining segments, the entire space is free
-  if (remaining_segments.empty()) {
-    return total_memory_bytes;
-  }
-
-  // Free space before the first segment
-  max_free = std::max(max_free, remaining_segments[0].offset);
-
-  // Free space between adjacent segments
-  for (size_t i = 1; i < remaining_segments.size(); ++i) {
-    uint64_t gap = remaining_segments[i].offset - remaining_segments[i-1].end();
-    max_free = std::max(max_free, gap);
-  }
-
-  // Free space after the last segment
-  max_free = std::max(max_free,
-                      total_memory_bytes - remaining_segments.back().end());
-
-  return max_free;
-}
-
-std::vector<ModelScalingTarget> InstanceMgr::compute_scaling_plan() {
-  std::vector<ModelScalingTarget> targets;
-
-  int32_t total_gpus = total_available_gpus_.load();
-  int32_t budget = total_gpus;  // All GPUs available for elastic pool
-
-  // Collect per-model heat and compute raw GPU targets
-  {
-    std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
-    for (const auto& pair : model_instance_mgrs_) {
-      ModelScalingTarget t;
-      t.model_id = pair.first;
-      t.model_heat = pair.second->get_model_heat();
-      auto it = model_resource_models_.find(t.model_id);
-      t.gpu_target = (t.model_heat == 0) ? 0
-          : (it != model_resource_models_.end())
-              ? it->second->compute_gpu_target(t.model_heat, gpu_hw_spec_)
-              : 1;
-      targets.push_back(t);
-    }
-  }
-
-  // Compute total elastic demand
-  int32_t elastic_needed = 0;
-  for (auto& t : targets) {
-    elastic_needed += t.gpu_target;
-  }
-
-  // Apply budget constraint with proportional scaling
-  if (elastic_needed <= budget) {
-    // Enough GPUs for all models
-    for (auto& t : targets) {
-      t.gpu_allocated = t.gpu_target;
-    }
-  } else if (elastic_needed > 0) {
-    // Proportional scaling: scale down proportionally
-    double ratio = std::min(1.0, static_cast<double>(budget) / elastic_needed);
-    int32_t allocated_sum = 0;
-    for (auto& t : targets) {
-      if (t.gpu_target > 0) {
-        t.gpu_allocated = std::max(1,
-            static_cast<int32_t>(std::floor(t.gpu_target * ratio)));
-      } else {
-        t.gpu_allocated = 0;
-      }
-      allocated_sum += t.gpu_allocated;
-    }
-
-    // Trim rounding overshoot: remove excess from lowest-heat models
-    // Sort by heat ascending for trimming
-    std::vector<size_t> indices(targets.size());
-    std::iota(indices.begin(), indices.end(), 0);
-    std::sort(indices.begin(), indices.end(), [&targets](size_t a, size_t b) {
-      return targets[a].model_heat < targets[b].model_heat;
-    });
-
-    while (allocated_sum > budget) {
-      bool trimmed = false;
-      for (size_t idx : indices) {
-        if (targets[idx].gpu_allocated > 1) {
-          targets[idx].gpu_allocated--;
-          allocated_sum--;
-          trimmed = true;
-          if (allocated_sum <= budget) break;
-        }
-      }
-      // If we couldn't trim anything above 1, trim to 0
-      if (!trimmed) {
-        for (size_t idx : indices) {
-          if (targets[idx].gpu_allocated > 0) {
-            targets[idx].gpu_allocated--;
-            allocated_sum--;
-            if (allocated_sum <= budget) break;
-          }
-        }
-        if (allocated_sum <= budget) break;
-      }
-    }
-  }
-
-  // Log the scaling plan
-  for (const auto& t : targets) {
-    LOG(INFO) << "Scaling plan: model=" << t.model_id
-              << " heat=" << t.model_heat
-              << " gpu_target=" << t.gpu_target
-              << " gpu_allocated=" << t.gpu_allocated;
-  }
-
-  return targets;
-}
-
-void InstanceMgr::scale_down_model(const std::string& model_id,
-                                    int32_t target_count) {
-  auto model_mgr = get_model_instance_mgr(model_id);
-  if (!model_mgr) {
-    LOG(ERROR) << "scale_down_model: model manager not found for " << model_id;
-    return;
-  }
-  model_mgr->scale_down(target_count);
-}
-
-std::vector<std::string> InstanceMgr::get_all_instance_names() {
-  std::shared_lock<std::shared_mutex> lock(inst_mutex_);
-  std::vector<std::string> names;
-  names.reserve(instances_.size());
-  for (const auto& pair : instances_) {
-    names.push_back(pair.first);
-  }
-  return names;
-}
 
 bool InstanceMgr::wait_for_model_drain(const std::string& instance_name,
                                         const std::string& model_id) {
@@ -1567,30 +1270,123 @@ bool InstanceMgr::wait_for_model_drain(const std::string& instance_name,
   return true;
 }
 
-void InstanceMgr::auto_scaling() {
-  // Two-pool auto-scaling: compute per-model GPU targets and scale up/down
+void InstanceMgr::dynamic_part_auto_scaling() {
+  std::unique_lock<std::mutex> alloc_lock(allocation_mutex_);
 
-  auto scaling_plan = compute_scaling_plan();
+  int32_t total_gpus = total_available_gpus_.load();
+  int32_t budget = total_gpus;
 
-  for (const auto& target : scaling_plan) {
-    auto model_mgr = get_model_instance_mgr(target.model_id);
-    if (!model_mgr) continue;
+  // 1. Compute per-model GPU targets
+  struct ScalingTarget {
+    std::string model_id;
+    int64_t heat;
+    int32_t gpu_target;
+    int32_t gpu_allocated;
+    std::shared_ptr<ModelInstanceMgr> mgr;
+  };
+  std::vector<ScalingTarget> targets;
 
-    int32_t current_wakeup = model_mgr->get_wakeup_count();
-    int32_t current_alloc = model_mgr->get_allocation_count();
+  {
+    std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
+    for (const auto& [id, mgr] : model_instance_mgrs_) {
+      ScalingTarget t;
+      t.model_id = id;
+      t.mgr = mgr;
+      t.heat = mgr->get_model_heat();
+      auto it = model_resource_models_.find(id);
+      t.gpu_target = (t.heat == 0) ? 0
+          : (it != model_resource_models_.end())
+              ? it->second->compute_gpu_target(t.heat, gpu_hw_spec_)
+              : 1;
+      t.gpu_allocated = 0;
+      targets.push_back(std::move(t));
+    }
+  }
 
-    if (target.gpu_allocated > current_alloc) {
-      // Scale up
-      LOG(INFO) << "Auto scaling UP: model=" << target.model_id
-                << " current_alloc=" << current_alloc
-                << " target=" << target.gpu_allocated;
-      allocate_instance_for_model(target.model_id, target.gpu_allocated);
-    } else if (target.gpu_allocated < current_wakeup) {
-      // Scale down
-      LOG(INFO) << "Auto scaling DOWN: model=" << target.model_id
-                << " current_wakeup=" << current_wakeup
-                << " target=" << target.gpu_allocated;
-      scale_down_model(target.model_id, target.gpu_allocated);
+  // 2. Budget constraint with proportional scaling
+  int32_t demand = 0;
+  for (auto& t : targets) demand += t.gpu_target;
+
+  if (demand <= budget) {
+    for (auto& t : targets) t.gpu_allocated = t.gpu_target;
+  } else if (demand > 0) {
+    double ratio = static_cast<double>(budget) / demand;
+    int32_t sum = 0;
+    for (auto& t : targets) {
+      t.gpu_allocated = (t.gpu_target > 0)
+          ? std::max(1, static_cast<int32_t>(std::floor(t.gpu_target * ratio)))
+          : 0;
+      sum += t.gpu_allocated;
+    }
+    // Trim overshoot from lowest-heat models
+    std::sort(targets.begin(), targets.end(),
+              [](const ScalingTarget& a, const ScalingTarget& b) {
+                return a.heat < b.heat;
+              });
+    while (sum > budget) {
+      bool trimmed = false;
+      for (auto& t : targets) {
+        if (t.gpu_allocated > 1) {
+          t.gpu_allocated--;
+          sum--;
+          trimmed = true;
+          if (sum <= budget) break;
+        }
+      }
+      if (!trimmed) break;
+    }
+  }
+
+  for (auto& t : targets) {
+    LOG(INFO) << "Scaling plan: model=" << t.model_id
+              << " heat=" << t.heat
+              << " gpu_target=" << t.gpu_target
+              << " gpu_allocated=" << t.gpu_allocated;
+  }
+
+  // 3. Scale UP — synchronous wakeup
+  for (auto& t : targets) {
+    int32_t current_alloc = t.mgr->get_allocation_count();
+    int32_t deficit = t.gpu_allocated - current_alloc;
+    if (deficit <= 0) continue;
+
+    uint64_t model_size = get_model_size_bytes(t.model_id);
+
+    std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_);
+    for (const auto& [inst_name, _] : instances_) {
+      if (deficit <= 0) break;
+      if (t.mgr->get_model_state(inst_name) != ModelState::SLEEP) continue;
+      if (!has_valid_xtensor_info(inst_name)) continue;
+      if (get_instance_free_bytes(inst_name) < model_size) continue;
+
+      t.mgr->set_model_state(inst_name, ModelState::ALLOCATED);
+      deduct_free_pages(inst_name, model_size);
+      inst_lock.unlock();
+
+      send_model_wakeup(inst_name, t.model_id, true);  // blocking
+      deficit--;
+
+      if (deficit > 0) inst_lock.lock();  // re-acquire for next iteration
+    }
+  }
+
+  // 4. Scale DOWN — async drain + sleep
+  for (auto& t : targets) {
+    int32_t current_wakeup = t.mgr->get_wakeup_count();
+    int32_t excess = current_wakeup - t.gpu_allocated;
+    if (excess <= 0) continue;
+
+    auto unlocked = t.mgr->get_unlocked_instances();
+    for (int32_t i = 0; i < excess && i < static_cast<int32_t>(unlocked.size()); ++i) {
+      t.mgr->set_model_state(unlocked[i], ModelState::DRAINING);
+      std::string inst = unlocked[i];
+      std::string model = t.model_id;
+      std::thread([this, inst, model]() {
+        if (!wait_for_model_drain(inst, model)) return;
+        auto mgr = get_model_instance_mgr(model);
+        if (mgr && !mgr->can_sleep(inst)) return;
+        send_model_sleep(inst, model);
+      }).detach();
     }
   }
 }

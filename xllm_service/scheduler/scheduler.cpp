@@ -70,8 +70,6 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
   if (is_master_service_) {
     heartbeat_thread_ = std::make_unique<std::thread>(
         &Scheduler::update_master_service_heartbeat, this);
-    auto_scaling_thread_ =
-        std::make_unique<std::thread>(&Scheduler::auto_scaling_task, this);
   } else {
     auto handle_master = std::bind(&Scheduler::handle_master_service_watch,
                                    this,
@@ -205,37 +203,22 @@ void Scheduler::process_request_queue(const std::string& model_name) {
     // Check if model is already awake on any instance
     int32_t model_count = instance_mgr_->get_wakeup_count(request->model);
 
-    if (model_count > 0) {
-      lb_policy_->select_instances_pair(request);
-    } else {
-      // allocate instance for model
-      auto newly_allocated_instances = instance_mgr_->allocate_instance_for_model(
-          request->model, /*target_model_count*/ 1);
+    if (model_count == 0) {
+      // Cold model: blocking wakeup via dynamic_part_auto_scaling
+      instance_mgr_->dynamic_part_auto_scaling();
 
-      std::string awake_instance = "";
-
-      for (int retry_count = 0; retry_count < 10;
-           retry_count++) {  // wait for the allocated instance to WAKEUP
-        auto awake_instances =
-            instance_mgr_->get_awake_instances(request->model);
-        if (awake_instances.size() > 0) {
-          awake_instance = awake_instances[0];
-          break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-      }
-
-      if (awake_instance.empty()) {
-        LOG(ERROR) << "Failed to get awake instances for expected waking up "
-                      "model "
-                   << request->model;
-        // push back to queue to retry? or just fail?
-        // for now just fail and let the client retry
+      // Verify instance is now awake
+      auto awake = instance_mgr_->get_awake_instances(request->model);
+      if (awake.empty()) {
+        LOG(ERROR) << "dynamic_part_auto_scaling failed to wake model " << request->model;
         continue;
       }
-
-      request->routing.prefill_name = awake_instance;
-      request->routing.decode_name = awake_instance;
+      request->routing.prefill_name = awake[0];
+      request->routing.decode_name = awake[0];
+    } else {
+      // Warm model: route first, then trigger scaling adjustment
+      lb_policy_->select_instances_pair(request);
+      instance_mgr_->dynamic_part_auto_scaling();
     }
 
     DLOG(INFO) << request->routing.debug_string();
@@ -263,13 +246,6 @@ void Scheduler::update_master_service_heartbeat() {
     global_kvcache_mgr_->upload_kvcache();
 
     instance_mgr_->upload_load_metrics();
-  }
-}
-
-void Scheduler::auto_scaling_task() {
-  while (!exited_) {
-    std::this_thread::sleep_for(std::chrono::seconds(5));
-    instance_mgr_->auto_scaling();
   }
 }
 
@@ -301,8 +277,6 @@ void Scheduler::handle_master_service_watch(const etcd::Response& response,
 
     heartbeat_thread_ = std::make_unique<std::thread>(
         &Scheduler::update_master_service_heartbeat, this);
-    auto_scaling_thread_ =
-        std::make_unique<std::thread>(&Scheduler::auto_scaling_task, this);
 
     global_kvcache_mgr_->set_as_master();
     instance_mgr_->set_as_master();
