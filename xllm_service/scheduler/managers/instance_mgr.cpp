@@ -132,6 +132,7 @@ void InstanceMgr::init() {
           std::string model_id = model_pair.first;
           if (model_instance_mgrs_.find(model_id) == model_instance_mgrs_.end()) {
              model_instance_mgrs_[model_id] = std::make_shared<ModelInstanceMgr>(model_id);
+             model_instance_mgrs_[model_id]->set_instance_mgr(this);
           }
           model_instance_mgrs_[model_id]->add_instance(ist.first, ist.second);
         }
@@ -571,6 +572,7 @@ void InstanceMgr::register_instance(const std::string& instance_name,
       std::string model_id = model_pair.first;
       if (model_instance_mgrs_.find(model_id) == model_instance_mgrs_.end()) {
           model_instance_mgrs_[model_id] = std::make_shared<ModelInstanceMgr>(model_id);
+          model_instance_mgrs_[model_id]->set_instance_mgr(this);
       }
       model_instance_mgrs_[model_id]->add_instance(instance_name, metainfo);
     }
@@ -1252,212 +1254,13 @@ int32_t InstanceMgr::get_wakeup_count(const std::string& model_id) {
 // returns the instance_names of newly allocated(already wakeup or is waking_up) models
 std::vector<std::string> InstanceMgr::allocate_instance_for_model(const std::string& model_id,
                                                                   int32_t target_model_count) {
-
   std::unique_lock<std::mutex> allocation_lock(allocation_mutex_);
-  // check for race conditions
-  // (multiple entrance in allocate_instance_for_model)
-  int model_count_margin = 0;
-  {
-    std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_);
-    auto model_mgr = get_model_instance_mgr(model_id);
-    model_count_margin = target_model_count - model_mgr->get_allocation_count();
-    if (model_count_margin <= 0) {
-      LOG(INFO) << "Model " << model_id << " is already being allocated to target count "
-                << target_model_count << ". Give up allocation.";
-      return {};
-    }
+  auto model_mgr = get_model_instance_mgr(model_id);
+  if (!model_mgr) {
+    LOG(ERROR) << "allocate_instance_for_model: model manager not found for " << model_id;
+    return {};
   }
-
-  uint64_t model_size_bytes = get_model_size_bytes(model_id);
-
-  LOG(INFO) << "Allocating instance for model " << model_id
-            << " with size " << (model_size_bytes / (1024.0 * 1024 * 1024)) << " GB."
-            << " Model count margin: " << model_count_margin;
-
-  std::vector<std::thread> wakeup_threads;
-  int newly_allocated_count = 0;
-  std::vector<std::string> newly_allocated_instances;
-
-  // First, try instances with enough free space (using xtensor info)
-  {
-    std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_);
-    for (const auto& inst_pair : instances_) {
-      const std::string& instance_name = inst_pair.first;
-      auto model_mgr = get_model_instance_mgr(model_id);
-
-      if (model_mgr->get_model_state(instance_name) != ModelState::SLEEP) {
-        // Model not ready to wake up.
-        continue;
-      }
-
-      // Skip instances without valid xtensor info
-      if (!has_valid_xtensor_info(instance_name)) {
-        LOG(INFO) << "Instance " << instance_name << " has no valid xtensor info, skipping";
-        continue;
-      }
-
-      uint64_t free_bytes = get_instance_free_bytes(instance_name);
-
-      LOG(INFO) << "Instance " << instance_name
-                << " free space: " << (free_bytes / (1024.0 * 1024 * 1024)) << " GB.";
-
-      if (free_bytes >= model_size_bytes) {
-        model_mgr->set_model_state(instance_name, ModelState::ALLOCATED);
-
-        // Locally deduct free pages to prevent double allocation before next heartbeat
-        deduct_free_pages(instance_name, model_size_bytes);
-
-        wakeup_threads.emplace_back([this, instance_name, model_id]() {
-          send_model_wakeup(instance_name, model_id, /*memory_increased_in_advance*/ true);
-        });
-        newly_allocated_count += 1;
-        newly_allocated_instances.push_back(instance_name);
-        if (newly_allocated_count >= model_count_margin) {
-          break;
-        }
-      }
-    }
-  }
-
-  // Strategy: Find the instance where we can free up enough space by evicting the *coldest* models.
-
-  std::vector<EvictionPlanInfo> eviction_plans;
-
-  if (newly_allocated_count < model_count_margin) {// At least evict one instance
-    std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_); // Iterate instances safely
-    for (const auto& inst_pair : instances_) {
-      std::string instance_name = inst_pair.first;
-      auto model_mgr = get_model_instance_mgr(model_id);
-
-      if (model_mgr->get_model_state(instance_name) != ModelState::SLEEP) {
-        continue;
-      }
-
-      // Skip instances without valid xtensor info
-      if (!has_valid_xtensor_info(instance_name)) {
-        LOG(INFO) << "Instance " << instance_name << " has no valid xtensor info, skipping for eviction";
-        continue;
-      }
-
-      uint64_t free_bytes = get_instance_free_bytes(instance_name);
-      // space_needed is how many more bytes we need beyond what's already free
-      int64_t space_needed_bytes = static_cast<int64_t>(model_size_bytes) - static_cast<int64_t>(free_bytes);
-      double space_needed_gb = space_needed_bytes / (1024.0 * 1024.0 * 1024.0);
-
-      EvictionPlanInfo current_plan = select_eviction_candidates(instance_name, space_needed_gb);
-      if (current_plan.instance_name.empty()) {
-        continue; // Cannot free enough space on this instance
-      }
-
-      eviction_plans.push_back(current_plan);
-
-    }
-  }
-
-  sort(eviction_plans.begin(), eviction_plans.end(),
-       [](const EvictionPlanInfo& plan_A, const EvictionPlanInfo &plan_B) {
-    return plan_A.heat_sum < plan_B.heat_sum;
-  });
-
-  int plans_to_execute = std::min(model_count_margin - newly_allocated_count,
-                                  (int)eviction_plans.size());
-
-  for (int i = 0; i < plans_to_execute; i++) {
-
-
-    auto& current_plan = eviction_plans[i];
-    auto& instance_name = current_plan.instance_name;
-    auto& models_to_evict = current_plan.models_to_evict;
-
-    newly_allocated_count += 1;
-    newly_allocated_instances.push_back(instance_name);
-
-    {
-      auto model_mgr = get_model_instance_mgr(model_id);
-
-      // early mark as ALLOCATED, for race conditions
-      // (multiple entrance in allocate_instance_for_model)
-      model_mgr->set_model_state(instance_name, ModelState::ALLOCATED);
-
-      for (const auto& model_to_evict : current_plan.models_to_evict) {
-        auto evict_mgr = get_model_instance_mgr(model_to_evict);
-        evict_mgr->set_model_state(instance_name, ModelState::DRAINING);
-      }
-    }
-
-    LOG(INFO) << "Preparing to wake up model " << model_id
-              << " on instance " << instance_name;
-
-    wakeup_threads.emplace_back([this, model_id, model_size_bytes, instance_name, models_to_evict]() {
-      std::vector<std::thread> sleep_threads;
-
-      for (const auto& model_to_sleep : models_to_evict) {
-
-        LOG(INFO) << "Preparing to wake up model " << model_id
-                  << " on instance " << instance_name
-                  << ", sending sleep to model " << model_to_sleep;
-
-        sleep_threads.emplace_back([this, instance_name, model_to_sleep]() {
-          std::unique_lock<std::mutex> request_metrics_lock(request_metrics_mutex_);
-          auto instance_it = request_metrics_.find(instance_name);
-          if (instance_it == request_metrics_.end()) {
-            LOG(ERROR) << "Failed to find request metrics for instance "
-                      << instance_name << " during eviction.";
-            return;
-          }
-          auto model_it = instance_it->second.model_metrics.find(model_to_sleep);
-          if (model_it == instance_it->second.model_metrics.end()) {
-            LOG(ERROR) << "Failed to find request metrics for model "
-                      << model_to_sleep << " on instance "
-                      << instance_name << " during eviction.";
-            return;
-          }
-
-          auto& metrics = model_it->second;
-          metrics.cv_idle.wait(request_metrics_lock, [&metrics]() {
-            return metrics.prefill_request_num == 0 && metrics.decode_request_num == 0;
-          });
-
-          request_metrics_lock.unlock();
-
-          // Double-check can_sleep() to handle D2D lock race condition
-          // (a D2D lock could have been acquired after eviction planning)
-          auto evict_mgr = get_model_instance_mgr(model_to_sleep);
-          if (evict_mgr && !evict_mgr->can_sleep(instance_name)) {
-            LOG(WARNING) << "Model " << model_to_sleep << " on " << instance_name
-                         << " became D2D locked, skipping sleep";
-            return;
-          }
-
-          send_model_sleep(instance_name, model_to_sleep);
-
-        });
-
-      }
-
-      for (auto& thread : sleep_threads) {
-        if (thread.joinable()) {
-          thread.join();
-        }
-      }
-
-      // Locally deduct free pages for the model being woken up
-      deduct_free_pages(instance_name, model_size_bytes);
-
-      send_model_wakeup(instance_name, model_id, /*memory_increased_in_advance*/ true);
-
-    });
-
-  }
-
-  for (auto& thread : wakeup_threads) {
-    if (thread.joinable()) {
-      thread.join();
-    }
-  }
-
-  return newly_allocated_instances;
-
+  return model_mgr->scale_up(target_model_count);
 }
 
 // Select models to evict out >= required_space, meanwhile minimizing sum(heat)
@@ -1730,70 +1533,38 @@ void InstanceMgr::scale_down_model(const std::string& model_id,
     LOG(ERROR) << "scale_down_model: model manager not found for " << model_id;
     return;
   }
+  model_mgr->scale_down(target_count);
+}
 
-  // Get awake unlocked instances (safe to scale down)
-  auto unlocked = model_mgr->get_unlocked_instances();
-  int32_t current_count = static_cast<int32_t>(unlocked.size());
-  int32_t to_remove = current_count - target_count;
-
-  if (to_remove <= 0) return;
-
-  LOG(INFO) << "Scaling down model " << model_id
-            << ": current=" << current_count
-            << " target=" << target_count
-            << " removing=" << to_remove;
-
-  // Mark excess instances as DRAINING
-  std::vector<std::string> instances_to_sleep;
-  for (int32_t i = 0; i < to_remove && i < static_cast<int32_t>(unlocked.size()); ++i) {
-    model_mgr->set_model_state(unlocked[i], ModelState::DRAINING);
-    instances_to_sleep.push_back(unlocked[i]);
+std::vector<std::string> InstanceMgr::get_all_instance_names() {
+  std::shared_lock<std::shared_mutex> lock(inst_mutex_);
+  std::vector<std::string> names;
+  names.reserve(instances_.size());
+  for (const auto& pair : instances_) {
+    names.push_back(pair.first);
   }
+  return names;
+}
 
-  // Spawn threads to wait for drain then sleep
-  std::vector<std::thread> drain_threads;
-  for (const auto& instance_name : instances_to_sleep) {
-    drain_threads.emplace_back([this, instance_name, model_id]() {
-      // Wait for all requests to finish on this model/instance
-      {
-        std::unique_lock<std::mutex> request_metrics_lock(request_metrics_mutex_);
-        auto instance_it = request_metrics_.find(instance_name);
-        if (instance_it == request_metrics_.end()) {
-          LOG(ERROR) << "scale_down_model: no request metrics for " << instance_name;
-          return;
-        }
-        auto model_it = instance_it->second.model_metrics.find(model_id);
-        if (model_it == instance_it->second.model_metrics.end()) {
-          LOG(ERROR) << "scale_down_model: no model metrics for " << model_id
-                     << " on " << instance_name;
-          return;
-        }
-        auto& metrics = model_it->second;
-        metrics.cv_idle.wait(request_metrics_lock, [&metrics]() {
-          return metrics.prefill_request_num == 0 &&
-                 metrics.decode_request_num == 0;
-        });
-      }
-
-      // Double-check can_sleep for D2D lock race
-      auto mgr = get_model_instance_mgr(model_id);
-      if (mgr && !mgr->can_sleep(instance_name)) {
-        LOG(WARNING) << "scale_down_model: " << model_id << " on "
-                     << instance_name << " became D2D locked, skipping sleep";
-        return;
-      }
-
-      send_model_sleep(instance_name, model_id);
-      LOG(INFO) << "scale_down_model: slept model " << model_id
-                << " on " << instance_name;
-    });
+bool InstanceMgr::wait_for_model_drain(const std::string& instance_name,
+                                        const std::string& model_id) {
+  std::unique_lock<std::mutex> lock(request_metrics_mutex_);
+  auto instance_it = request_metrics_.find(instance_name);
+  if (instance_it == request_metrics_.end()) {
+    LOG(ERROR) << "wait_for_model_drain: no request metrics for " << instance_name;
+    return false;
   }
-
-  for (auto& thread : drain_threads) {
-    if (thread.joinable()) {
-      thread.join();
-    }
+  auto model_it = instance_it->second.model_metrics.find(model_id);
+  if (model_it == instance_it->second.model_metrics.end()) {
+    LOG(ERROR) << "wait_for_model_drain: no model metrics for " << model_id
+               << " on " << instance_name;
+    return false;
   }
+  auto& metrics = model_it->second;
+  metrics.cv_idle.wait(lock, [&metrics]() {
+    return metrics.prefill_request_num == 0 && metrics.decode_request_num == 0;
+  });
+  return true;
 }
 
 void InstanceMgr::auto_scaling() {

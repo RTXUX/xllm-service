@@ -161,22 +161,33 @@ class InstanceMgr final {
   // Predict TTFT using any available instance (homogeneous instances, for LST_IMH)
   double predict_ttft_any_instance(const std::string& model_id, int32_t token_count);
 
+  // --- Methods used by ModelInstanceMgr::scale_up/scale_down ---
+
+  // Snapshot of all registered instance names (thread-safe)
+  std::vector<std::string> get_all_instance_names();
+
+  // Block until model on instance has 0 inflight requests. Returns false on error.
+  bool wait_for_model_drain(const std::string& instance_name,
+                             const std::string& model_id);
+
+  // Select models to evict on a specific instance to free up required_space (GB)
+  EvictionPlanInfo select_eviction_candidates(const std::string& instance_name,
+                                               double required_space);
+
+  // Locally adjust free pages after allocation (before next heartbeat)
+  void deduct_free_pages(const std::string& instance_name, uint64_t bytes);
+
  private:
   void init_model_memory_specs();
   void init_model_resource_coefficients();
   std::vector<ModelScalingTarget> compute_scaling_plan();
   double get_model_memory_size(const std::string& model_id);
-  // Select models to evict on a specific instance to free up required_space
-  EvictionPlanInfo select_eviction_candidates(const std::string& instance_name, double required_space);
 
   // Compute max contiguous free space after evicting specified models
   uint64_t compute_max_contiguous_free_space(
       const InstanceXTensorInfo& xtensor_info,
       const std::vector<std::string>& models_to_evict,
       uint64_t total_memory_bytes);
-
-  // Locally adjust free pages after allocation (before next heartbeat)
-  void deduct_free_pages(const std::string& instance_name, uint64_t bytes);
 
  private:
 

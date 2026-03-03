@@ -30,6 +30,8 @@ limitations under the License.
 
 namespace xllm_service {
 
+class InstanceMgr;  // Forward declaration (included in .cpp only)
+
 class ModelInstanceMgr {
  public:
   ModelInstanceMgr(const std::string& model_id);
@@ -101,6 +103,19 @@ class ModelInstanceMgr {
 
   void auto_flipping(const std::unordered_map<std::string, LatencyMetrics>& latency_metrics);
 
+  // Back-pointer to InstanceMgr for accessing instance-level services.
+  // Must be called after construction, before any scale_up/scale_down calls.
+  void set_instance_mgr(InstanceMgr* mgr);
+
+  // Scale up: allocate instances to reach target_count.
+  // Caller must hold InstanceMgr::allocation_mutex_.
+  // Returns names of newly allocated instances.
+  std::vector<std::string> scale_up(int32_t target_count);
+
+  // Scale down: drain and sleep excess instances to reach target_count.
+  // Blocks until drain completes.
+  void scale_down(int32_t target_count);
+
  private:
   bool send_http_request(std::shared_ptr<brpc::Channel> channel,
                          const std::string& uri,
@@ -110,6 +125,10 @@ class ModelInstanceMgr {
   void prune_model_heat_locked();
 
   std::string model_id_;
+
+  // Back-pointer to InstanceMgr for instance-level services (channels, xtensor, etc.)
+  // Set via set_instance_mgr(), must not be null when scale_up/scale_down are called.
+  InstanceMgr* instance_mgr_ = nullptr;
 
   // Lock hierarchy within ModelInstanceMgr (acquire in this order):
   //   1. mutex_                       — protects instances_, prefill_index_, decode_index_
