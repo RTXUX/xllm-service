@@ -28,6 +28,7 @@ class LinearResourceModel final : public ResourceModel {
 
   int32_t compute_gpu_target(int64_t model_heat,
                              const GpuHardwareSpec& hw) const override;
+  ResourceNeeds compute_resource_needs(int64_t model_heat) const override;
   std::string name() const override;
 
  private:

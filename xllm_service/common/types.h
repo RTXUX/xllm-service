@@ -536,6 +536,21 @@ struct GpuHardwareSpec {
   double compute_sm_per_gpu = 1.0;
 };
 
+// Dual-pool scheduling types
+enum class PoolType : int8_t { NONE = 0, STEADY = 1, ELASTIC = 2 };
+
+struct ResourceNeeds {
+  double hbm_gb = 0.0;
+  double compute_sm = 0.0;
+};
+
+struct SteadyBin {
+  std::string instance_name;
+  double remaining_hbm_gb;
+  double remaining_compute_sm;
+  std::unordered_set<std::string> models;  // models loaded on this instance
+};
+
 // Function call related types
 struct JsonFunction {
   std::string name;

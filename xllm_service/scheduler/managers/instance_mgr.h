@@ -21,6 +21,7 @@ limitations under the License.
 #include <optional>
 #include <shared_mutex>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <deque>
@@ -120,12 +121,32 @@ class InstanceMgr final {
   std::vector<std::string> get_awake_instances(const std::string& model_id);
   bool is_model_waking_up(const std::string& model_id);
 
-  // Trigger per-request auto-scaling. Computes GPU targets for all models
+  // Trigger per-request auto-scaling. Computes GPU targets for elastic pool models
   // using resource_model, then directly wakes/sleeps instances.
   // Scale-up is blocking; scale-down spawns async drain threads.
+  // Budget = total_gpus - steady_needed_gpus.
   void dynamic_part_auto_scaling();
 
   std::shared_ptr<ModelInstanceMgr> get_model_instance_mgr(const std::string& model_id);
+
+  // --- Dual-pool scheduling ---
+
+  // Assign a new model to a pool based on current gpu_target.
+  // If gpu_target <= 1: steady pool (bin-packed). If > 1: elastic pool.
+  // Blocks until wakeup completes for steady pool models.
+  void assign_model_to_pool(const std::string& model_id);
+
+  // Get current pool assignment for a model
+  PoolType get_model_pool(const std::string& model_id);
+
+  // Check if steady pool model needs upgrade to elastic. Returns true if upgraded.
+  bool steady_part_check_upgrading(const std::string& model_id);
+
+  // Periodic: sleep models with 0 heat, repack bins, release unused instances.
+  void steady_part_auto_repacking();
+
+  // Route a request to the steady pool instance hosting the model.
+  bool route_to_steady_instance(std::shared_ptr<Request> request);
 
   // Update XTensor info for an instance from heartbeat
   void update_xtensor_info(const std::string& instance_name,
@@ -171,6 +192,33 @@ class InstanceMgr final {
   void init_model_memory_specs();
   void init_model_resource_coefficients();
   double get_model_memory_size(const std::string& model_id);
+
+  // --- Dual-pool private helpers ---
+
+  // 2D First Fit: find a bin for a model, or create a new one.
+  // If all instances occupied, reclaims from elastic pool (blocking).
+  // Must be called with allocation_mutex_ held.
+  std::string find_or_create_steady_bin(const std::string& model_id,
+                                         const ResourceNeeds& needs);
+
+  // Full FFD repack of all steady bins.
+  // Returns list of (model_id, old_instance, new_instance) moves.
+  // Must be called with allocation_mutex_ held.
+  std::vector<std::tuple<std::string, std::string, std::string>>
+      repack_steady_bins();
+
+  // Remove a model from its steady bin, reclaiming resources.
+  // Must be called with allocation_mutex_ held.
+  void remove_model_from_steady_bin(const std::string& model_id);
+
+  // Get resource needs for a model using its current heat.
+  ResourceNeeds get_model_resource_needs(const std::string& model_id);
+
+  // Check if instance is in the steady pool
+  bool is_steady_pool_instance(const std::string& instance_name);
+
+  // Get number of GPUs reserved by the steady pool
+  int32_t steady_needed_gpus();
 
  private:
 
@@ -288,6 +336,18 @@ class InstanceMgr final {
   std::unordered_map<std::string, std::unique_ptr<ResourceModel>> model_resource_models_;
   // GPU hardware spec (read-only after init)
   GpuHardwareSpec gpu_hw_spec_;
+
+  // --- Dual-pool state (protected by allocation_mutex_) ---
+  // model_id -> which pool it belongs to
+  std::unordered_map<std::string, PoolType> model_pool_assignments_;
+  // Steady pool bins (each bin = one instance with co-located models)
+  std::vector<SteadyBin> steady_bins_;
+  // Instances occupied by elastic pool (one model each)
+  std::unordered_set<std::string> elastic_occupied_instances_;
+  // Pending steady pool GPU reservations (used during instance reclamation)
+  int32_t pending_steady_gpus_ = 0;
+  // Repack timer thread
+  std::unique_ptr<std::thread> repack_thread_;
 
   // XTensor memory info per instance
   std::mutex xtensor_info_mutex_;

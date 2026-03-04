@@ -435,7 +435,7 @@ void XllmHttpServiceImpl::Completions(
     req_pb->mutable_routing()->set_decode_name(
         service_request->routing.decode_name);
 
-    if (FLAGS_enable_prefill_only_mode) {
+    if (service_request->prefill_only || FLAGS_enable_prefill_only_mode) {
       req_pb->set_max_tokens(1);
     }
 
@@ -526,7 +526,7 @@ void XllmHttpServiceImpl::ChatCompletions(
     req_pb->mutable_routing()->set_decode_name(
         service_request->routing.decode_name);
 
-    if (FLAGS_enable_prefill_only_mode) {
+    if (service_request->prefill_only || FLAGS_enable_prefill_only_mode) {
       req_pb->set_max_tokens(1);
     }
 

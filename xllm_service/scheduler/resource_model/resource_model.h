@@ -27,6 +27,7 @@ class ResourceModel {
   virtual ~ResourceModel() = default;
   virtual int32_t compute_gpu_target(int64_t model_heat,
                                      const GpuHardwareSpec& hw) const = 0;
+  virtual ResourceNeeds compute_resource_needs(int64_t model_heat) const = 0;
   virtual std::string name() const = 0;
 };
 

@@ -42,4 +42,9 @@ int32_t LinearResourceModel::compute_gpu_target(
 
 std::string LinearResourceModel::name() const { return "linear"; }
 
+ResourceNeeds LinearResourceModel::compute_resource_needs(
+    int64_t model_heat) const {
+  return {hbm_a_ * model_heat + hbm_b_, compute_a_ * model_heat + compute_b_};
+}
+
 }  // namespace xllm_service

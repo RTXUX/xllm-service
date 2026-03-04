@@ -85,6 +85,9 @@ struct Request {
 
   absl::Mutex mutex;
   bool is_scheduled = false;
+
+  // true for elastic pool requests: forces max_tokens=1 (prefill-only)
+  bool prefill_only = false;
 };
 
 }  // namespace xllm_service

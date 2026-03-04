@@ -74,6 +74,16 @@ void InstanceMgr::init() {
   init_model_memory_specs();
   init_model_resource_coefficients();
 
+  // Start steady pool repack timer thread
+  static constexpr int kRepackIntervalSeconds = 30;
+  repack_thread_ = std::make_unique<std::thread>([this]() {
+    while (!exited_) {
+      std::this_thread::sleep_for(std::chrono::seconds(kRepackIntervalSeconds));
+      if (exited_) break;
+      steady_part_auto_repacking();
+    }
+  });
+
   {
     std::unique_lock<std::shared_mutex> lock(inst_mutex_);
     for (auto& it : ETCD_KEYS_PREFIX_MAP) {
@@ -154,7 +164,12 @@ void InstanceMgr::init() {
 
 }
 
-InstanceMgr::~InstanceMgr() { exited_ = true; }
+InstanceMgr::~InstanceMgr() {
+  exited_ = true;
+  if (repack_thread_ && repack_thread_->joinable()) {
+    repack_thread_->join();
+  }
+}
 
 InstanceMetaInfo InstanceMgr::get_instance_info(
     const std::string& instance_name) {
@@ -1274,9 +1289,10 @@ void InstanceMgr::dynamic_part_auto_scaling() {
   std::unique_lock<std::mutex> alloc_lock(allocation_mutex_);
 
   int32_t total_gpus = total_available_gpus_.load();
-  int32_t budget = total_gpus;
+  // Budget: total GPUs minus steady pool reservation
+  int32_t budget = std::max(0, total_gpus - steady_needed_gpus());
 
-  // 1. Compute per-model GPU targets
+  // 1. Compute per-model GPU targets (elastic pool models only)
   struct ScalingTarget {
     std::string model_id;
     int64_t heat;
@@ -1289,6 +1305,13 @@ void InstanceMgr::dynamic_part_auto_scaling() {
   {
     std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
     for (const auto& [id, mgr] : model_instance_mgrs_) {
+      // Only include elastic pool models
+      auto pool_it = model_pool_assignments_.find(id);
+      if (pool_it == model_pool_assignments_.end() ||
+          pool_it->second != PoolType::ELASTIC) {
+        continue;
+      }
+
       ScalingTarget t;
       t.model_id = id;
       t.mgr = mgr;
@@ -1339,9 +1362,11 @@ void InstanceMgr::dynamic_part_auto_scaling() {
 
   for (auto& t : targets) {
     LOG(INFO) << "Scaling plan: model=" << t.model_id
+              << " pool=ELASTIC"
               << " heat=" << t.heat
               << " gpu_target=" << t.gpu_target
-              << " gpu_allocated=" << t.gpu_allocated;
+              << " gpu_allocated=" << t.gpu_allocated
+              << " budget=" << budget;
   }
 
   // 3. Scale UP — synchronous wakeup
@@ -1356,11 +1381,16 @@ void InstanceMgr::dynamic_part_auto_scaling() {
     for (const auto& [inst_name, _] : instances_) {
       if (deficit <= 0) break;
       if (t.mgr->get_model_state(inst_name) != ModelState::SLEEP) continue;
+      // Skip steady pool instances
+      if (is_steady_pool_instance(inst_name)) continue;
+      // Skip instances occupied by another elastic model
+      if (elastic_occupied_instances_.count(inst_name)) continue;
       if (!has_valid_xtensor_info(inst_name)) continue;
       if (get_instance_free_bytes(inst_name) < model_size) continue;
 
       t.mgr->set_model_state(inst_name, ModelState::ALLOCATED);
       deduct_free_pages(inst_name, model_size);
+      elastic_occupied_instances_.insert(inst_name);
       inst_lock.unlock();
 
       send_model_wakeup(inst_name, t.model_id, true);  // blocking
@@ -1386,7 +1416,16 @@ void InstanceMgr::dynamic_part_auto_scaling() {
         auto mgr = get_model_instance_mgr(model);
         if (mgr && !mgr->can_sleep(inst)) return;
         send_model_sleep(inst, model);
+        // Remove from elastic occupied set
+        std::lock_guard<std::mutex> lock(allocation_mutex_);
+        elastic_occupied_instances_.erase(inst);
       }).detach();
+    }
+
+    // Cleanup: if heat → 0, remove from pool
+    if (t.gpu_allocated == 0) {
+      model_pool_assignments_[t.model_id] = PoolType::NONE;
+      LOG(INFO) << "Model " << t.model_id << " heat=0, removed from ELASTIC pool";
     }
   }
 }
@@ -1619,6 +1658,448 @@ std::optional<D2DWakeupInfo> InstanceMgr::find_d2d_source(
   LOG(INFO) << "No suitable D2D source found for model " << model_id
             << ", will use H2D wakeup";
   return std::nullopt;
+}
+
+// --- Dual-pool scheduling implementation ---
+
+PoolType InstanceMgr::get_model_pool(const std::string& model_id) {
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
+  auto it = model_pool_assignments_.find(model_id);
+  if (it != model_pool_assignments_.end()) {
+    return it->second;
+  }
+  return PoolType::NONE;
+}
+
+bool InstanceMgr::is_steady_pool_instance(const std::string& instance_name) {
+  for (const auto& bin : steady_bins_) {
+    if (bin.instance_name == instance_name) return true;
+  }
+  return false;
+}
+
+int32_t InstanceMgr::steady_needed_gpus() {
+  return static_cast<int32_t>(steady_bins_.size()) * kTensorParallelSize
+      + pending_steady_gpus_;
+}
+
+ResourceNeeds InstanceMgr::get_model_resource_needs(const std::string& model_id) {
+  auto model_mgr = get_model_instance_mgr(model_id);
+  int64_t heat = model_mgr ? model_mgr->get_model_heat() : 0;
+
+  auto it = model_resource_models_.find(model_id);
+  if (it != model_resource_models_.end()) {
+    return it->second->compute_resource_needs(heat);
+  }
+  // Default: use hbm_b=20GB, compute_b=0 for unknown models
+  return {20.0, 0.0};
+}
+
+void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
+  std::unique_lock<std::mutex> alloc_lock(allocation_mutex_);
+
+  // Already assigned?
+  if (model_pool_assignments_.count(model_id) &&
+      model_pool_assignments_[model_id] != PoolType::NONE) {
+    return;
+  }
+
+  auto model_mgr = get_model_instance_mgr(model_id);
+  if (!model_mgr) {
+    LOG(ERROR) << "assign_model_to_pool: no model mgr for " << model_id;
+    return;
+  }
+
+  int64_t heat = model_mgr->get_model_heat();
+  auto res_it = model_resource_models_.find(model_id);
+  int32_t gpu_target = (heat == 0) ? 1
+      : (res_it != model_resource_models_.end())
+          ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)
+          : 1;
+
+  if (gpu_target <= 1) {
+    // Steady pool
+    ResourceNeeds needs = (res_it != model_resource_models_.end())
+        ? res_it->second->compute_resource_needs(heat)
+        : ResourceNeeds{20.0, 0.0};
+
+    std::string instance = find_or_create_steady_bin(model_id, needs);
+    if (instance.empty()) {
+      LOG(WARNING) << "assign_model_to_pool: no instance for steady pool, "
+                   << "falling back to elastic for " << model_id;
+      model_pool_assignments_[model_id] = PoolType::ELASTIC;
+      return;
+    }
+
+    model_pool_assignments_[model_id] = PoolType::STEADY;
+
+    uint64_t model_size = get_model_size_bytes(model_id);
+    model_mgr->set_model_state(instance, ModelState::ALLOCATED);
+    deduct_free_pages(instance, model_size);
+
+    alloc_lock.unlock();
+    send_model_wakeup(instance, model_id, true);
+
+    LOG(INFO) << "Assigned model " << model_id << " to STEADY pool on " << instance;
+  } else {
+    // Elastic pool
+    model_pool_assignments_[model_id] = PoolType::ELASTIC;
+    LOG(INFO) << "Assigned model " << model_id << " to ELASTIC pool (gpu_target="
+              << gpu_target << ")";
+  }
+}
+
+std::string InstanceMgr::find_or_create_steady_bin(
+    const std::string& model_id, const ResourceNeeds& needs) {
+  // Phase 1: First Fit in existing bins
+  for (auto& bin : steady_bins_) {
+    if (bin.remaining_hbm_gb >= needs.hbm_gb &&
+        bin.remaining_compute_sm >= needs.compute_sm) {
+      bin.remaining_hbm_gb -= needs.hbm_gb;
+      bin.remaining_compute_sm -= needs.compute_sm;
+      bin.models.insert(model_id);
+      LOG(INFO) << "Placed model " << model_id << " in existing steady bin "
+                << bin.instance_name << " (remaining hbm=" << bin.remaining_hbm_gb
+                << "GB, compute=" << bin.remaining_compute_sm << ")";
+      return bin.instance_name;
+    }
+  }
+
+  // Phase 2: Open new bin from idle instances
+  {
+    std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_);
+    for (const auto& [inst_name, _] : instances_) {
+      if (is_steady_pool_instance(inst_name)) continue;
+      if (elastic_occupied_instances_.count(inst_name)) continue;
+      if (!has_valid_xtensor_info(inst_name)) continue;
+
+      // Check that no model is loaded on this instance
+      bool is_idle = true;
+      {
+        std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
+        for (const auto& [mid, mgr] : model_instance_mgrs_) {
+          if (mgr->get_model_state(inst_name) != ModelState::SLEEP) {
+            is_idle = false;
+            break;
+          }
+        }
+      }
+      if (!is_idle) continue;
+
+      SteadyBin new_bin;
+      new_bin.instance_name = inst_name;
+      new_bin.remaining_hbm_gb = gpu_hw_spec_.hbm_per_gpu_gb - needs.hbm_gb;
+      new_bin.remaining_compute_sm = gpu_hw_spec_.compute_sm_per_gpu - needs.compute_sm;
+      new_bin.models.insert(model_id);
+      steady_bins_.push_back(std::move(new_bin));
+
+      LOG(INFO) << "Created new steady bin on " << inst_name << " for model "
+                << model_id;
+      return inst_name;
+    }
+  }
+
+  // Phase 3: No idle instance — reclaim from elastic pool (BLOCKING)
+  LOG(INFO) << "No idle instance for steady pool, reclaiming from elastic pool";
+  pending_steady_gpus_ += kTensorParallelSize;
+
+  // Release allocation_mutex_ since dynamic_part_auto_scaling also acquires it
+  // Note: caller must handle this unlock/relock pattern
+  allocation_mutex_.unlock();
+  dynamic_part_auto_scaling();
+  allocation_mutex_.lock();
+
+  pending_steady_gpus_ -= kTensorParallelSize;
+
+  // Retry: find the freed instance
+  {
+    std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_);
+    for (const auto& [inst_name, _] : instances_) {
+      if (is_steady_pool_instance(inst_name)) continue;
+      if (elastic_occupied_instances_.count(inst_name)) continue;
+      if (!has_valid_xtensor_info(inst_name)) continue;
+
+      bool is_idle = true;
+      {
+        std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
+        for (const auto& [mid, mgr] : model_instance_mgrs_) {
+          if (mgr->get_model_state(inst_name) != ModelState::SLEEP) {
+            is_idle = false;
+            break;
+          }
+        }
+      }
+      if (!is_idle) continue;
+
+      SteadyBin new_bin;
+      new_bin.instance_name = inst_name;
+      new_bin.remaining_hbm_gb = gpu_hw_spec_.hbm_per_gpu_gb - needs.hbm_gb;
+      new_bin.remaining_compute_sm = gpu_hw_spec_.compute_sm_per_gpu - needs.compute_sm;
+      new_bin.models.insert(model_id);
+      steady_bins_.push_back(std::move(new_bin));
+
+      LOG(INFO) << "Reclaimed instance " << inst_name << " for steady bin, model "
+                << model_id;
+      return inst_name;
+    }
+  }
+
+  LOG(ERROR) << "Failed to reclaim instance for steady pool model " << model_id;
+  return "";
+}
+
+void InstanceMgr::remove_model_from_steady_bin(const std::string& model_id) {
+  // Must be called with allocation_mutex_ held
+  for (auto it = steady_bins_.begin(); it != steady_bins_.end(); ++it) {
+    if (it->models.count(model_id)) {
+      // Reclaim resources
+      ResourceNeeds needs = get_model_resource_needs(model_id);
+      it->remaining_hbm_gb += needs.hbm_gb;
+      it->remaining_compute_sm += needs.compute_sm;
+      it->models.erase(model_id);
+
+      LOG(INFO) << "Removed model " << model_id << " from steady bin "
+                << it->instance_name;
+
+      // If bin is now empty, remove it
+      if (it->models.empty()) {
+        LOG(INFO) << "Steady bin " << it->instance_name << " is now empty, releasing";
+        steady_bins_.erase(it);
+      }
+      return;
+    }
+  }
+}
+
+bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
+  std::unique_lock<std::mutex> alloc_lock(allocation_mutex_);
+
+  auto pool_it = model_pool_assignments_.find(model_id);
+  if (pool_it == model_pool_assignments_.end() ||
+      pool_it->second != PoolType::STEADY) {
+    return false;
+  }
+
+  auto model_mgr = get_model_instance_mgr(model_id);
+  if (!model_mgr) return false;
+
+  int64_t heat = model_mgr->get_model_heat();
+  auto res_it = model_resource_models_.find(model_id);
+  int32_t gpu_target = (res_it != model_resource_models_.end())
+      ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)
+      : 1;
+
+  if (gpu_target <= 1) {
+    return false;  // still fits in steady pool
+  }
+
+  // Upgrade to elastic
+  pool_it->second = PoolType::ELASTIC;
+
+  // Find the steady instance hosting this model
+  std::string steady_instance;
+  for (const auto& bin : steady_bins_) {
+    if (bin.models.count(model_id)) {
+      steady_instance = bin.instance_name;
+      break;
+    }
+  }
+
+  remove_model_from_steady_bin(model_id);
+
+  alloc_lock.unlock();
+
+  LOG(INFO) << "Upgrading model " << model_id << " from STEADY to ELASTIC pool "
+            << "(gpu_target=" << gpu_target << ")";
+
+  // Async: drain + sleep the model on old steady instance
+  if (!steady_instance.empty()) {
+    std::string inst = steady_instance;
+    std::string mid = model_id;
+    std::thread([this, inst, mid]() {
+      auto mgr = get_model_instance_mgr(mid);
+      if (mgr) mgr->set_model_state(inst, ModelState::DRAINING);
+      if (!wait_for_model_drain(inst, mid)) return;
+      send_model_sleep(inst, mid);
+    }).detach();
+  }
+
+  return true;
+}
+
+bool InstanceMgr::route_to_steady_instance(std::shared_ptr<Request> request) {
+  std::lock_guard<std::mutex> lock(allocation_mutex_);
+  for (const auto& bin : steady_bins_) {
+    if (bin.models.count(request->model)) {
+      request->routing.prefill_name = bin.instance_name;
+      request->routing.decode_name = bin.instance_name;
+      return true;
+    }
+  }
+  LOG(ERROR) << "route_to_steady_instance: model " << request->model
+             << " not found in any steady bin";
+  return false;
+}
+
+std::vector<std::tuple<std::string, std::string, std::string>>
+InstanceMgr::repack_steady_bins() {
+  // Must be called with allocation_mutex_ held
+  struct PackItem {
+    std::string model_id;
+    ResourceNeeds needs;
+    std::string old_instance;
+    double dominant_ratio;
+  };
+
+  // Collect all items from current bins
+  std::vector<PackItem> items;
+  for (const auto& bin : steady_bins_) {
+    for (const auto& model_id : bin.models) {
+      PackItem item;
+      item.model_id = model_id;
+      item.needs = get_model_resource_needs(model_id);
+      item.old_instance = bin.instance_name;
+      item.dominant_ratio = std::max(
+          item.needs.hbm_gb / gpu_hw_spec_.hbm_per_gpu_gb,
+          item.needs.compute_sm / gpu_hw_spec_.compute_sm_per_gpu);
+      items.push_back(std::move(item));
+    }
+  }
+
+  if (items.empty()) {
+    steady_bins_.clear();
+    return {};
+  }
+
+  // Sort by dominant resource ratio (decreasing) — FFD heuristic
+  std::sort(items.begin(), items.end(),
+            [](const PackItem& a, const PackItem& b) {
+              return a.dominant_ratio > b.dominant_ratio;
+            });
+
+  // Collect old bin instance names for reuse
+  std::vector<std::string> old_instances;
+  for (const auto& bin : steady_bins_) {
+    old_instances.push_back(bin.instance_name);
+  }
+
+  // Build new bins with FFD
+  std::vector<SteadyBin> new_bins;
+  size_t next_old_instance = 0;
+
+  for (const auto& item : items) {
+    bool placed = false;
+    for (auto& bin : new_bins) {
+      if (bin.remaining_hbm_gb >= item.needs.hbm_gb &&
+          bin.remaining_compute_sm >= item.needs.compute_sm) {
+        bin.remaining_hbm_gb -= item.needs.hbm_gb;
+        bin.remaining_compute_sm -= item.needs.compute_sm;
+        bin.models.insert(item.model_id);
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) {
+      // Open new bin, preferring old steady instances
+      std::string inst_name;
+      if (next_old_instance < old_instances.size()) {
+        inst_name = old_instances[next_old_instance++];
+      } else {
+        // Need a completely new instance — find idle
+        std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_);
+        for (const auto& [name, _] : instances_) {
+          if (elastic_occupied_instances_.count(name)) continue;
+          if (!has_valid_xtensor_info(name)) continue;
+          // Check not already used in new_bins
+          bool already_used = false;
+          for (const auto& nb : new_bins) {
+            if (nb.instance_name == name) { already_used = true; break; }
+          }
+          if (already_used) continue;
+          inst_name = name;
+          break;
+        }
+      }
+
+      if (inst_name.empty()) {
+        LOG(ERROR) << "repack_steady_bins: no instance available for model "
+                   << item.model_id;
+        continue;
+      }
+
+      SteadyBin new_bin;
+      new_bin.instance_name = inst_name;
+      new_bin.remaining_hbm_gb = gpu_hw_spec_.hbm_per_gpu_gb - item.needs.hbm_gb;
+      new_bin.remaining_compute_sm = gpu_hw_spec_.compute_sm_per_gpu - item.needs.compute_sm;
+      new_bin.models.insert(item.model_id);
+      new_bins.push_back(std::move(new_bin));
+    }
+  }
+
+  // Compute moves
+  std::vector<std::tuple<std::string, std::string, std::string>> moves;
+  for (const auto& item : items) {
+    std::string new_instance;
+    for (const auto& bin : new_bins) {
+      if (bin.models.count(item.model_id)) {
+        new_instance = bin.instance_name;
+        break;
+      }
+    }
+    if (!new_instance.empty() && new_instance != item.old_instance) {
+      moves.emplace_back(item.model_id, item.old_instance, new_instance);
+    }
+  }
+
+  steady_bins_ = std::move(new_bins);
+
+  LOG(INFO) << "Steady pool repack: " << items.size() << " models, "
+            << steady_bins_.size() << " bins, " << moves.size() << " moves";
+
+  return moves;
+}
+
+void InstanceMgr::steady_part_auto_repacking() {
+  std::unique_lock<std::mutex> alloc_lock(allocation_mutex_);
+
+  // Phase 1: collect models with 0 heat → schedule sleep
+  std::vector<std::pair<std::string, std::string>> models_to_remove;  // (model_id, instance)
+  for (const auto& bin : steady_bins_) {
+    for (const auto& model_id : bin.models) {
+      auto model_mgr = get_model_instance_mgr(model_id);
+      if (model_mgr && model_mgr->get_model_heat() == 0) {
+        models_to_remove.emplace_back(model_id, bin.instance_name);
+      }
+    }
+  }
+
+  for (const auto& [model_id, instance] : models_to_remove) {
+    remove_model_from_steady_bin(model_id);
+    model_pool_assignments_.erase(model_id);
+    LOG(INFO) << "steady_part_auto_repacking: sleeping model " << model_id
+              << " on " << instance << " (heat=0)";
+    std::string inst = instance;
+    std::string mid = model_id;
+    std::thread([this, inst, mid]() {
+      send_model_sleep(inst, mid);
+    }).detach();
+  }
+
+  // Phase 2: FFD repack of remaining models
+  auto moves = repack_steady_bins();
+
+  alloc_lock.unlock();
+
+  // Phase 3: Execute moves (wake on new, drain+sleep on old)
+  for (const auto& [model_id, old_inst, new_inst] : moves) {
+    LOG(INFO) << "steady_part_auto_repacking: moving model " << model_id
+              << " from " << old_inst << " to " << new_inst;
+    send_model_wakeup(new_inst, model_id, false);
+    auto mgr = get_model_instance_mgr(model_id);
+    if (mgr) mgr->set_model_state(old_inst, ModelState::DRAINING);
+    wait_for_model_drain(old_inst, model_id);
+    send_model_sleep(old_inst, model_id);
+  }
 }
 
 }  // namespace xllm_service

@@ -200,25 +200,49 @@ void Scheduler::process_request_queue(const std::string& model_name) {
       continue;
     }
 
-    // Check if model is already awake on any instance
-    int32_t model_count = instance_mgr_->get_wakeup_count(request->model);
+    // Dual-pool routing
+    PoolType pool = instance_mgr_->get_model_pool(request->model);
 
-    if (model_count == 0) {
-      // Cold model: blocking wakeup via dynamic_part_auto_scaling
-      instance_mgr_->dynamic_part_auto_scaling();
+    // New model: assign to pool (blocking if steady wakeup needed)
+    if (pool == PoolType::NONE) {
+      instance_mgr_->assign_model_to_pool(request->model);
+      pool = instance_mgr_->get_model_pool(request->model);
+    }
 
-      // Verify instance is now awake
-      auto awake = instance_mgr_->get_awake_instances(request->model);
-      if (awake.empty()) {
-        LOG(ERROR) << "dynamic_part_auto_scaling failed to wake model " << request->model;
+    // Steady pool: check for upgrade to elastic
+    if (pool == PoolType::STEADY) {
+      if (instance_mgr_->steady_part_check_upgrading(request->model)) {
+        pool = PoolType::ELASTIC;
+      }
+    }
+
+    if (pool == PoolType::STEADY) {
+      // Route to steady pool instance
+      if (!instance_mgr_->route_to_steady_instance(request)) {
+        LOG(ERROR) << "Failed to route to steady instance for " << request->model;
         continue;
       }
-      request->routing.prefill_name = awake[0];
-      request->routing.decode_name = awake[0];
     } else {
-      // Warm model: route first, then trigger scaling adjustment
-      lb_policy_->select_instances_pair(request);
-      instance_mgr_->dynamic_part_auto_scaling();
+      // Elastic pool: set prefill_only mode
+      request->prefill_only = true;
+
+      int32_t model_count = instance_mgr_->get_wakeup_count(request->model);
+      if (model_count == 0) {
+        // Cold elastic model: blocking wakeup
+        instance_mgr_->dynamic_part_auto_scaling();
+
+        auto awake = instance_mgr_->get_awake_instances(request->model);
+        if (awake.empty()) {
+          LOG(ERROR) << "dynamic_part_auto_scaling failed to wake model " << request->model;
+          continue;
+        }
+        request->routing.prefill_name = awake[0];
+        request->routing.decode_name = awake[0];
+      } else {
+        // Warm elastic model: route first, then trigger scaling adjustment
+        lb_policy_->select_instances_pair(request);
+        instance_mgr_->dynamic_part_auto_scaling();
+      }
     }
 
     DLOG(INFO) << request->routing.debug_string();
