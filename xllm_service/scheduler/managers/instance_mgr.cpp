@@ -84,6 +84,17 @@ void InstanceMgr::init() {
     }
   });
 
+  // Start elastic-to-steady demotion check thread
+  static constexpr int kDemotionCheckIntervalSeconds = 10;
+  demotion_thread_ = std::make_unique<std::thread>([this]() {
+    while (!exited_) {
+      std::this_thread::sleep_for(
+          std::chrono::seconds(kDemotionCheckIntervalSeconds));
+      if (exited_) break;
+      elastic_to_steady_demotion();
+    }
+  });
+
   {
     std::unique_lock<std::shared_mutex> lock(inst_mutex_);
     for (auto& it : ETCD_KEYS_PREFIX_MAP) {
@@ -1582,7 +1593,16 @@ std::optional<D2DWakeupInfo> InstanceMgr::find_d2d_source(
   // Track which instance we select as source (to keep it locked)
   std::string selected_source;
 
-  // Find a suitable source instance (not the target itself)
+  // Collect all eligible D2D source candidates, then pick the most loaded one.
+  struct D2DCandidate {
+    std::string instance_name;
+    std::vector<std::string> p2p_addrs;
+    std::vector<WeightSegment> weight_segments;
+    int64_t epdt;  // estimated prefill done time (higher = more loaded)
+  };
+  std::vector<D2DCandidate> candidates;
+
+  // Find all suitable source instances (not the target itself)
   for (const auto& source_instance_name : locked_instances) {
     if (source_instance_name == target_instance_name) {
       continue;
@@ -1599,8 +1619,6 @@ std::optional<D2DWakeupInfo> InstanceMgr::find_d2d_source(
     }
 
     if (!xtensor_info.has_value()) {
-      LOG(INFO) << "No valid XTensor info for source instance " << source_instance_name
-                << ", skipping for D2D";
       continue;
     }
 
@@ -1608,18 +1626,14 @@ std::optional<D2DWakeupInfo> InstanceMgr::find_d2d_source(
     auto seg_it = xtensor_info->model_weight_segments.find(model_id);
     if (seg_it == xtensor_info->model_weight_segments.end() ||
         seg_it->second.empty()) {
-      LOG(INFO) << "No weight segments for model " << model_id
-                << " on source instance " << source_instance_name;
       continue;
     }
 
     // Get P2P addresses for D2D weight transfer
-    // P2P addresses are mooncake transfer engine addresses (different from device_addrs)
     std::vector<std::string> p2p_addrs;
     if (!xtensor_info->p2p_addrs.empty()) {
       p2p_addrs = xtensor_info->p2p_addrs;
     } else {
-      // Fallback: try InstanceMetaInfo.p2p_addrs from registration
       std::shared_lock<std::shared_mutex> lock(inst_mutex_);
       auto meta_it = instances_.find(source_instance_name);
       if (meta_it != instances_.end()) {
@@ -1628,47 +1642,56 @@ std::optional<D2DWakeupInfo> InstanceMgr::find_d2d_source(
     }
 
     if (p2p_addrs.empty()) {
-      LOG(INFO) << "No P2P addresses for source instance " << source_instance_name
-                << ", skipping for D2D";
       continue;
     }
 
-    // Found a suitable source - build D2DWakeupInfo
-    D2DWakeupInfo d2d_info;
-    d2d_info.source_instance_name = source_instance_name;
-    d2d_info.remote_addrs = p2p_addrs;
-
-    // For each remote addr, add the weight segments
-    // Currently assuming all workers have the same weight segments
-    for (size_t i = 0; i < p2p_addrs.size(); ++i) {
-      d2d_info.src_weight_segments.push_back(seg_it->second);
-    }
-
-    selected_source = source_instance_name;
-
-    LOG(INFO) << "Found D2D source instance " << source_instance_name
-              << " for model " << model_id
-              << " with " << d2d_info.remote_addrs.size() << " remote addrs"
-              << " and " << seg_it->second.size() << " weight segments";
-
-    // Unlock all instances except the selected source
-    std::vector<std::string> instances_to_unlock;
-    for (const auto& inst : locked_instances) {
-      if (inst != selected_source) {
-        instances_to_unlock.push_back(inst);
-      }
-    }
-    model_mgr->release_d2d_locks(instances_to_unlock);
-
-    return d2d_info;
+    // Eligible candidate — record with EPDT for load ranking
+    int64_t epdt = get_estimated_prefill_done_time(source_instance_name);
+    candidates.push_back({source_instance_name, std::move(p2p_addrs),
+                          seg_it->second, epdt});
   }
 
-  // No suitable source found - unlock all instances
-  model_mgr->release_d2d_locks(locked_instances);
+  if (candidates.empty()) {
+    model_mgr->release_d2d_locks(locked_instances);
+    LOG(INFO) << "No suitable D2D source found for model " << model_id
+              << ", will use H2D wakeup";
+    return std::nullopt;
+  }
 
-  LOG(INFO) << "No suitable D2D source found for model " << model_id
-            << ", will use H2D wakeup";
-  return std::nullopt;
+  // Prefer the most heavily-loaded instance (highest EPDT) as D2D source.
+  // This avoids choosing lightly-loaded instances that are more likely to be
+  // drained/evicted.
+  auto& best = *std::max_element(
+      candidates.begin(), candidates.end(),
+      [](const D2DCandidate& a, const D2DCandidate& b) {
+        return a.epdt < b.epdt;
+      });
+
+  // Build D2DWakeupInfo from best candidate
+  D2DWakeupInfo d2d_info;
+  d2d_info.source_instance_name = best.instance_name;
+  d2d_info.remote_addrs = best.p2p_addrs;
+  for (size_t i = 0; i < best.p2p_addrs.size(); ++i) {
+    d2d_info.src_weight_segments.push_back(best.weight_segments);
+  }
+  selected_source = best.instance_name;
+
+  LOG(INFO) << "Found D2D source instance " << selected_source
+            << " for model " << model_id
+            << " with " << d2d_info.remote_addrs.size() << " remote addrs"
+            << " and " << best.weight_segments.size() << " weight segments"
+            << " (EPDT=" << best.epdt << ", candidates=" << candidates.size() << ")";
+
+  // Unlock all instances except the selected source
+  std::vector<std::string> instances_to_unlock;
+  for (const auto& inst : locked_instances) {
+    if (inst != selected_source) {
+      instances_to_unlock.push_back(inst);
+    }
+  }
+  model_mgr->release_d2d_locks(instances_to_unlock);
+
+  return d2d_info;
 }
 
 // --- Dual-pool scheduling implementation ---
@@ -1764,7 +1787,8 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
 }
 
 std::string InstanceMgr::find_or_create_steady_bin(
-    const std::string& model_id, const ResourceNeeds& needs) {
+    const std::string& model_id, const ResourceNeeds& needs,
+    bool allow_reclaim) {
 
   // Phase 1: First Fit in existing bins
   for (auto& bin : steady_bins_) {
@@ -1821,6 +1845,9 @@ std::string InstanceMgr::find_or_create_steady_bin(
   }
 
   // Phase 3: No idle instance — reclaim from elastic pool (BLOCKING)
+  if (!allow_reclaim) {
+    return "";
+  }
   pending_steady_gpus_ += kTensorParallelSize;
 
   // Release allocation_mutex_ since dynamic_part_auto_scaling also acquires it
@@ -2127,6 +2154,152 @@ void InstanceMgr::steady_part_auto_repacking() {
     if (mgr) mgr->set_model_state(old_inst, ModelState::DRAINING);
     wait_for_model_drain(old_inst, model_id);
     send_model_sleep(old_inst, model_id);
+  }
+}
+
+void InstanceMgr::elastic_to_steady_demotion() {
+  static constexpr int kDemotionThresholdSeconds = 30;
+  auto now = std::chrono::steady_clock::now();
+
+  // Phase 1: Scan elastic models and update low-demand tracking
+  struct DemotionCandidate {
+    std::string model_id;
+    std::shared_ptr<ModelInstanceMgr> mgr;
+  };
+  std::vector<DemotionCandidate> candidates;
+
+  {
+    std::unique_lock<std::mutex> alloc_lock(allocation_mutex_);
+
+    std::vector<std::string> elastic_models;
+    for (const auto& [id, pool] : model_pool_assignments_) {
+      if (pool == PoolType::ELASTIC) {
+        elastic_models.push_back(id);
+      }
+    }
+
+    for (const auto& model_id : elastic_models) {
+      auto model_mgr = get_model_instance_mgr(model_id);
+      if (!model_mgr) continue;
+
+      int64_t heat = model_mgr->get_model_heat();
+      auto res_it = model_resource_models_.find(model_id);
+      int32_t gpu_target = (heat == 0) ? 0
+          : (res_it != model_resource_models_.end())
+              ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)
+              : 1;
+
+      if (gpu_target != 1) {
+        // Demand is not "low but nonzero" — reset tracking
+        elastic_low_demand_since_.erase(model_id);
+        continue;
+      }
+
+      // gpu_target == 1: track low demand duration
+      auto it = elastic_low_demand_since_.find(model_id);
+      if (it == elastic_low_demand_since_.end()) {
+        elastic_low_demand_since_[model_id] = now;
+        continue;
+      }
+
+      auto duration_s = std::chrono::duration_cast<std::chrono::seconds>(
+          now - it->second).count();
+      if (duration_s < kDemotionThresholdSeconds) {
+        continue;
+      }
+
+      // Sustained low demand — mark as demotion candidate
+      candidates.push_back({model_id, model_mgr});
+    }
+  }  // release allocation_mutex_
+
+  // Phase 2: Attempt demotion for each candidate
+  for (const auto& candidate : candidates) {
+    const auto& model_id = candidate.model_id;
+    auto model_mgr = candidate.mgr;
+
+    std::unique_lock<std::mutex> alloc_lock(allocation_mutex_);
+
+    // Re-verify: still ELASTIC and gpu_target still <= 1
+    auto pool_it = model_pool_assignments_.find(model_id);
+    if (pool_it == model_pool_assignments_.end() ||
+        pool_it->second != PoolType::ELASTIC) {
+      elastic_low_demand_since_.erase(model_id);
+      continue;
+    }
+
+    int64_t heat = model_mgr->get_model_heat();
+    auto res_it = model_resource_models_.find(model_id);
+    int32_t gpu_target = (heat == 0) ? 0
+        : (res_it != model_resource_models_.end())
+            ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)
+            : 1;
+    if (gpu_target != 1) {
+      elastic_low_demand_since_.erase(model_id);
+      continue;
+    }
+
+    // Try to find a steady bin (no reclamation allowed)
+    ResourceNeeds needs = get_model_resource_needs(model_id);
+    std::string steady_instance =
+        find_or_create_steady_bin(model_id, needs, /*allow_reclaim=*/false);
+
+    if (steady_instance.empty()) {
+      LOG(INFO) << "elastic_to_steady_demotion: no room in steady pool for "
+                << model_id << ", skipping this round";
+      continue;
+    }
+
+    // Collect elastic instances before changing pool
+    auto elastic_instances = model_mgr->get_awake_instances();
+
+    // Set model state to ALLOCATED on steady instance, deduct memory
+    uint64_t model_size = get_model_size_bytes(model_id);
+    model_mgr->set_model_state(steady_instance, ModelState::ALLOCATED);
+    deduct_free_pages(steady_instance, model_size);
+
+    // Change pool assignment to STEADY
+    pool_it->second = PoolType::STEADY;
+
+    LOG(INFO) << "elastic_to_steady_demotion: demoting model " << model_id
+              << " from ELASTIC to STEADY on " << steady_instance
+              << " (elastic instances: " << elastic_instances.size() << ")";
+
+    alloc_lock.unlock();
+
+    // Blocking wakeup on steady instance
+    send_model_wakeup(steady_instance, model_id, true);
+
+    // Check if wakeup succeeded
+    if (model_mgr->get_model_state(steady_instance) != ModelState::WAKEUP) {
+      LOG(ERROR) << "elastic_to_steady_demotion: wakeup failed for "
+                 << model_id << " on " << steady_instance << ", rolling back";
+      std::lock_guard<std::mutex> lock(allocation_mutex_);
+      remove_model_from_steady_bin(model_id);
+      model_pool_assignments_[model_id] = PoolType::ELASTIC;
+      elastic_low_demand_since_.erase(model_id);
+      continue;
+    }
+
+    // Drain and sleep all elastic instances for this model
+    for (const auto& elastic_inst : elastic_instances) {
+      if (elastic_inst == steady_instance) continue;
+      model_mgr->set_model_state(elastic_inst, ModelState::DRAINING);
+      wait_for_model_drain(elastic_inst, model_id);
+      send_model_sleep(elastic_inst, model_id);
+      {
+        std::lock_guard<std::mutex> lock(allocation_mutex_);
+        elastic_occupied_instances_.erase(elastic_inst);
+      }
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(allocation_mutex_);
+      elastic_low_demand_since_.erase(model_id);
+    }
+
+    LOG(INFO) << "elastic_to_steady_demotion: model " << model_id
+              << " successfully demoted to STEADY on " << steady_instance;
   }
 }
 

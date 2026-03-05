@@ -145,6 +145,10 @@ class InstanceMgr final {
   // Periodic: sleep models with 0 heat, repack bins, release unused instances.
   void steady_part_auto_repacking();
 
+  // Periodic: demote elastic models with sustained low demand (gpu_target<=1)
+  // back to steady pool via find_or_create_steady_bin.
+  void elastic_to_steady_demotion();
+
   // Route a request to the steady pool instance hosting the model.
   bool route_to_steady_instance(std::shared_ptr<Request> request);
 
@@ -198,8 +202,10 @@ class InstanceMgr final {
   // 2D First Fit: find a bin for a model, or create a new one.
   // If all instances occupied, reclaims from elastic pool (blocking).
   // Must be called with allocation_mutex_ held.
+  // When allow_reclaim is false, skip Phase 3 (elastic pool reclamation).
   std::string find_or_create_steady_bin(const std::string& model_id,
-                                         const ResourceNeeds& needs);
+                                         const ResourceNeeds& needs,
+                                         bool allow_reclaim = true);
 
   // Full FFD repack of all steady bins.
   // Returns list of (model_id, old_instance, new_instance) moves.
@@ -348,6 +354,13 @@ class InstanceMgr final {
   int32_t pending_steady_gpus_ = 0;
   // Repack timer thread
   std::unique_ptr<std::thread> repack_thread_;
+
+  // --- Elastic-to-steady demotion state (protected by allocation_mutex_) ---
+  // model_id -> timestamp when gpu_target first dropped to <= 1
+  std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+      elastic_low_demand_since_;
+  // Demotion check thread
+  std::unique_ptr<std::thread> demotion_thread_;
 
   // XTensor memory info per instance
   std::mutex xtensor_info_mutex_;

@@ -100,7 +100,6 @@ bool LstImhPolicy::select_instances_pair(std::shared_ptr<Request> request) {
 // on_prefill_done — called when a prefill finishes on an instance
 // ---------------------------------------------------------------------------
 void LstImhPolicy::on_prefill_done(const std::string& instance_name) {
-  LOG(INFO) << "[LST-IMH] PREFILL_DONE signal from instance=" << instance_name;
   signal_dispatch();
 }
 
