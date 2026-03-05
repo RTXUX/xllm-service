@@ -44,8 +44,8 @@ class InstanceMgr final {
  public:
 
   const std::vector<std::pair<std::string, std::string>> MODELS = {
-    {"Qwen3-8B", "/export/home/models/Qwen3-8B"}
-    // {"Qwen2-7B", "/export/home/models/Qwen2-7B"},
+    {"Qwen3-8B", "/export/home/models/Qwen3-8B"},
+    {"Qwen2-7B", "/export/home/models/Qwen2-7B"}
     // {"Qwen2.5-14B", "/export/home/models/Qwen2.5-14B"},
     // {"Qwen3-4B", "/export/home/models/Qwen3-4B"}
     // {"Qwen2.5-3b", "/export/home/models/Qwen2.5-3b"}

@@ -89,7 +89,6 @@ TimePredictor::TimePredictor(
 double TimePredictor::predict_ttft(const std::string& model_id, int32_t length) {
   auto it = ttft_coefficients_.find(model_id);
   if (it == ttft_coefficients_.end()) {
-    LOG(WARNING) << "Model " << model_id << " not found in TTFT coefficients, using default";
     if (!default_model_id_.empty() && ttft_coefficients_.find(default_model_id_) != ttft_coefficients_.end()) {
       it = ttft_coefficients_.find(default_model_id_);
     } else if (!ttft_coefficients_.empty()) {

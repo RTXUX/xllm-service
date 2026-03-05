@@ -88,6 +88,10 @@ struct Request {
 
   // true for elastic pool requests: forces max_tokens=1 (prefill-only)
   bool prefill_only = false;
+
+  // LstImhPolicy coordinator pre-updates metrics after assigning an instance;
+  // process_request_queue checks this flag to avoid double-updating.
+  bool metrics_already_updated = false;
 };
 
 }  // namespace xllm_service

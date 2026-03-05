@@ -30,6 +30,14 @@ class LoadBalancePolicy {
 
   virtual bool select_instances_pair(std::shared_ptr<Request> request) = 0;
 
+  // Called when prefill completes on an instance; LstImhPolicy overrides to
+  // wake the coordinator so it can re-evaluate availability.
+  virtual void on_prefill_done(const std::string& instance_name) {}
+
+  // Called at shutdown; LstImhPolicy overrides to unblock threads waiting
+  // inside select_instances_pair().
+  virtual void shutdown() {}
+
  protected:
   std::shared_ptr<InstanceMgr> instance_mgr_;
 };

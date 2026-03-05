@@ -17,6 +17,7 @@ limitations under the License.
 
 #include "common/xllm/status.h"
 #include "loadbalance_policy/cache_aware_routing.h"
+#include "loadbalance_policy/lst_imh_policy.h"
 #include "loadbalance_policy/round_robin.h"
 #include "loadbalance_policy/slo_aware_policy.h"
 #include "tokenizer/tokenizer_factory.h"
@@ -25,9 +26,7 @@ limitations under the License.
 #include <absl/time/time.h>
 
 #include <algorithm>
-#include <limits>
 #include <thread>
-#include <unordered_set>
 
 static constexpr int kHeartbeatInterval = 3;  // in seconds
 static constexpr int kQueueProcessThreadNum = 4;
@@ -59,10 +58,7 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
   } else if (options.load_balance_policy() == "SLO_AWARE") {
     lb_policy_ = std::make_unique<SloAwarePolicy>(options, instance_mgr_);
   } else if (options.load_balance_policy() == "LST_IMH") {
-    // LST-IMH mode: dispatch coordinator thread replaces processing threads
-    dispatch_coordinator_thread_ = std::make_unique<std::thread>(
-        &Scheduler::dispatch_coordinator, this);
-    LOG(INFO) << "LST-IMH scheduling mode enabled.";
+    lb_policy_ = std::make_unique<LstImhPolicy>(options, instance_mgr_);
   } else {
     lb_policy_ = std::make_unique<RoundRobin>(instance_mgr_);
   }
@@ -82,29 +78,15 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
 Scheduler::~Scheduler() {
   exited_ = true;
 
-  // Wake up dispatch coordinator if in LST_IMH mode
-  {
-    std::lock_guard<std::mutex> lock(dispatch_mutex_);
-    dispatch_signal_ = true;
-  }
-  dispatch_cv_.notify_one();
-  if (dispatch_coordinator_thread_ && dispatch_coordinator_thread_->joinable()) {
-    dispatch_coordinator_thread_->join();
+  // Shut down lb_policy first (unblocks any threads waiting in
+  // select_instances_pair, e.g. LstImhPolicy's coordinator).
+  if (lb_policy_) {
+    lb_policy_->shutdown();
   }
 
-  // Drain pending queue - notify clients of remaining requests
-  {
-    std::lock_guard<std::mutex> lock(pending_queue_mutex_);
-    for (auto& req : pending_queue_) {
-      if (req && req->timeout_callback) {
-        req->timeout_callback();
-      }
-    }
-    pending_queue_.clear();
-  }
-
+  // Push nullptr sentinels to unblock process_request_queue threads.
   for (auto& queue_pair : request_queues_) {
-    queue_pair.second->emplace(nullptr);  // unblock queue
+    queue_pair.second->emplace(nullptr);
   }
   for (auto& thread_pair : processing_threads_) {
     for (auto& thread : thread_pair.second) {
@@ -145,27 +127,7 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
     instance_mgr_->update_model_heat(request->model, request->token_ids.size());
   }
 
-  // LST-IMH mode: add to pending queue, signal coordinator
-  if (options_.load_balance_policy() == "LST_IMH") {
-    // Compute estimated processing time
-    if (!request->token_ids.empty()) {
-      request->estimated_processing_time_ms = static_cast<int64_t>(
-          instance_mgr_->predict_ttft_any_instance(request->model,
-                                                    request->token_ids.size()));
-    }
-
-    {
-      std::lock_guard<std::mutex> lock(pending_queue_mutex_);
-      pending_queue_.push_back(request);
-      // Remember model name for coordinator (single model assumption)
-      lst_imh_model_name_ = request->model;
-    }
-
-    signal_dispatch();
-    return true;
-  }
-
-  // Push request to queue (existing path for RR/CAR/SLO_AWARE)
+  // Push request to queue (all policies go through process_request_queue)
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     if (request_queues_.find(request->model) == request_queues_.end()) {
@@ -233,22 +195,28 @@ void Scheduler::process_request_queue(const std::string& model_name) {
 
         auto awake = instance_mgr_->get_awake_instances(request->model);
         if (awake.empty()) {
-          LOG(ERROR) << "dynamic_part_auto_scaling failed to wake model " << request->model;
+          LOG(ERROR) << "dynamic_part_auto_scaling failed to wake model " << request->model
+                     << " (request silently dropped!)";
           continue;
         }
         request->routing.prefill_name = awake[0];
         request->routing.decode_name = awake[0];
       } else {
         // Warm elastic model: route first, then trigger scaling adjustment
-        lb_policy_->select_instances_pair(request);
+        if (!lb_policy_->select_instances_pair(request)) {
+          LOG(WARNING) << "LB policy failed to assign instance for request "
+                       << request->service_request_id
+                       << " model=" << request->model;
+          continue;
+        }
         instance_mgr_->dynamic_part_auto_scaling();
       }
     }
 
     DLOG(INFO) << request->routing.debug_string();
 
-    // update request metrics
-    if (request->prompt.size() != 0) {
+    // update request metrics (skip if already updated by LstImhPolicy coordinator)
+    if (request->prompt.size() != 0 && !request->metrics_already_updated) {
       instance_mgr_->update_request_metrics(request, RequestAction::SCHEDULE);
     }
 
@@ -522,282 +490,10 @@ void Scheduler::update_request_metrics_for_prefill(
     }
   }
 
-  // Signal dispatch coordinator on PREFILL_DONE so it can re-evaluate availability
-  if (!prefill_instance.empty() &&
-      options_.load_balance_policy() == "LST_IMH") {
-    LOG(INFO) << "[LST-IMH] PREFILL_DONE: instance=" << prefill_instance
-              << " request=" << service_request_id;
-    signal_dispatch();
-  }
-
-}
-
-// === LST-IMH Implementation ===
-
-void Scheduler::signal_dispatch() {
-  {
-    std::lock_guard<std::mutex> lock(dispatch_mutex_);
-    dispatch_signal_ = true;
-  }
-  dispatch_cv_.notify_one();
-}
-
-std::vector<SchedulingJob> Scheduler::moore_hodgson(
-    const std::vector<SchedulingJob>& jobs, int64_t T) {
-  // Sort jobs by EDD (earliest due date first)
-  std::vector<SchedulingJob> sorted_jobs = jobs;
-  std::sort(sorted_jobs.begin(), sorted_jobs.end(),
-            [](const SchedulingJob& a, const SchedulingJob& b) {
-              return a.deadline_ms < b.deadline_ms;
-            });
-
-  // on_time_indices tracks which jobs (by index in sorted_jobs) are on-time
-  std::vector<size_t> on_time_indices;
-  // Track removed indices for lazy heap deletion
-  std::unordered_set<size_t> removed_indices;
-
-  // Max-heap: (processing_time, index_in_sorted_jobs)
-  auto cmp = [](const std::pair<int64_t, size_t>& a,
-                const std::pair<int64_t, size_t>& b) {
-    return a.first < b.first;
-  };
-  std::priority_queue<std::pair<int64_t, size_t>,
-                      std::vector<std::pair<int64_t, size_t>>,
-                      decltype(cmp)> max_heap(cmp);
-
-  int64_t current_time = T;
-
-  for (size_t i = 0; i < sorted_jobs.size(); ++i) {
-    on_time_indices.push_back(i);
-    max_heap.push({sorted_jobs[i].processing_time_ms, i});
-    current_time += sorted_jobs[i].processing_time_ms;
-
-    if (current_time > sorted_jobs[i].deadline_ms) {
-      // Skip stale heap entries (already removed in a previous iteration)
-      while (!max_heap.empty() &&
-             removed_indices.count(max_heap.top().second)) {
-        max_heap.pop();
-      }
-      if (max_heap.empty()) break;
-
-      // Remove job with largest processing time
-      auto [p_max, idx_max] = max_heap.top();
-      max_heap.pop();
-
-      // Mark as removed
-      removed_indices.insert(idx_max);
-
-      // Remove idx_max from on_time_indices
-      on_time_indices.erase(
-          std::remove(on_time_indices.begin(), on_time_indices.end(), idx_max),
-          on_time_indices.end());
-
-      current_time -= p_max;
-    }
-  }
-
-  // Build result from on_time_indices (already in EDD order)
-  std::vector<SchedulingJob> result;
-  result.reserve(on_time_indices.size());
-  for (size_t idx : on_time_indices) {
-    result.push_back(sorted_jobs[idx]);
-  }
-  return result;
-}
-
-std::unordered_map<std::string, std::vector<SchedulingJob>>
-Scheduler::run_lst_imh(std::vector<SchedulingJob>& jobs,
-                       std::vector<MachineInfo>& machines) {
-  // Sort machines by availability time ascending (earliest available first)
-  // Tie-break by instance name for deterministic ordering
-  std::sort(machines.begin(), machines.end(),
-            [](const MachineInfo& a, const MachineInfo& b) {
-              if (a.availability_time_ms != b.availability_time_ms)
-                return a.availability_time_ms < b.availability_time_ms;
-              return a.instance_name < b.instance_name;
-            });
-
-  std::unordered_map<std::string, std::vector<SchedulingJob>> assignment;
-  std::vector<SchedulingJob> remaining = jobs;
-
-  for (const auto& machine : machines) {
-    if (remaining.empty()) break;
-
-    // Run Moore-Hodgson on remaining jobs for this machine
-    auto on_time = moore_hodgson(remaining, machine.availability_time_ms);
-
-    if (!on_time.empty()) {
-      // Only assign the most urgent job (first in EDD order) to this machine.
-      // The dispatch loop dispatches at most 1 job per ready instance per cycle,
-      // so assigning more would starve subsequent machines of work.
-      assignment[machine.instance_name] = {on_time[0]};
-
-      // Remove only the assigned job from remaining
-      const auto& assigned_id = on_time[0].request->service_request_id;
-      remaining.erase(
-          std::remove_if(remaining.begin(), remaining.end(),
-                         [&assigned_id](const SchedulingJob& j) {
-                           return j.request->service_request_id == assigned_id;
-                         }),
-          remaining.end());
-    }
-  }
-
-  return assignment;
-}
-
-void Scheduler::dispatch_coordinator() {
-  const int64_t pre_pull_ms =
-      static_cast<int64_t>(options_.lst_imh_pre_pull_ms());
-  LOG(INFO) << "[LST-IMH] dispatch_coordinator started, pre_pull_ms="
-            << pre_pull_ms;
-
-  while (!exited_) {
-    // Compute next wake time from EPDT (estimated prefill done time)
-    int64_t now_ms = absl::ToUnixMillis(absl::Now());
-    int64_t next_wake_ms = std::numeric_limits<int64_t>::max();
-
-    {
-      std::string model_name;
-      {
-        std::lock_guard<std::mutex> lock(pending_queue_mutex_);
-        model_name = lst_imh_model_name_;
-      }
-      if (!model_name.empty()) {
-        auto instances = instance_mgr_->get_awake_instances(model_name);
-        for (const auto& inst : instances) {
-          int64_t epdt = instance_mgr_->get_estimated_prefill_done_time(inst);
-          if (epdt > now_ms) {
-            int64_t wake_at = epdt - pre_pull_ms;
-            if (wake_at > now_ms) {
-              next_wake_ms = std::min(next_wake_ms, wake_at);
-            }
-          }
-        }
-      }
-    }
-
-    // Wait for signal or timer
-    {
-      std::unique_lock<std::mutex> lock(dispatch_mutex_);
-      if (next_wake_ms == std::numeric_limits<int64_t>::max()) {
-        // No active prefills, wait indefinitely for signal
-        dispatch_cv_.wait(lock, [this] {
-          return dispatch_signal_ || exited_;
-        });
-      } else {
-        auto wait_ms = std::max(int64_t(0), next_wake_ms - now_ms);
-        dispatch_cv_.wait_for(lock, std::chrono::milliseconds(wait_ms),
-                              [this] {
-                                return dispatch_signal_ || exited_;
-                              });
-      }
-      dispatch_signal_ = false;
-    }
-
-    if (exited_) break;
-
-    now_ms = absl::ToUnixMillis(absl::Now());
-
-    // Get awake instances for the model
-    std::string model_name;
-    {
-      std::lock_guard<std::mutex> lock(pending_queue_mutex_);
-      model_name = lst_imh_model_name_;
-    }
-    if (model_name.empty()) continue;
-    auto awake_instances =
-        instance_mgr_->get_awake_instances(model_name);
-    if (awake_instances.empty()) continue;
-
-    // Build machine list with real-time availability estimates using EPDT
-    std::vector<MachineInfo> machines;
-    std::vector<std::string> ready_instances;
-
-    for (const auto& inst : awake_instances) {
-      int64_t epdt = instance_mgr_->get_estimated_prefill_done_time(inst);
-      int64_t T_i = std::max(int64_t(0), epdt - now_ms);
-      machines.push_back({inst, T_i});
-      if (T_i <= pre_pull_ms) {
-        ready_instances.push_back(inst);
-      }
-    }
-
-    if (ready_instances.empty()) continue;
-
-    // Purge expired requests and build job list
-    std::vector<SchedulingJob> jobs;
-    {
-      std::lock_guard<std::mutex> lock(pending_queue_mutex_);
-      auto it = pending_queue_.begin();
-      while (it != pending_queue_.end()) {
-        int64_t deadline = (*it)->arrival_time_ms + (*it)->ttft_slo_ms;
-        if (deadline <= now_ms) {
-          // Expired - discard
-          LOG(WARNING) << "Request " << (*it)->service_request_id
-                       << " expired (TTFT SLO exceeded), discarding.";
-          if ((*it)->timeout_callback) {
-            (*it)->timeout_callback();
-          }
-          it = pending_queue_.erase(it);
-        } else {
-          jobs.push_back({*it, (*it)->estimated_processing_time_ms, deadline});
-          ++it;
-        }
-      }
-    }
-
-    if (jobs.empty()) continue;
-
-    // Run LST-IMH algorithm
-    auto assignment = run_lst_imh(jobs, machines);
-
-    // Dispatch to each ready instance
-    for (const auto& instance : ready_instances) {
-      auto assign_it = assignment.find(instance);
-      if (assign_it == assignment.end() || assign_it->second.empty()) {
-        LOG(INFO) << "[LST-IMH] dispatch: instance " << instance
-                  << " is ready but got no assignment";
-        continue;
-      }
-
-      // Take first job (already in EDD order from Moore-Hodgson)
-      auto& job = assign_it->second[0];
-      auto request = job.request;
-
-      // Set routing
-      request->routing.prefill_name = instance;
-      request->routing.decode_name = instance;
-      request->estimated_ttft = job.processing_time_ms;
-
-      // Remove from pending queue
-      {
-        std::lock_guard<std::mutex> lock(pending_queue_mutex_);
-        auto before_size = pending_queue_.size();
-        pending_queue_.erase(
-            std::remove_if(
-                pending_queue_.begin(), pending_queue_.end(),
-                [&request](const std::shared_ptr<Request>& r) {
-                  return r->service_request_id ==
-                         request->service_request_id;
-                }),
-            pending_queue_.end());
-      }
-
-      // Update request metrics
-      if (!request->prompt.empty()) {
-        instance_mgr_->update_request_metrics(request,
-                                              RequestAction::SCHEDULE);
-      }
-
-      // Note: EPDT (estimated_prefill_done_time) is already updated in
-      // update_request_metrics(SCHEDULE) above, no separate dispatch state needed.
-
-      // Execute dispatch callback
-      if (request->dispatch_callback) {
-        std::thread([request]() { request->dispatch_callback(); }).detach();
-      }
-    }
+  // Notify lb_policy on PREFILL_DONE (polymorphic; LstImhPolicy uses this to
+  // wake its coordinator, other policies ignore it).
+  if (!prefill_instance.empty() && lb_policy_) {
+    lb_policy_->on_prefill_done(prefill_instance);
   }
 
 }

@@ -10,10 +10,12 @@ cc_library(
     round_robin.h
     cache_aware_routing.h
     slo_aware_policy.h
+    lst_imh_policy.h
   SRCS
     round_robin.cpp
     cache_aware_routing.cpp
     slo_aware_policy.cpp
+    lst_imh_policy.cpp
   DEPS
     :chat_template
     :common

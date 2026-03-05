@@ -892,11 +892,6 @@ void InstanceMgr::update_request_metrics(std::shared_ptr<Request> request,
         if (request->expected_prefill_done_ms > 0) {
           // Shift EPDT by the difference between actual and expected completion
           int64_t correction = now_ms - request->expected_prefill_done_ms;
-          LOG(INFO) << "[EPDT] FINISH_PREFILL correction: instance="
-                    << request->routing.prefill_name
-                    << " expected=" << request->expected_prefill_done_ms
-                    << " actual=" << now_ms
-                    << " correction=" << correction << "ms";
           epdt += correction;
 
           // Propagate correction to all remaining inflight requests on this
@@ -1385,8 +1380,17 @@ void InstanceMgr::dynamic_part_auto_scaling() {
       if (is_steady_pool_instance(inst_name)) continue;
       // Skip instances occupied by another elastic model
       if (elastic_occupied_instances_.count(inst_name)) continue;
-      if (!has_valid_xtensor_info(inst_name)) continue;
-      if (get_instance_free_bytes(inst_name) < model_size) continue;
+      if (!has_valid_xtensor_info(inst_name)) {
+        LOG(WARNING) << "dynamic_part_auto_scaling: skip " << inst_name
+                     << " for model " << t.model_id << " (no valid xtensor info)";
+        continue;
+      }
+      if (get_instance_free_bytes(inst_name) < model_size) {
+        LOG(INFO) << "dynamic_part_auto_scaling: skip " << inst_name
+                  << " for model " << t.model_id << " (not enough space: free="
+                  << get_instance_free_bytes(inst_name) << " need=" << model_size << ")";
+        continue;
+      }
 
       t.mgr->set_model_state(inst_name, ModelState::ALLOCATED);
       deduct_free_pages(inst_name, model_size);
@@ -1717,6 +1721,9 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
           ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)
           : 1;
 
+  LOG(INFO) << "assign_model_to_pool: model=" << model_id
+            << " heat=" << heat << " gpu_target=" << gpu_target;
+
   if (gpu_target <= 1) {
     // Steady pool
     ResourceNeeds needs = (res_it != model_resource_models_.end())
@@ -1751,6 +1758,7 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
 
 std::string InstanceMgr::find_or_create_steady_bin(
     const std::string& model_id, const ResourceNeeds& needs) {
+
   // Phase 1: First Fit in existing bins
   for (auto& bin : steady_bins_) {
     if (bin.remaining_hbm_gb >= needs.hbm_gb &&
@@ -1769,9 +1777,15 @@ std::string InstanceMgr::find_or_create_steady_bin(
   {
     std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_);
     for (const auto& [inst_name, _] : instances_) {
-      if (is_steady_pool_instance(inst_name)) continue;
-      if (elastic_occupied_instances_.count(inst_name)) continue;
-      if (!has_valid_xtensor_info(inst_name)) continue;
+      if (is_steady_pool_instance(inst_name)) {
+        continue;
+      }
+      if (elastic_occupied_instances_.count(inst_name)) {
+        continue;
+      }
+      if (!has_valid_xtensor_info(inst_name)) {
+        continue;
+      }
 
       // Check that no model is loaded on this instance
       bool is_idle = true;
@@ -1800,7 +1814,6 @@ std::string InstanceMgr::find_or_create_steady_bin(
   }
 
   // Phase 3: No idle instance — reclaim from elastic pool (BLOCKING)
-  LOG(INFO) << "No idle instance for steady pool, reclaiming from elastic pool";
   pending_steady_gpus_ += kTensorParallelSize;
 
   // Release allocation_mutex_ since dynamic_part_auto_scaling also acquires it
@@ -1844,7 +1857,6 @@ std::string InstanceMgr::find_or_create_steady_bin(
     }
   }
 
-  LOG(ERROR) << "Failed to reclaim instance for steady pool model " << model_id;
   return "";
 }
 
