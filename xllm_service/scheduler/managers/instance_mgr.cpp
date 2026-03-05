@@ -101,6 +101,10 @@ void InstanceMgr::init() {
         request_metrics_.insert_or_assign(pair.first, RequestMetrics());
       }
     }
+    // Sync total_available_gpus_ with instances loaded from etcd, so that
+    // subsequent deletes (which call fetch_sub) don't drive the counter negative.
+    total_available_gpus_.store(
+        static_cast<int32_t>(instances_.size()) * kTensorParallelSize);
     LOG(INFO) << "Load instance info from etcd:" << instances_.size();
     std::vector<std::string> channel_creat_fail_insts;
     for (auto& ist : instances_) {
@@ -1221,6 +1225,9 @@ void InstanceMgr::init_model_resource_coefficients() {
   model_resource_models_["Qwen3-8B"] = std::make_unique<LinearResourceModel>(
       /*hbm_a=*/0.001, /*hbm_b=*/20.0,
       /*compute_a=*/0.0005, /*compute_b=*/0.0);
+  model_resource_models_["Qwen2-7B"] = std::make_unique<LinearResourceModel>(
+      /*hbm_a=*/0.001, /*hbm_b=*/20.0,
+      /*compute_a=*/0.0005, /*compute_b=*/0.0);
 
   LOG(INFO) << "Initialized model resource models for "
             << model_resource_models_.size() << " models, "
@@ -1905,9 +1912,6 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
     return false;  // still fits in steady pool
   }
 
-  // Upgrade to elastic
-  pool_it->second = PoolType::ELASTIC;
-
   // Find the steady instance hosting this model
   std::string steady_instance;
   for (const auto& bin : steady_bins_) {
@@ -1916,6 +1920,18 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
       break;
     }
   }
+
+  // Don't upgrade while the model wakeup is still in progress (ALLOCATED state).
+  // The drain thread would fail (ALLOCATED→DRAINING is invalid), and
+  // dynamic_part_auto_scaling would see the in-progress allocation as already
+  // satisfying the budget, resulting in no new instances being woken.
+  if (!steady_instance.empty() &&
+      model_mgr->get_model_state(steady_instance) != ModelState::WAKEUP) {
+    return false;
+  }
+
+  // Upgrade to elastic
+  pool_it->second = PoolType::ELASTIC;
 
   remove_model_from_steady_bin(model_id);
 

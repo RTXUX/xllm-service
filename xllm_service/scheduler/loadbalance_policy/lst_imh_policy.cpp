@@ -21,6 +21,7 @@ limitations under the License.
 #include <algorithm>
 #include <limits>
 #include <queue>
+#include <random>
 #include <unordered_set>
 
 namespace xllm_service {
@@ -398,13 +399,13 @@ std::unordered_map<std::string, std::vector<SchedulingJob>>
 LstImhPolicy::run_lst_imh(std::vector<SchedulingJob>& jobs,
                            std::vector<MachineInfo>& machines) {
   // Sort machines by availability time ascending (earliest available first).
-  // Tie-break by instance name for deterministic ordering.
-  std::sort(machines.begin(), machines.end(),
-            [](const MachineInfo& a, const MachineInfo& b) {
-              if (a.availability_time_ms != b.availability_time_ms)
-                return a.availability_time_ms < b.availability_time_ms;
-              return a.instance_name < b.instance_name;
-            });
+  // Randomize tie-breaking to avoid always favoring the same instance.
+  static thread_local std::mt19937 rng(std::random_device{}());
+  std::shuffle(machines.begin(), machines.end(), rng);
+  std::stable_sort(machines.begin(), machines.end(),
+                   [](const MachineInfo& a, const MachineInfo& b) {
+                     return a.availability_time_ms < b.availability_time_ms;
+                   });
 
   std::unordered_map<std::string, std::vector<SchedulingJob>> assignment;
   std::vector<SchedulingJob> remaining = jobs;

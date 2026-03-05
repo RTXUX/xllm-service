@@ -179,9 +179,11 @@ void Scheduler::process_request_queue(const std::string& model_name) {
     }
 
     if (pool == PoolType::STEADY) {
-      // Route to steady pool instance
-      if (!instance_mgr_->route_to_steady_instance(request)) {
-        LOG(ERROR) << "Failed to route to steady instance for " << request->model;
+      // Pull-based dispatch: queue in LST-IMH coordinator (Moore-Hodgson with 1 instance)
+      if (!lb_policy_->select_instances_pair(request)) {
+        LOG(WARNING) << "LB policy failed to assign instance for steady request "
+                     << request->service_request_id
+                     << " model=" << request->model;
         continue;
       }
     } else {
