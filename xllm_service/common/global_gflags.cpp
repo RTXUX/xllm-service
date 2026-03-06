@@ -197,3 +197,48 @@ DEFINE_bool(sllm_enable_knapsack,
 DEFINE_int32(sllm_max_models_per_instance,
              4,
              "ServerlessLLM maximum number of models colocated on one instance.");
+
+// Llumnix baseline flags
+DEFINE_double(llumnix_schedule_interval_s,
+              1.0,
+              "Llumnix global scheduling interval in seconds.");
+
+DEFINE_double(llumnix_idle_threshold_s,
+              60.0,
+              "Llumnix idle model eviction threshold in seconds.");
+
+DEFINE_double(llumnix_migrate_out_load_threshold,
+              0.8,
+              "Llumnix load threshold above which an instance is a migration source.");
+
+DEFINE_int32(llumnix_topk_random_dispatch,
+             1,
+             "Llumnix top-K for random selection in load-based dispatch.");
+
+DEFINE_int32(llumnix_max_models_per_instance,
+             4,
+             "Llumnix maximum number of models colocated on one instance.");
+
+DEFINE_int32(llumnix_min_instances,
+             0,
+             "Llumnix minimum instances per model.");
+
+DEFINE_int32(llumnix_max_instances,
+             8,
+             "Llumnix maximum instances per model.");
+
+DEFINE_string(llumnix_dispatch_load_metric,
+              "kv_blocks_ratio",
+              "Llumnix dispatch load metric: kv_blocks_ratio or remaining_steps.");
+
+DEFINE_string(llumnix_migration_load_metric,
+              "kv_blocks_ratio",
+              "Llumnix migration load metric: kv_blocks_ratio or remaining_steps.");
+
+DEFINE_string(llumnix_dispatch_policy,
+              "load",
+              "Llumnix dispatch policy: load, balanced, queue, or rr.");
+
+DEFINE_string(llumnix_migration_policy,
+              "balanced",
+              "Llumnix migration policy: balanced or defrag.");

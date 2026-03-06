@@ -590,6 +590,21 @@ struct ServerlessLLMConfig {
   double dispatch_poll_interval_ms = 100.0;      // Dispatch polling interval
 };
 
+// Llumnix baseline configuration
+struct LlumnixConfig {
+  double schedule_interval_s = 1.0;              // Global scheduling interval
+  double model_idle_threshold_s = 60.0;          // Idle eviction threshold
+  double migrate_out_load_threshold = 0.8;       // Migration source threshold
+  int32_t topk_random_dispatch = 1;              // Top-K for random dispatch
+  int32_t max_models_per_instance = 4;           // Max colocated models per instance
+  int32_t min_instances_per_model = 0;           // Min instances per model
+  int32_t max_instances_per_model = 8;           // Max instances per model
+  std::string dispatch_load_metric = "kv_blocks_ratio";   // kv_blocks_ratio|remaining_steps
+  std::string migration_load_metric = "kv_blocks_ratio";  // kv_blocks_ratio|remaining_steps
+  std::string dispatch_policy = "load";          // load|balanced|queue|rr
+  std::string migration_policy = "balanced";     // balanced|defrag
+};
+
 }  // namespace xllm_service
 
 // Prism baseline configuration

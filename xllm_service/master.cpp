@@ -213,7 +213,18 @@ int main(int argc, char* argv[]) {
       .sllm_min_instances(FLAGS_sllm_min_instances)
       .sllm_max_instances(FLAGS_sllm_max_instances)
       .sllm_enable_knapsack(FLAGS_sllm_enable_knapsack)
-      .sllm_max_models_per_instance(FLAGS_sllm_max_models_per_instance);
+      .sllm_max_models_per_instance(FLAGS_sllm_max_models_per_instance)
+      .llumnix_schedule_interval_s(FLAGS_llumnix_schedule_interval_s)
+      .llumnix_idle_threshold_s(FLAGS_llumnix_idle_threshold_s)
+      .llumnix_migrate_out_load_threshold(FLAGS_llumnix_migrate_out_load_threshold)
+      .llumnix_topk_random_dispatch(FLAGS_llumnix_topk_random_dispatch)
+      .llumnix_max_models_per_instance(FLAGS_llumnix_max_models_per_instance)
+      .llumnix_min_instances(FLAGS_llumnix_min_instances)
+      .llumnix_max_instances(FLAGS_llumnix_max_instances)
+      .llumnix_dispatch_load_metric(FLAGS_llumnix_dispatch_load_metric)
+      .llumnix_migration_load_metric(FLAGS_llumnix_migration_load_metric)
+      .llumnix_dispatch_policy(FLAGS_llumnix_dispatch_policy)
+      .llumnix_migration_policy(FLAGS_llumnix_migration_policy);
 
   xllm_service::Master master(options);
 

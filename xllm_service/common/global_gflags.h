@@ -95,3 +95,16 @@ DECLARE_int32(sllm_min_instances);
 DECLARE_int32(sllm_max_instances);
 DECLARE_bool(sllm_enable_knapsack);
 DECLARE_int32(sllm_max_models_per_instance);
+
+// Llumnix baseline flags
+DECLARE_double(llumnix_schedule_interval_s);
+DECLARE_double(llumnix_idle_threshold_s);
+DECLARE_double(llumnix_migrate_out_load_threshold);
+DECLARE_int32(llumnix_topk_random_dispatch);
+DECLARE_int32(llumnix_max_models_per_instance);
+DECLARE_int32(llumnix_min_instances);
+DECLARE_int32(llumnix_max_instances);
+DECLARE_string(llumnix_dispatch_load_metric);
+DECLARE_string(llumnix_migration_load_metric);
+DECLARE_string(llumnix_dispatch_policy);
+DECLARE_string(llumnix_migration_policy);

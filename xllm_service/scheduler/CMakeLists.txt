@@ -5,6 +5,7 @@ add_subdirectory(managers)
 add_subdirectory(loadbalance_policy)
 add_subdirectory(prism)
 add_subdirectory(serverless_llm)
+add_subdirectory(llumnix)
 add_subdirectory(resource_model)
 
 cc_library(
@@ -24,6 +25,7 @@ cc_library(
     :managers
     :prism
     :serverless_llm
+    :llumnix
     :request
     cpprest
     etcd-cpp-api

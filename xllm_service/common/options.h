@@ -98,6 +98,19 @@ class Options {
   PROPERTY(int32_t, sllm_max_instances) = 8;
   PROPERTY(bool, sllm_enable_knapsack) = true;
   PROPERTY(int32_t, sllm_max_models_per_instance) = 4;
+
+  // Llumnix baseline options
+  PROPERTY(double, llumnix_schedule_interval_s) = 1.0;
+  PROPERTY(double, llumnix_idle_threshold_s) = 60.0;
+  PROPERTY(double, llumnix_migrate_out_load_threshold) = 0.8;
+  PROPERTY(int32_t, llumnix_topk_random_dispatch) = 1;
+  PROPERTY(int32_t, llumnix_max_models_per_instance) = 4;
+  PROPERTY(int32_t, llumnix_min_instances) = 0;
+  PROPERTY(int32_t, llumnix_max_instances) = 8;
+  PROPERTY(std::string, llumnix_dispatch_load_metric) = "kv_blocks_ratio";
+  PROPERTY(std::string, llumnix_migration_load_metric) = "kv_blocks_ratio";
+  PROPERTY(std::string, llumnix_dispatch_policy) = "load";
+  PROPERTY(std::string, llumnix_migration_policy) = "balanced";
 };
 
 }  // namespace xllm_service

@@ -399,6 +399,14 @@ bool InstanceMgr::send_http_request(std::shared_ptr<brpc::Channel> channel,
   return true;
 }
 
+std::optional<LoadMetrics> InstanceMgr::get_instance_load_metrics(
+    const std::string& instance_name) {
+  std::shared_lock<std::shared_mutex> lock(load_metric_mutex_);
+  auto it = load_metrics_.find(instance_name);
+  if (it == load_metrics_.end()) return std::nullopt;
+  return it->second;
+}
+
 void InstanceMgr::get_load_metrics(LoadBalanceInfos* infos) {
   std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_);
   std::shared_lock<std::shared_mutex> metric_lock(load_metric_mutex_);

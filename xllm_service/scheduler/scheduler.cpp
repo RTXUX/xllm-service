@@ -23,6 +23,7 @@ limitations under the License.
 #include "scheduler/prism/prism_instance_mgr.h"
 #include "scheduler/prism/prism_request_tracker.h"
 #include "scheduler/serverless_llm/serverless_llm_instance_mgr.h"
+#include "scheduler/llumnix/llumnix_instance_mgr.h"
 #include "tokenizer/tokenizer_factory.h"
 
 #include <absl/time/clock.h>
@@ -51,6 +52,7 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
 
   prism_mode_ = (options.baseline_type() == "PRISM");
   serverless_llm_mode_ = (options.baseline_type() == "SERVERLESS_LLM");
+  llumnix_mode_ = (options.baseline_type() == "LLUMNIX");
 
   if (prism_mode_) {
     PrismConfig prism_config;
@@ -86,6 +88,26 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
     instance_mgr_ = sllm_mgr;  // polymorphic assignment
 
     LOG(INFO) << "Scheduler: ServerlessLLM mode enabled";
+  } else if (llumnix_mode_) {
+    LlumnixConfig llumnix_config;
+    llumnix_config.schedule_interval_s = options.llumnix_schedule_interval_s();
+    llumnix_config.model_idle_threshold_s = options.llumnix_idle_threshold_s();
+    llumnix_config.migrate_out_load_threshold = options.llumnix_migrate_out_load_threshold();
+    llumnix_config.topk_random_dispatch = options.llumnix_topk_random_dispatch();
+    llumnix_config.max_models_per_instance = options.llumnix_max_models_per_instance();
+    llumnix_config.min_instances_per_model = options.llumnix_min_instances();
+    llumnix_config.max_instances_per_model = options.llumnix_max_instances();
+    llumnix_config.dispatch_load_metric = options.llumnix_dispatch_load_metric();
+    llumnix_config.migration_load_metric = options.llumnix_migration_load_metric();
+    llumnix_config.dispatch_policy = options.llumnix_dispatch_policy();
+    llumnix_config.migration_policy = options.llumnix_migration_policy();
+
+    auto llumnix_mgr = std::make_shared<LlumnixInstanceMgr>(
+        options, etcd_client_, is_master_service_, llumnix_config);
+    llumnix_mgr->start_global_scheduler();
+    instance_mgr_ = llumnix_mgr;  // polymorphic assignment
+
+    LOG(INFO) << "Scheduler: Llumnix mode enabled";
   } else {
     instance_mgr_ =
         std::make_shared<InstanceMgr>(options, etcd_client_, is_master_service_);
@@ -213,6 +235,12 @@ void Scheduler::process_request_queue(const std::string& model_name) {
     // ServerlessLLM mode: bypass dual-pool, use ServerlessLLMInstanceMgr dispatch
     if (serverless_llm_mode_) {
       process_serverless_llm_request(request);
+      continue;
+    }
+
+    // Llumnix mode: bypass dual-pool, use LlumnixInstanceMgr dispatch
+    if (llumnix_mode_) {
+      process_llumnix_request(request);
       continue;
     }
 
@@ -363,6 +391,47 @@ void Scheduler::process_serverless_llm_request(
                            request->routing.prefill_name);
 
   DLOG(INFO) << "ServerlessLLM: dispatched " << request->service_request_id
+             << " to " << request->routing.prefill_name;
+
+  // 4. Update request metrics
+  if (request->prompt.size() != 0 && !request->metrics_already_updated) {
+    instance_mgr_->update_request_metrics(request, RequestAction::SCHEDULE);
+  }
+
+  if (request->dispatch_callback) {
+    std::thread([request]() { request->dispatch_callback(); }).detach();
+  }
+}
+
+void Scheduler::process_llumnix_request(std::shared_ptr<Request> request) {
+  auto llumnix_mgr =
+      std::static_pointer_cast<LlumnixInstanceMgr>(instance_mgr_);
+
+  // 1. Register request in Llumnix tracker
+  llumnix_mgr->enqueue_request(request->model, request->service_request_id);
+
+  // 2. Wait for an available instance (global scheduler will activate models)
+  bool dispatched = false;
+  for (int retry = 0; retry < 300 && !exited_; ++retry) {
+    if (llumnix_mgr->dispatch_request(request)) {
+      dispatched = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  if (!dispatched) {
+    LOG(ERROR) << "Llumnix: timeout waiting for model " << request->model
+               << " request_id=" << request->service_request_id;
+    llumnix_mgr->finish_request(request->service_request_id);
+    return;
+  }
+
+  // 3. Mark as running
+  llumnix_mgr->start_running(request->service_request_id,
+                              request->routing.prefill_name);
+
+  DLOG(INFO) << "Llumnix: dispatched " << request->service_request_id
              << " to " << request->routing.prefill_name;
 
   // 4. Update request metrics
@@ -578,6 +647,13 @@ void Scheduler::finish_request(const std::string& service_request_id,
     auto sllm_mgr =
         std::static_pointer_cast<ServerlessLLMInstanceMgr>(instance_mgr_);
     sllm_mgr->finish_request(service_request_id);
+  }
+
+  // Notify Llumnix tracker of request completion
+  if (llumnix_mode_) {
+    auto llumnix_mgr =
+        std::static_pointer_cast<LlumnixInstanceMgr>(instance_mgr_);
+    llumnix_mgr->finish_request(service_request_id);
   }
 
   {

@@ -237,6 +237,9 @@ class InstanceMgr {
                          const std::string& uri,
                          const std::string& request_body);
 
+  // Get LoadMetrics for a specific instance (thread-safe read)
+  std::optional<LoadMetrics> get_instance_load_metrics(const std::string& instance_name);
+
  private:
   DISALLOW_COPY_AND_ASSIGN(InstanceMgr);
 

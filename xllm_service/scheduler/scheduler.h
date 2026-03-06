@@ -27,6 +27,7 @@ limitations under the License.
 #include "managers/instance_mgr.h"
 #include "prism/prism_instance_mgr.h"
 #include "serverless_llm/serverless_llm_instance_mgr.h"
+#include "llumnix/llumnix_instance_mgr.h"
 #include "request/request.h"
 #include "response_handler.h"
 #include "tokenizer/tokenizer.h"
@@ -91,6 +92,9 @@ class Scheduler final {
   // ServerlessLLM mode: process request through ServerlessLLMInstanceMgr
   void process_serverless_llm_request(std::shared_ptr<Request> request);
 
+  // Llumnix mode: process request through LlumnixInstanceMgr
+  void process_llumnix_request(std::shared_ptr<Request> request);
+
   Tokenizer* get_tls_tokenizer();
 
  private:
@@ -105,6 +109,9 @@ class Scheduler final {
 
   // ServerlessLLM mode flag
   bool serverless_llm_mode_ = false;
+
+  // Llumnix mode flag
+  bool llumnix_mode_ = false;
 
   TokenizerArgs tokenizer_args_;
 
