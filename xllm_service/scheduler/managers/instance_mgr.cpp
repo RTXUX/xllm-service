@@ -1354,7 +1354,41 @@ void InstanceMgr::dynamic_part_auto_scaling() {
           : 0;
       sum += t.gpu_allocated;
     }
-    // Trim overshoot from lowest-heat models
+    // Distribute remainder GPUs using Largest Remainder Method
+    // (Hamilton apportionment) to avoid wasting budget.
+    int32_t remainder = budget - sum;
+    if (remainder > 0) {
+      struct RemainderCandidate {
+        size_t index;
+        double fractional;
+        int64_t heat;
+      };
+      std::vector<RemainderCandidate> candidates;
+      for (size_t i = 0; i < targets.size(); ++i) {
+        if (targets[i].gpu_target == 0) continue;
+        double raw = targets[i].gpu_target * ratio;
+        int32_t floored = static_cast<int32_t>(std::floor(raw));
+        // Skip models bumped by max(1, ...) guarantee — their fractional
+        // part is artificial and should not compete for remainder GPUs.
+        if (floored < 1 && targets[i].gpu_allocated == 1) continue;
+        double frac = raw - targets[i].gpu_allocated;
+        candidates.push_back({i, frac, targets[i].heat});
+      }
+      // Sort: largest fractional first; tiebreak by lower heat (colder first)
+      std::sort(candidates.begin(), candidates.end(),
+                [](const RemainderCandidate& a, const RemainderCandidate& b) {
+                  if (a.fractional != b.fractional)
+                    return a.fractional > b.fractional;
+                  return a.heat < b.heat;
+                });
+      for (int32_t r = 0;
+           r < remainder && r < static_cast<int32_t>(candidates.size()); ++r) {
+        targets[candidates[r].index].gpu_allocated++;
+        sum++;
+      }
+    }
+
+    // Trim overshoot from lowest-heat models (safety net)
     std::sort(targets.begin(), targets.end(),
               [](const ScalingTarget& a, const ScalingTarget& b) {
                 return a.heat < b.heat;
