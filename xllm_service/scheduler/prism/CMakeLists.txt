@@ -1,0 +1,20 @@
+include(cc_library)
+
+cc_library(
+  NAME
+    prism
+  HDRS
+    prism_instance_mgr.h
+    prism_request_tracker.h
+    prism_trackers.h
+  SRCS
+    prism_instance_mgr.cpp
+    prism_request_tracker.cpp
+    prism_trackers.cpp
+  DEPS
+    :common
+    :managers
+    :request
+    glog::glog
+    nlohmann_json::nlohmann_json
+)

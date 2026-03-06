@@ -3,6 +3,7 @@ include(cc_library)
 add_subdirectory(etcd_client)
 add_subdirectory(managers)
 add_subdirectory(loadbalance_policy)
+add_subdirectory(prism)
 add_subdirectory(resource_model)
 
 cc_library(
@@ -20,6 +21,7 @@ cc_library(
     :etcd_client
     :loadbalance_policy
     :managers
+    :prism
     :request
     cpprest
     etcd-cpp-api

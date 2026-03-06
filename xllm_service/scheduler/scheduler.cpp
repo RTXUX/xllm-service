@@ -20,6 +20,8 @@ limitations under the License.
 #include "loadbalance_policy/lst_imh_policy.h"
 #include "loadbalance_policy/round_robin.h"
 #include "loadbalance_policy/slo_aware_policy.h"
+#include "scheduler/prism/prism_instance_mgr.h"
+#include "scheduler/prism/prism_request_tracker.h"
 #include "tokenizer/tokenizer_factory.h"
 
 #include <absl/time/clock.h>
@@ -46,8 +48,26 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
     LOG(INFO) << "Set current service as master!";
   }
 
-  instance_mgr_ =
-      std::make_unique<InstanceMgr>(options, etcd_client_, is_master_service_);
+  prism_mode_ = (options.baseline_type() == "PRISM");
+
+  if (prism_mode_) {
+    PrismConfig prism_config;
+    prism_config.schedule_interval_s = options.prism_schedule_interval_s();
+    prism_config.memory_pool_budget_gb = options.prism_memory_pool_budget_gb();
+    prism_config.model_idle_threshold_s = options.prism_idle_threshold_s();
+    prism_config.migrate_policy = options.prism_migrate_policy();
+    prism_config.max_models_per_instance = options.prism_max_models_per_instance();
+
+    auto prism_mgr = std::make_shared<PrismInstanceMgr>(
+        options, etcd_client_, is_master_service_, prism_config);
+    prism_mgr->start_global_scheduler();
+    instance_mgr_ = prism_mgr;  // polymorphic assignment
+
+    LOG(INFO) << "Scheduler: Prism mode enabled";
+  } else {
+    instance_mgr_ =
+        std::make_shared<InstanceMgr>(options, etcd_client_, is_master_service_);
+  }
 
   global_kvcache_mgr_ = std::make_shared<GlobalKVCacheMgr>(
       options, etcd_client_, is_master_service_);
@@ -162,6 +182,12 @@ void Scheduler::process_request_queue(const std::string& model_name) {
       continue;
     }
 
+    // Prism mode: bypass dual-pool, use PrismInstanceMgr dispatch
+    if (prism_mode_) {
+      process_prism_request(request);
+      continue;
+    }
+
     // Dual-pool routing
     PoolType pool = instance_mgr_->get_model_pool(request->model);
 
@@ -231,6 +257,52 @@ void Scheduler::process_request_queue(const std::string& model_name) {
 std::shared_ptr<brpc::Channel> Scheduler::get_channel(
     const std::string& target_name) {
   return instance_mgr_->get_channel(target_name);
+}
+
+void Scheduler::process_prism_request(std::shared_ptr<Request> request) {
+  auto prism_mgr = std::static_pointer_cast<PrismInstanceMgr>(instance_mgr_);
+
+  // 1. Register request in Prism tracker
+  auto prism_req = std::make_shared<PrismReq>();
+  prism_req->rid = request->service_request_id;
+  prism_req->model = request->model;
+  prism_req->arrival_time = PrismRequestTracker::now_seconds();
+  prism_req->slo = 30.0;  // Default TTFT SLO in seconds
+  prism_req->prompt_len = static_cast<int32_t>(request->token_ids.size());
+  prism_req->state = PrismReqState::WAITING;
+  prism_mgr->enqueue_prism_request(request->model, prism_req);
+
+  // 2. Wait for an available instance (global scheduler will activate models)
+  bool dispatched = false;
+  for (int retry = 0; retry < 300 && !exited_; ++retry) {
+    if (prism_mgr->dispatch_prism_request(request)) {
+      dispatched = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  if (!dispatched) {
+    LOG(ERROR) << "Prism: timeout waiting for model " << request->model
+               << " request_id=" << request->service_request_id;
+    prism_mgr->finish_prism_request(prism_req->rid);
+    return;
+  }
+
+  // 3. Mark as running
+  prism_mgr->start_prism_running(prism_req->rid, request->routing.prefill_name);
+
+  DLOG(INFO) << "Prism: dispatched " << request->service_request_id
+             << " to " << request->routing.prefill_name;
+
+  // 4. Update request metrics
+  if (request->prompt.size() != 0 && !request->metrics_already_updated) {
+    instance_mgr_->update_request_metrics(request, RequestAction::SCHEDULE);
+  }
+
+  if (request->dispatch_callback) {
+    std::thread([request]() { request->dispatch_callback(); }).detach();
+  }
 }
 
 void Scheduler::update_master_service_heartbeat() {
@@ -423,6 +495,12 @@ void Scheduler::finish_request(const std::string& service_request_id,
 
       requests_.erase(it);
     }
+  }
+
+  // Notify Prism tracker of request completion
+  if (prism_mode_) {
+    auto prism_mgr = std::static_pointer_cast<PrismInstanceMgr>(instance_mgr_);
+    prism_mgr->finish_prism_request(service_request_id);
   }
 
   {

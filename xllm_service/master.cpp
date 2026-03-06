@@ -196,7 +196,13 @@ int main(int argc, char* argv[]) {
       .block_size(FLAGS_block_size)
       .tokenizer_path(FLAGS_tokenizer_path)
       .default_ttft_slo_ms(FLAGS_default_ttft_slo_ms)
-      .lst_imh_pre_pull_ms(FLAGS_lst_imh_pre_pull_ms);
+      .lst_imh_pre_pull_ms(FLAGS_lst_imh_pre_pull_ms)
+      .baseline_type(FLAGS_baseline_type)
+      .prism_schedule_interval_s(FLAGS_prism_schedule_interval_s)
+      .prism_memory_pool_budget_gb(FLAGS_prism_memory_pool_budget_gb)
+      .prism_idle_threshold_s(FLAGS_prism_idle_threshold_s)
+      .prism_migrate_policy(FLAGS_prism_migrate_policy)
+      .prism_max_models_per_instance(FLAGS_prism_max_models_per_instance);
 
   xllm_service::Master master(options);
 

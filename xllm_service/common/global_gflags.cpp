@@ -126,3 +126,29 @@ DEFINE_double(gpu_hbm_per_gpu_gb,
 DEFINE_double(gpu_compute_sm_per_gpu,
               1.0,
               "Compute SM units per GPU, used for auto-scaling resource model.");
+
+// Prism baseline flags
+DEFINE_string(baseline_type,
+              "",
+              "Baseline scheduling type. Empty = default dual-pool, "
+              "\"PRISM\" = Prism multi-model scheduling.");
+
+DEFINE_double(prism_schedule_interval_s,
+              5.0,
+              "Prism global scheduling interval in seconds.");
+
+DEFINE_double(prism_memory_pool_budget_gb,
+              6.0,
+              "Prism KV cache memory pool budget per model in GB.");
+
+DEFINE_double(prism_idle_threshold_s,
+              50.0,
+              "Prism idle model eviction threshold in seconds.");
+
+DEFINE_string(prism_migrate_policy,
+              "memory_per_request",
+              "Prism migration policy: \"memory_per_request\" or \"violation\".");
+
+DEFINE_int32(prism_max_models_per_instance,
+             4,
+             "Prism maximum number of models colocated on one instance.");

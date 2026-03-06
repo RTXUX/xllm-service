@@ -25,6 +25,7 @@ limitations under the License.
 #include "loadbalance_policy/loadbalance_policy.h"
 #include "managers/global_kvcache_mgr.h"
 #include "managers/instance_mgr.h"
+#include "prism/prism_instance_mgr.h"
 #include "request/request.h"
 #include "response_handler.h"
 #include "tokenizer/tokenizer.h"
@@ -83,6 +84,9 @@ class Scheduler final {
 
   void process_request_queue(const std::string& model_name);
 
+  // Prism mode: process request through PrismInstanceMgr
+  void process_prism_request(std::shared_ptr<Request> request);
+
   Tokenizer* get_tls_tokenizer();
 
  private:
@@ -91,6 +95,9 @@ class Scheduler final {
   bool exited_ = false;
 
   bool is_master_service_ = false;
+
+  // Prism mode flag
+  bool prism_mode_ = false;
 
   TokenizerArgs tokenizer_args_;
 

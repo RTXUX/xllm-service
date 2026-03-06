@@ -40,7 +40,7 @@ limitations under the License.
 
 namespace xllm_service {
 
-class InstanceMgr final {
+class InstanceMgr {
  public:
 
   const std::vector<std::pair<std::string, std::string>> MODELS = {
@@ -226,8 +226,7 @@ class InstanceMgr final {
   // Get number of GPUs reserved by the steady pool
   int32_t steady_needed_gpus();
 
- private:
-
+ protected:
   // send_http_request(instance_name, ...) uses inst_mutex to get_channel()
   // send_http_request(channel, ...) does not use inst_mutex
   bool send_http_request(const std::string& instance_name,

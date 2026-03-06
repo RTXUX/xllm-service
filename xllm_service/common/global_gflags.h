@@ -74,3 +74,11 @@ DECLARE_bool(enable_prefill_only_mode);
 DECLARE_double(gpu_hbm_per_gpu_gb);
 
 DECLARE_double(gpu_compute_sm_per_gpu);
+
+// Prism baseline flags
+DECLARE_string(baseline_type);
+DECLARE_double(prism_schedule_interval_s);
+DECLARE_double(prism_memory_pool_budget_gb);
+DECLARE_double(prism_idle_threshold_s);
+DECLARE_string(prism_migrate_policy);
+DECLARE_int32(prism_max_models_per_instance);

@@ -77,6 +77,14 @@ class Options {
 
   // LST-IMH pre-pull threshold in milliseconds
   PROPERTY(int32_t, lst_imh_pre_pull_ms) = 0;
+
+  // Prism baseline options
+  PROPERTY(std::string, baseline_type);  // "" = default, "PRISM" = Prism mode
+  PROPERTY(double, prism_schedule_interval_s) = 5.0;
+  PROPERTY(double, prism_memory_pool_budget_gb) = 6.0;
+  PROPERTY(double, prism_idle_threshold_s) = 50.0;
+  PROPERTY(std::string, prism_migrate_policy) = "memory_per_request";
+  PROPERTY(int32_t, prism_max_models_per_instance) = 4;
 };
 
 }  // namespace xllm_service

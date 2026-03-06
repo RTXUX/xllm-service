@@ -574,3 +574,20 @@ struct JsonTool {
 };
 
 }  // namespace xllm_service
+
+// Prism baseline configuration
+namespace xllm_service {
+
+struct PrismConfig {
+  double schedule_interval_s = 5.0;              // Global scheduling interval
+  double memory_pool_budget_gb = 6.0;            // KV cache budget per model
+  double model_idle_threshold_s = 50.0;          // Idle eviction threshold
+  double violation_proportion_threshold = 0.1;   // SLO violation diff threshold (10%)
+  double memory_per_request_ratio_threshold = 15.0; // Memory ratio threshold
+  double gpu_cluster_threshold_gb = 5.0;         // GPU clustering threshold
+  std::string migrate_policy = "memory_per_request"; // or "violation"
+  double model_transfer_speed_gbps = 6.0;        // Model weight transfer speed
+  int32_t max_models_per_instance = 4;           // Max colocated models per instance
+};
+
+}  // namespace xllm_service
