@@ -22,6 +22,7 @@ limitations under the License.
 #include "loadbalance_policy/slo_aware_policy.h"
 #include "scheduler/prism/prism_instance_mgr.h"
 #include "scheduler/prism/prism_request_tracker.h"
+#include "scheduler/serverless_llm/serverless_llm_instance_mgr.h"
 #include "tokenizer/tokenizer_factory.h"
 
 #include <absl/time/clock.h>
@@ -49,6 +50,7 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
   }
 
   prism_mode_ = (options.baseline_type() == "PRISM");
+  serverless_llm_mode_ = (options.baseline_type() == "SERVERLESS_LLM");
 
   if (prism_mode_) {
     PrismConfig prism_config;
@@ -64,6 +66,26 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
     instance_mgr_ = prism_mgr;  // polymorphic assignment
 
     LOG(INFO) << "Scheduler: Prism mode enabled";
+  } else if (serverless_llm_mode_) {
+    ServerlessLLMConfig sllm_config;
+    sllm_config.schedule_interval_s = options.sllm_schedule_interval_s();
+    sllm_config.model_idle_threshold_s = options.sllm_idle_threshold_s();
+    sllm_config.d2d_speed_gbps = options.sllm_d2d_speed_gbps();
+    sllm_config.h2d_speed_gbps = options.sllm_h2d_speed_gbps();
+    sllm_config.drain_alpha = options.sllm_drain_alpha();
+    sllm_config.drain_beta = options.sllm_drain_beta();
+    sllm_config.target_ongoing_requests = options.sllm_target_ongoing_requests();
+    sllm_config.min_instances_per_model = options.sllm_min_instances();
+    sllm_config.max_instances_per_model = options.sllm_max_instances();
+    sllm_config.enable_knapsack_migration = options.sllm_enable_knapsack();
+    sllm_config.max_models_per_instance = options.sllm_max_models_per_instance();
+
+    auto sllm_mgr = std::make_shared<ServerlessLLMInstanceMgr>(
+        options, etcd_client_, is_master_service_, sllm_config);
+    sllm_mgr->start_global_scheduler();
+    instance_mgr_ = sllm_mgr;  // polymorphic assignment
+
+    LOG(INFO) << "Scheduler: ServerlessLLM mode enabled";
   } else {
     instance_mgr_ =
         std::make_shared<InstanceMgr>(options, etcd_client_, is_master_service_);
@@ -188,6 +210,12 @@ void Scheduler::process_request_queue(const std::string& model_name) {
       continue;
     }
 
+    // ServerlessLLM mode: bypass dual-pool, use ServerlessLLMInstanceMgr dispatch
+    if (serverless_llm_mode_) {
+      process_serverless_llm_request(request);
+      continue;
+    }
+
     // Dual-pool routing
     PoolType pool = instance_mgr_->get_model_pool(request->model);
 
@@ -293,6 +321,48 @@ void Scheduler::process_prism_request(std::shared_ptr<Request> request) {
   prism_mgr->start_prism_running(prism_req->rid, request->routing.prefill_name);
 
   DLOG(INFO) << "Prism: dispatched " << request->service_request_id
+             << " to " << request->routing.prefill_name;
+
+  // 4. Update request metrics
+  if (request->prompt.size() != 0 && !request->metrics_already_updated) {
+    instance_mgr_->update_request_metrics(request, RequestAction::SCHEDULE);
+  }
+
+  if (request->dispatch_callback) {
+    std::thread([request]() { request->dispatch_callback(); }).detach();
+  }
+}
+
+void Scheduler::process_serverless_llm_request(
+    std::shared_ptr<Request> request) {
+  auto sllm_mgr =
+      std::static_pointer_cast<ServerlessLLMInstanceMgr>(instance_mgr_);
+
+  // 1. Register request in ServerlessLLM tracker
+  sllm_mgr->enqueue_request(request->model, request->service_request_id);
+
+  // 2. Wait for an available instance (global scheduler will activate models)
+  bool dispatched = false;
+  for (int retry = 0; retry < 300 && !exited_; ++retry) {
+    if (sllm_mgr->dispatch_request(request)) {
+      dispatched = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  if (!dispatched) {
+    LOG(ERROR) << "ServerlessLLM: timeout waiting for model " << request->model
+               << " request_id=" << request->service_request_id;
+    sllm_mgr->finish_request(request->service_request_id);
+    return;
+  }
+
+  // 3. Mark as running
+  sllm_mgr->start_running(request->service_request_id,
+                           request->routing.prefill_name);
+
+  DLOG(INFO) << "ServerlessLLM: dispatched " << request->service_request_id
              << " to " << request->routing.prefill_name;
 
   // 4. Update request metrics
@@ -501,6 +571,13 @@ void Scheduler::finish_request(const std::string& service_request_id,
   if (prism_mode_) {
     auto prism_mgr = std::static_pointer_cast<PrismInstanceMgr>(instance_mgr_);
     prism_mgr->finish_prism_request(service_request_id);
+  }
+
+  // Notify ServerlessLLM tracker of request completion
+  if (serverless_llm_mode_) {
+    auto sllm_mgr =
+        std::static_pointer_cast<ServerlessLLMInstanceMgr>(instance_mgr_);
+    sllm_mgr->finish_request(service_request_id);
   }
 
   {

@@ -4,6 +4,7 @@ add_subdirectory(etcd_client)
 add_subdirectory(managers)
 add_subdirectory(loadbalance_policy)
 add_subdirectory(prism)
+add_subdirectory(serverless_llm)
 add_subdirectory(resource_model)
 
 cc_library(
@@ -22,6 +23,7 @@ cc_library(
     :loadbalance_policy
     :managers
     :prism
+    :serverless_llm
     :request
     cpprest
     etcd-cpp-api

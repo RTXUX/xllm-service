@@ -82,3 +82,16 @@ DECLARE_double(prism_memory_pool_budget_gb);
 DECLARE_double(prism_idle_threshold_s);
 DECLARE_string(prism_migrate_policy);
 DECLARE_int32(prism_max_models_per_instance);
+
+// ServerlessLLM baseline flags
+DECLARE_double(sllm_schedule_interval_s);
+DECLARE_double(sllm_idle_threshold_s);
+DECLARE_double(sllm_d2d_speed_gbps);
+DECLARE_double(sllm_h2d_speed_gbps);
+DECLARE_double(sllm_drain_alpha);
+DECLARE_double(sllm_drain_beta);
+DECLARE_int32(sllm_target_ongoing_requests);
+DECLARE_int32(sllm_min_instances);
+DECLARE_int32(sllm_max_instances);
+DECLARE_bool(sllm_enable_knapsack);
+DECLARE_int32(sllm_max_models_per_instance);

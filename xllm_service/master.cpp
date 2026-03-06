@@ -202,7 +202,18 @@ int main(int argc, char* argv[]) {
       .prism_memory_pool_budget_gb(FLAGS_prism_memory_pool_budget_gb)
       .prism_idle_threshold_s(FLAGS_prism_idle_threshold_s)
       .prism_migrate_policy(FLAGS_prism_migrate_policy)
-      .prism_max_models_per_instance(FLAGS_prism_max_models_per_instance);
+      .prism_max_models_per_instance(FLAGS_prism_max_models_per_instance)
+      .sllm_schedule_interval_s(FLAGS_sllm_schedule_interval_s)
+      .sllm_idle_threshold_s(FLAGS_sllm_idle_threshold_s)
+      .sllm_d2d_speed_gbps(FLAGS_sllm_d2d_speed_gbps)
+      .sllm_h2d_speed_gbps(FLAGS_sllm_h2d_speed_gbps)
+      .sllm_drain_alpha(FLAGS_sllm_drain_alpha)
+      .sllm_drain_beta(FLAGS_sllm_drain_beta)
+      .sllm_target_ongoing_requests(FLAGS_sllm_target_ongoing_requests)
+      .sllm_min_instances(FLAGS_sllm_min_instances)
+      .sllm_max_instances(FLAGS_sllm_max_instances)
+      .sllm_enable_knapsack(FLAGS_sllm_enable_knapsack)
+      .sllm_max_models_per_instance(FLAGS_sllm_max_models_per_instance);
 
   xllm_service::Master master(options);
 

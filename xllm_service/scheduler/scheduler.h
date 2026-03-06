@@ -26,6 +26,7 @@ limitations under the License.
 #include "managers/global_kvcache_mgr.h"
 #include "managers/instance_mgr.h"
 #include "prism/prism_instance_mgr.h"
+#include "serverless_llm/serverless_llm_instance_mgr.h"
 #include "request/request.h"
 #include "response_handler.h"
 #include "tokenizer/tokenizer.h"
@@ -87,6 +88,9 @@ class Scheduler final {
   // Prism mode: process request through PrismInstanceMgr
   void process_prism_request(std::shared_ptr<Request> request);
 
+  // ServerlessLLM mode: process request through ServerlessLLMInstanceMgr
+  void process_serverless_llm_request(std::shared_ptr<Request> request);
+
   Tokenizer* get_tls_tokenizer();
 
  private:
@@ -98,6 +102,9 @@ class Scheduler final {
 
   // Prism mode flag
   bool prism_mode_ = false;
+
+  // ServerlessLLM mode flag
+  bool serverless_llm_mode_ = false;
 
   TokenizerArgs tokenizer_args_;
 

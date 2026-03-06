@@ -85,6 +85,19 @@ class Options {
   PROPERTY(double, prism_idle_threshold_s) = 50.0;
   PROPERTY(std::string, prism_migrate_policy) = "memory_per_request";
   PROPERTY(int32_t, prism_max_models_per_instance) = 4;
+
+  // ServerlessLLM baseline options
+  PROPERTY(double, sllm_schedule_interval_s) = 1.0;
+  PROPERTY(double, sllm_idle_threshold_s) = 60.0;
+  PROPERTY(double, sllm_d2d_speed_gbps) = 25.0;
+  PROPERTY(double, sllm_h2d_speed_gbps) = 6.0;
+  PROPERTY(double, sllm_drain_alpha) = 0.001;
+  PROPERTY(double, sllm_drain_beta) = 0.5;
+  PROPERTY(int32_t, sllm_target_ongoing_requests) = 8;
+  PROPERTY(int32_t, sllm_min_instances) = 0;
+  PROPERTY(int32_t, sllm_max_instances) = 8;
+  PROPERTY(bool, sllm_enable_knapsack) = true;
+  PROPERTY(int32_t, sllm_max_models_per_instance) = 4;
 };
 
 }  // namespace xllm_service

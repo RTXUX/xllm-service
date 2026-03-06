@@ -152,3 +152,48 @@ DEFINE_string(prism_migrate_policy,
 DEFINE_int32(prism_max_models_per_instance,
              4,
              "Prism maximum number of models colocated on one instance.");
+
+// ServerlessLLM baseline flags
+DEFINE_double(sllm_schedule_interval_s,
+              1.0,
+              "ServerlessLLM global scheduling interval in seconds.");
+
+DEFINE_double(sllm_idle_threshold_s,
+              60.0,
+              "ServerlessLLM LRU idle model eviction threshold in seconds.");
+
+DEFINE_double(sllm_d2d_speed_gbps,
+              25.0,
+              "ServerlessLLM D2D transfer speed in GB/s (Tier 1).");
+
+DEFINE_double(sllm_h2d_speed_gbps,
+              6.0,
+              "ServerlessLLM H2D transfer speed in GB/s (Tier 2).");
+
+DEFINE_double(sllm_drain_alpha,
+              0.001,
+              "ServerlessLLM drain time linear coefficient (alpha * tokens).");
+
+DEFINE_double(sllm_drain_beta,
+              0.5,
+              "ServerlessLLM drain time constant (seconds).");
+
+DEFINE_int32(sllm_target_ongoing_requests,
+             8,
+             "ServerlessLLM target concurrent requests per instance for auto-scaling.");
+
+DEFINE_int32(sllm_min_instances,
+             0,
+             "ServerlessLLM minimum instances per model.");
+
+DEFINE_int32(sllm_max_instances,
+             8,
+             "ServerlessLLM maximum instances per model.");
+
+DEFINE_bool(sllm_enable_knapsack,
+            true,
+            "ServerlessLLM enable 0/1 knapsack DP eviction.");
+
+DEFINE_int32(sllm_max_models_per_instance,
+             4,
+             "ServerlessLLM maximum number of models colocated on one instance.");

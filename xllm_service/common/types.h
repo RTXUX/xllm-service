@@ -573,6 +573,23 @@ struct JsonTool {
       : type(tool_type), function(func) {}
 };
 
+// ServerlessLLM baseline configuration
+struct ServerlessLLMConfig {
+  double schedule_interval_s = 1.0;              // Global scheduling interval (faster than Prism)
+  double model_idle_threshold_s = 60.0;          // LRU idle eviction threshold
+  double d2d_speed_gbps = 25.0;                  // D2D transfer speed (Tier 1)
+  double h2d_speed_gbps = 6.0;                   // H2D transfer speed (Tier 2)
+  double drain_alpha = 0.001;                    // Drain time: alpha * running_tokens + beta
+  double drain_beta = 0.5;                       // Drain time constant
+  int32_t target_ongoing_requests = 8;           // Target concurrent requests per instance
+  int32_t min_instances_per_model = 0;           // Minimum instances per model
+  int32_t max_instances_per_model = 8;           // Maximum instances per model
+  bool enable_knapsack_migration = true;         // Enable 0/1 knapsack DP eviction
+  int32_t max_models_per_instance = 4;           // Max colocated models per instance
+  double dispatch_timeout_s = 30.0;              // Request dispatch timeout
+  double dispatch_poll_interval_ms = 100.0;      // Dispatch polling interval
+};
+
 }  // namespace xllm_service
 
 // Prism baseline configuration
