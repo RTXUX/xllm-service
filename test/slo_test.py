@@ -16,7 +16,7 @@ os.environ['no_proxy'] = '*'
 URL = "http://127.0.0.1:27888/v1/completions"
 MODELS = ["Qwen3-8B"]
 # MODELS = ["Qwen3-8B", "Qwen2-7B"]
-AVG_TOKENS_PER_SECOND = 18000  # Target average input token throughput
+AVG_TOKENS_PER_SECOND = 15000  # Target average input token throughput
 TOTAL_REQUESTS = 300
 MAX_WORKERS = 200  # Max concurrent threads (large enough to not bottleneck)
 

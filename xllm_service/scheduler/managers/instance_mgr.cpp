@@ -1416,7 +1416,126 @@ void InstanceMgr::dynamic_part_auto_scaling() {
               << " budget=" << budget;
   }
 
-  // 3. Scale UP — synchronous wakeup
+  // 3. Overlapped scale-up/scale-down
+  //
+  // Phase A: Build scale-down candidates and scale-up needs (round-robin)
+  struct ScaleUpNeed {
+    size_t target_idx;
+    std::string model_id;
+    uint64_t model_size;
+    bool matched = false;
+  };
+  struct ScaleDownCandidate {
+    std::string instance_name;
+    size_t target_idx;
+    std::string model_id;
+    bool matched = false;
+  };
+
+  std::vector<ScaleDownCandidate> scale_down_candidates;
+  for (size_t i = 0; i < targets.size(); ++i) {
+    int32_t current_wakeup = targets[i].mgr->get_wakeup_count();
+    int32_t excess = current_wakeup - targets[i].gpu_allocated;
+    if (excess <= 0) continue;
+    auto unlocked = targets[i].mgr->get_unlocked_instances();
+    for (int32_t j = 0; j < excess &&
+         j < static_cast<int32_t>(unlocked.size()); ++j) {
+      scale_down_candidates.push_back(
+          {unlocked[j], i, targets[i].model_id, false});
+    }
+  }
+
+  // Build scale-up needs in round-robin order for fairness
+  // E.g., A needs +5, B needs +4, C needs +3 → A,B,C,A,B,C,A,B,C,A,B,A
+  struct ModelDeficit {
+    size_t target_idx;
+    int32_t remaining;
+    std::string model_id;
+    uint64_t model_size;
+  };
+  std::vector<ModelDeficit> model_deficits;
+  for (size_t i = 0; i < targets.size(); ++i) {
+    int32_t current_alloc = targets[i].mgr->get_allocation_count();
+    int32_t deficit = targets[i].gpu_allocated - current_alloc;
+    if (deficit > 0) {
+      model_deficits.push_back({i, deficit, targets[i].model_id,
+                                get_model_size_bytes(targets[i].model_id)});
+    }
+  }
+  std::vector<ScaleUpNeed> scale_up_needs;
+  while (!model_deficits.empty()) {
+    for (auto it = model_deficits.begin(); it != model_deficits.end(); ) {
+      scale_up_needs.push_back(
+          {it->target_idx, it->model_id, it->model_size, false});
+      if (--it->remaining <= 0) {
+        it = model_deficits.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  // Phase B: Greedy matching — pair scale-up needs with scale-down candidates
+  // Best fit: smallest free_bytes >= model_size (can hold both models at once)
+  struct OverlapMatch {
+    size_t up_idx;
+    size_t down_idx;
+  };
+  std::vector<OverlapMatch> overlapped_matches;
+
+  for (size_t u = 0; u < scale_up_needs.size(); ++u) {
+    auto& up = scale_up_needs[u];
+    int best_idx = -1;
+    uint64_t best_free = UINT64_MAX;
+    for (size_t k = 0; k < scale_down_candidates.size(); ++k) {
+      if (scale_down_candidates[k].matched) continue;
+      uint64_t free_bytes =
+          get_instance_free_bytes(scale_down_candidates[k].instance_name);
+      if (free_bytes >= up.model_size && free_bytes < best_free) {
+        best_free = free_bytes;
+        best_idx = static_cast<int>(k);
+      }
+    }
+    if (best_idx >= 0) {
+      overlapped_matches.push_back({u, static_cast<size_t>(best_idx)});
+      scale_down_candidates[best_idx].matched = true;
+      scale_up_needs[u].matched = true;
+    }
+  }
+
+  // Phase C: Execute overlapped matches (wake new model while draining old)
+  for (auto& m : overlapped_matches) {
+    auto& up = scale_up_needs[m.up_idx];
+    auto& down = scale_down_candidates[m.down_idx];
+
+    LOG(INFO) << "Overlapped scale: wake " << up.model_id
+              << " while draining " << down.model_id
+              << " on " << down.instance_name;
+
+    // Mark old model as DRAINING (stops routing new requests to it)
+    targets[down.target_idx].mgr->set_model_state(
+        down.instance_name, ModelState::DRAINING);
+
+    // Allocate + wake new model on same instance (synchronous)
+    targets[up.target_idx].mgr->set_model_state(
+        down.instance_name, ModelState::ALLOCATED);
+    deduct_free_pages(down.instance_name,
+                      get_model_size_bytes(up.model_id));
+    send_model_wakeup(down.instance_name, up.model_id, true);
+
+    // Async: drain + sleep old model
+    // Instance stays in elastic_occupied_instances_ (new model is using it)
+    std::string inst = down.instance_name;
+    std::string old_model = down.model_id;
+    std::thread([this, inst, old_model]() {
+      if (!wait_for_model_drain(inst, old_model)) return;
+      auto mgr = get_model_instance_mgr(old_model);
+      if (mgr && !mgr->can_sleep(inst)) return;
+      send_model_sleep(inst, old_model);
+    }).detach();
+  }
+
+  // Phase D: Execute remaining scale-ups (on free instances)
   for (auto& t : targets) {
     int32_t current_alloc = t.mgr->get_allocation_count();
     int32_t deficit = t.gpu_allocated - current_alloc;
@@ -1428,19 +1547,19 @@ void InstanceMgr::dynamic_part_auto_scaling() {
     for (const auto& [inst_name, _] : instances_) {
       if (deficit <= 0) break;
       if (t.mgr->get_model_state(inst_name) != ModelState::SLEEP) continue;
-      // Skip steady pool instances
       if (is_steady_pool_instance(inst_name)) continue;
-      // Skip instances occupied by another elastic model
       if (elastic_occupied_instances_.count(inst_name)) continue;
       if (!has_valid_xtensor_info(inst_name)) {
         LOG(WARNING) << "dynamic_part_auto_scaling: skip " << inst_name
-                     << " for model " << t.model_id << " (no valid xtensor info)";
+                     << " for model " << t.model_id
+                     << " (no valid xtensor info)";
         continue;
       }
       if (get_instance_free_bytes(inst_name) < model_size) {
         LOG(INFO) << "dynamic_part_auto_scaling: skip " << inst_name
                   << " for model " << t.model_id << " (not enough space: free="
-                  << get_instance_free_bytes(inst_name) << " need=" << model_size << ")";
+                  << get_instance_free_bytes(inst_name)
+                  << " need=" << model_size << ")";
         continue;
       }
 
@@ -1452,36 +1571,33 @@ void InstanceMgr::dynamic_part_auto_scaling() {
       send_model_wakeup(inst_name, t.model_id, true);  // blocking
       deficit--;
 
-      if (deficit > 0) inst_lock.lock();  // re-acquire for next iteration
+      if (deficit > 0) inst_lock.lock();
     }
   }
 
-  // 4. Scale DOWN — async drain + sleep
+  // Phase E: Execute remaining scale-downs (async drain + sleep)
+  for (auto& down : scale_down_candidates) {
+    if (down.matched) continue;
+    targets[down.target_idx].mgr->set_model_state(
+        down.instance_name, ModelState::DRAINING);
+    std::string inst = down.instance_name;
+    std::string model = down.model_id;
+    std::thread([this, inst, model]() {
+      if (!wait_for_model_drain(inst, model)) return;
+      auto mgr = get_model_instance_mgr(model);
+      if (mgr && !mgr->can_sleep(inst)) return;
+      send_model_sleep(inst, model);
+      std::lock_guard<std::mutex> lock(allocation_mutex_);
+      elastic_occupied_instances_.erase(inst);
+    }).detach();
+  }
+
+  // Cleanup: if heat → 0, remove from pool
   for (auto& t : targets) {
-    int32_t current_wakeup = t.mgr->get_wakeup_count();
-    int32_t excess = current_wakeup - t.gpu_allocated;
-    if (excess <= 0) continue;
-
-    auto unlocked = t.mgr->get_unlocked_instances();
-    for (int32_t i = 0; i < excess && i < static_cast<int32_t>(unlocked.size()); ++i) {
-      t.mgr->set_model_state(unlocked[i], ModelState::DRAINING);
-      std::string inst = unlocked[i];
-      std::string model = t.model_id;
-      std::thread([this, inst, model]() {
-        if (!wait_for_model_drain(inst, model)) return;
-        auto mgr = get_model_instance_mgr(model);
-        if (mgr && !mgr->can_sleep(inst)) return;
-        send_model_sleep(inst, model);
-        // Remove from elastic occupied set
-        std::lock_guard<std::mutex> lock(allocation_mutex_);
-        elastic_occupied_instances_.erase(inst);
-      }).detach();
-    }
-
-    // Cleanup: if heat → 0, remove from pool
     if (t.gpu_allocated == 0) {
       model_pool_assignments_[t.model_id] = PoolType::NONE;
-      LOG(INFO) << "Model " << t.model_id << " heat=0, removed from ELASTIC pool";
+      LOG(INFO) << "Model " << t.model_id
+                << " heat=0, removed from ELASTIC pool";
     }
   }
 }
