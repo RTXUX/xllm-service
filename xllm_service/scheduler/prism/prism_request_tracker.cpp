@@ -1,5 +1,6 @@
 #include "scheduler/prism/prism_request_tracker.h"
 
+#include <algorithm>
 #include <glog/logging.h>
 
 namespace xllm_service {

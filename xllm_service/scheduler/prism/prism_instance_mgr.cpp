@@ -616,6 +616,11 @@ void PrismInstanceMgr::execute_activate(const std::string& model_id,
             << " instance=" << instance_name
             << " budget=" << memory_pool_gb << "GB";
 
+  // Transition model state from SLEEP to ALLOCATED before wakeup
+  // (wakeup requires ALLOCATED state per the state machine: SLEEP -> ALLOCATED -> WAKEUP)
+  auto model_mgr = get_model_instance_mgr(model_id);
+  model_mgr->set_model_state(instance_name, ModelState::ALLOCATED);
+
   // Use inherited send_model_wakeup (D2D with H2D fallback)
   send_model_wakeup(instance_name, model_id, /*memory_increased_in_advance=*/false);
 
