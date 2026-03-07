@@ -151,7 +151,7 @@ class ModelInstanceMgr {
     std::chrono::steady_clock::time_point timestamp;
     int64_t token_count;
   };
-  static constexpr int64_t kModelHeatRetentionSeconds = 5;
+  static constexpr int64_t kModelHeatRetentionSeconds = 15;
   std::mutex model_heat_mutex_;
   std::deque<HeatRecord> model_heat_records_;
   int64_t model_heat_ = 0;

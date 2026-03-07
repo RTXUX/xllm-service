@@ -1298,6 +1298,100 @@ bool InstanceMgr::wait_for_model_drain(const std::string& instance_name,
   return true;
 }
 
+bool InstanceMgr::should_accept_scaling_plan(
+    const ScalingPlan& new_plan) const {
+  // No previous plan — always accept.
+  if (current_scaling_plan_.empty()) return true;
+
+  const auto& now_plan = current_scaling_plan_;
+
+  // Rule 1: Model set changed (new model added or existing model removed).
+  for (const auto& [model, _] : new_plan) {
+    if (now_plan.find(model) == now_plan.end()) return true;
+  }
+  for (const auto& [model, _] : now_plan) {
+    if (new_plan.find(model) == new_plan.end()) return true;
+  }
+
+  // Rule 2: Any model has a large heat change (>50%) or large instance
+  //         change (>=3) — accept immediately.
+  for (const auto& [model, new_entry] : new_plan) {
+    const auto& now_entry = now_plan.at(model);
+    // Heat change check
+    int64_t heat_base = std::max(now_entry.heat, new_entry.heat);
+    if (heat_base > 0) {
+      int64_t heat_delta = std::abs(new_entry.heat - now_entry.heat);
+      double heat_ratio = static_cast<double>(heat_delta) / heat_base;
+      if (heat_ratio > 0.5) return true;
+    }
+    // Instance change check
+    int32_t inst_delta = std::abs(new_entry.gpu_allocated - now_entry.gpu_allocated);
+    if (inst_delta >= 3) return true;
+  }
+
+  auto elapsed = std::chrono::steady_clock::now() - last_plan_change_time_;
+  double elapsed_sec =
+      std::chrono::duration<double>(elapsed).count();
+
+  // Rule 3: All models have tiny changes (heat change <=20% AND instance
+  //         change <=1) and the last plan change was <5s ago — reject.
+  {
+    bool all_tiny = true;
+    for (const auto& [model, new_entry] : new_plan) {
+      const auto& now_entry = now_plan.at(model);
+      int64_t heat_base = std::max(now_entry.heat, new_entry.heat);
+      double heat_ratio = (heat_base > 0)
+          ? static_cast<double>(std::abs(new_entry.heat - now_entry.heat)) / heat_base
+          : 0.0;
+      int32_t inst_delta = std::abs(new_entry.gpu_allocated - now_entry.gpu_allocated);
+      if (!(heat_ratio <= 0.2 && inst_delta <= 1)) {
+        all_tiny = false;
+        break;
+      }
+    }
+    if (all_tiny && elapsed_sec < 5.0) {
+      LOG(INFO) << "Anti-jitter: reject (all changes tiny, elapsed="
+                << elapsed_sec << "s < 5s)";
+      return false;
+    }
+  }
+
+  // Rule 4: Direction reversal detection via dot product.
+  //         If dot(now - last, new - now) < 0 and elapsed < 5s — reject.
+  if (!last_scaling_plan_.empty() && elapsed_sec < 5.0) {
+    // Build direction vectors over the union of all models across the three
+    // plans. Missing models in a plan are treated as 0 instances.
+    std::unordered_set<std::string> all_models;
+    for (const auto& [m, _] : last_scaling_plan_) all_models.insert(m);
+    for (const auto& [m, _] : now_plan) all_models.insert(m);
+    for (const auto& [m, _] : new_plan) all_models.insert(m);
+
+    auto get_gpu = [](const ScalingPlan& plan,
+                      const std::string& m) -> int32_t {
+      auto it = plan.find(m);
+      return (it != plan.end()) ? it->second.gpu_allocated : 0;
+    };
+
+    double dot = 0.0;
+    for (const auto& m : all_models) {
+      int32_t last_v = get_gpu(last_scaling_plan_, m);
+      int32_t now_v = get_gpu(now_plan, m);
+      int32_t new_v = get_gpu(new_plan, m);
+      double d_prev = static_cast<double>(now_v - last_v);   // last→now
+      double d_next = static_cast<double>(new_v - now_v);    // now→new
+      dot += d_prev * d_next;
+    }
+    if (dot < 0.0) {
+      LOG(INFO) << "Anti-jitter: reject (direction reversal, dot="
+                << dot << ", elapsed=" << elapsed_sec << "s < 5s)";
+      return false;
+    }
+  }
+
+  // Rule 5: Accept by default.
+  return true;
+}
+
 void InstanceMgr::dynamic_part_auto_scaling() {
   std::unique_lock<std::mutex> alloc_lock(allocation_mutex_);
 
@@ -1415,6 +1509,19 @@ void InstanceMgr::dynamic_part_auto_scaling() {
               << " gpu_allocated=" << t.gpu_allocated
               << " budget=" << budget;
   }
+
+  // Anti-jitter check: compare new plan against previous plans.
+  ScalingPlan new_plan;
+  for (const auto& t : targets) {
+    new_plan[t.model_id] = {t.gpu_allocated, t.heat};
+  }
+  if (!should_accept_scaling_plan(new_plan)) {
+    return;
+  }
+  // Accepted — rotate plan history.
+  last_scaling_plan_ = std::move(current_scaling_plan_);
+  current_scaling_plan_ = std::move(new_plan);
+  last_plan_change_time_ = std::chrono::steady_clock::now();
 
   // 3. Overlapped scale-up/scale-down
   //

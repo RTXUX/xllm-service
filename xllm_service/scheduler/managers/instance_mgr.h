@@ -355,6 +355,21 @@ class InstanceMgr final {
   // Repack timer thread
   std::unique_ptr<std::thread> repack_thread_;
 
+  // --- Scaling plan anti-jitter state (protected by allocation_mutex_) ---
+  struct ScalingPlanEntry {
+    int32_t gpu_allocated = 0;
+    int64_t heat = 0;
+  };
+  using ScalingPlan = std::unordered_map<std::string, ScalingPlanEntry>;
+  // model_id -> entry from the previous-previous plan
+  ScalingPlan last_scaling_plan_;
+  // model_id -> entry from the previous plan
+  ScalingPlan current_scaling_plan_;
+  // Timestamp when current_scaling_plan_ replaced last_scaling_plan_
+  std::chrono::steady_clock::time_point last_plan_change_time_;
+
+  bool should_accept_scaling_plan(const ScalingPlan& new_plan) const;
+
   // --- Elastic-to-steady demotion state (protected by allocation_mutex_) ---
   // model_id -> timestamp when gpu_target first dropped to <= 1
   std::unordered_map<std::string, std::chrono::steady_clock::time_point>
