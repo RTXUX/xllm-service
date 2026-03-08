@@ -102,6 +102,9 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
     llumnix_config.migration_load_metric = options.llumnix_migration_load_metric();
     llumnix_config.dispatch_policy = options.llumnix_dispatch_policy();
     llumnix_config.migration_policy = options.llumnix_migration_policy();
+    llumnix_config.dispatch_busy_threshold = options.llumnix_dispatch_busy_threshold();
+    llumnix_config.dispatch_busy_threshold_remaining_steps =
+        options.llumnix_dispatch_busy_threshold_remaining_steps();
 
     auto llumnix_mgr = std::make_shared<LlumnixInstanceMgr>(
         options, etcd_client_, is_master_service_, llumnix_config);

@@ -191,17 +191,135 @@ int32_t LlumnixInstanceMgr::get_reqs_on_instance(
 
 double LlumnixInstanceMgr::compute_instance_load(
     const std::string& instance_name, LlumnixLoadMetric metric) {
+  auto lm = get_instance_load_metrics(instance_name);
+
   if (metric == LlumnixLoadMetric::KV_BLOCKS_RATIO) {
-    auto lm = get_instance_load_metrics(instance_name);
+    // Source: KvBlocksRatioLoad.compute_instance_load (load_computation.py:81-86)
+    //   all_wanted_blocks = num_used_gpu_blocks + num_blocks_all_waiting_requests
+    //   demand_factor = all_wanted_blocks / num_total_gpu_blocks
     if (!lm.has_value()) return 0.0;
-    return static_cast<double>(lm->gpu_cache_usage_perc);
+    // Source: KvBlocksRatioLoad returns np.inf when num_total_gpu_blocks == 0
+    if (lm->num_total_gpu_blocks == 0) {
+      return std::numeric_limits<double>::infinity();
+    }
+    double all_wanted = static_cast<double>(lm->num_used_gpu_blocks) +
+                        static_cast<double>(lm->num_blocks_all_waiting_requests);
+    return all_wanted / static_cast<double>(lm->num_total_gpu_blocks);
   } else {
-    // REMAINING_STEPS: approximate as 1.0 - (1.0 / (1 + num_requests))
-    // More requests -> higher load
-    int32_t reqs = get_reqs_on_instance(instance_name);
-    if (reqs == 0) return 0.0;
-    return 1.0 - (1.0 / (1.0 + static_cast<double>(reqs)));
+    // Source: RemainingStepsLoad.compute_instance_load (load_computation.py:107-120)
+    //   num_available = num_total - num_used
+    //   num_requests = num_running + num_waiting (non-defrag mode)
+    //   num_available -= num_blocks_all_waiting_requests
+    //   remaining_steps = num_available / num_requests  (higher = less loaded)
+    //
+    // Note: Source's RemainingStepsLoad uses __lt__ as >=, meaning higher remaining_steps
+    // = less loaded. We normalize to [0,1] where higher = more loaded for consistent
+    // sorting (ascending = least loaded first).
+    if (!lm.has_value()) return 0.0;
+    if (lm->num_total_gpu_blocks == 0) return 0.0;
+
+    int64_t num_available = static_cast<int64_t>(lm->num_total_gpu_blocks) -
+                            static_cast<int64_t>(lm->num_used_gpu_blocks);
+    // Non-defrag mode: subtract all waiting request blocks
+    num_available -= static_cast<int64_t>(lm->num_blocks_all_waiting_requests);
+    // Source allows negative num_available to reflect over-allocation (load > 1.0)
+
+    uint64_t num_requests = lm->num_running_requests + lm->waiting_requests_num;
+    // R3-2: Source returns RemainingStepsLoad(np.inf) when num_requests == 0.
+    // We return 0.0 (least loaded). Both produce the same sort order (first in
+    // ascending) and same filtering behavior (not busy, valid destination).
+    if (num_requests == 0) return 0.0;
+
+    double remaining_steps = static_cast<double>(num_available) /
+                             static_cast<double>(num_requests);
+    // Normalize: load = 1.0 - (remaining_steps / num_total_gpu_blocks)
+    // Negative remaining_steps → load > 1.0, correctly reflecting over-allocation
+    double load = 1.0 - remaining_steps /
+                            static_cast<double>(lm->num_total_gpu_blocks);
+    return load;
   }
+}
+
+double LlumnixInstanceMgr::compute_load_after_migrate(
+    const std::string& instance_name, LlumnixLoadMetric metric,
+    bool is_migrate_in) {
+  // Source: InstanceLoadCalculator._compute_load_after_migrate (instance_info.py:147-158)
+  // Deep-copies instance info, adjusts num_running_requests and num_available_gpu_blocks
+  // by num_blocks_last_running_request, then recomputes load.
+  // R3-1: Source modifies num_available_gpu_blocks, NOT num_used_gpu_blocks.
+  // KvBlocksRatioLoad uses num_used_gpu_blocks (unchanged), so simulated load == current
+  // load for KV_BLOCKS_RATIO. RemainingStepsLoad uses num_available (= total - used),
+  // so we apply the delta there.
+  auto lm = get_instance_load_metrics(instance_name);
+  if (!lm.has_value()) return 0.0;
+
+  LoadMetrics simulated = lm.value();
+  int64_t blocks_last_running =
+      static_cast<int64_t>(simulated.num_blocks_last_running_request);
+
+  // Track available blocks delta separately (matches Python's modification target)
+  int64_t available_delta = 0;
+  if (is_migrate_in) {
+    simulated.num_running_requests += 1;
+    available_delta = -blocks_last_running;
+  } else {
+    if (simulated.num_running_requests > 0) simulated.num_running_requests -= 1;
+    available_delta = blocks_last_running;
+  }
+
+  if (metric == LlumnixLoadMetric::KV_BLOCKS_RATIO) {
+    // Source: KvBlocksRatioLoad.compute_instance_load uses num_used_gpu_blocks
+    // which is NOT modified by _compute_load_after_migrate. So simulated load
+    // equals current load (the migration simulation has no effect on this metric).
+    if (simulated.num_total_gpu_blocks == 0) {
+      return std::numeric_limits<double>::infinity();
+    }
+    double all_wanted = static_cast<double>(simulated.num_used_gpu_blocks) +
+                        static_cast<double>(simulated.num_blocks_all_waiting_requests);
+    return all_wanted / static_cast<double>(simulated.num_total_gpu_blocks);
+  } else {
+    if (simulated.num_total_gpu_blocks == 0) return 0.0;
+    // Apply available_delta: equivalent to Python modifying num_available_gpu_blocks
+    int64_t num_available = static_cast<int64_t>(simulated.num_total_gpu_blocks) -
+                            static_cast<int64_t>(simulated.num_used_gpu_blocks) +
+                            available_delta;
+    num_available -= static_cast<int64_t>(simulated.num_blocks_all_waiting_requests);
+
+    uint64_t num_requests = simulated.num_running_requests + simulated.waiting_requests_num;
+    if (num_requests == 0) return 0.0;
+
+    double remaining_steps = static_cast<double>(num_available) /
+                             static_cast<double>(num_requests);
+    return 1.0 - remaining_steps /
+                    static_cast<double>(simulated.num_total_gpu_blocks);
+  }
+}
+
+bool LlumnixInstanceMgr::is_instance_busy(
+    const std::string& instance_name, LlumnixLoadMetric metric,
+    double threshold) {
+  if (metric == LlumnixLoadMetric::REMAINING_STEPS) {
+    // R3-4: Source: RemainingStepsLoad.is_busy() → remaining_steps < BUSY_THRESHOLD (10.0)
+    // Use raw remaining_steps to match Python semantics (threshold in raw scale).
+    // The normalized load approach can't reproduce the raw threshold behavior.
+    auto lm = get_instance_load_metrics(instance_name);
+    if (!lm.has_value()) return false;
+    if (lm->num_total_gpu_blocks == 0) return false;
+
+    int64_t num_available = static_cast<int64_t>(lm->num_total_gpu_blocks) -
+                            static_cast<int64_t>(lm->num_used_gpu_blocks);
+    num_available -= static_cast<int64_t>(lm->num_blocks_all_waiting_requests);
+
+    uint64_t num_requests = lm->num_running_requests + lm->waiting_requests_num;
+    if (num_requests == 0) return false;  // np.inf remaining_steps → not busy
+
+    double remaining_steps = static_cast<double>(num_available) /
+                             static_cast<double>(num_requests);
+    return remaining_steps < config_.dispatch_busy_threshold_remaining_steps;
+  }
+  // KV_BLOCKS_RATIO: use normalized load >= threshold
+  double load = compute_instance_load(instance_name, metric);
+  return load >= threshold;
 }
 
 // ============================================================================
@@ -227,9 +345,25 @@ bool LlumnixInstanceMgr::dispatch_load(std::shared_ptr<Request> request) {
   auto awake = get_awake_instances(request->model);
   if (awake.empty()) return false;
 
+  // Source: Load.filter() uses MetricBasedFilter to exclude busy instances
+  // (dispatch_policy.py:121-127, dispatch_filter.py:30-43)
+  std::vector<std::string> candidates;
+  for (const auto& inst : awake) {
+    if (!is_instance_busy(inst, dispatch_load_metric_,
+                          config_.dispatch_busy_threshold)) {
+      candidates.push_back(inst);
+    }
+  }
+
+  // Source: dispatch_scheduler.py:102-105 - fallback to all primary instances
+  // if no candidates found and early_reject is disabled
+  if (candidates.empty()) {
+    candidates = awake;
+  }
+
   // Compute load per instance
   std::vector<std::pair<double, std::string>> load_instances;
-  for (const auto& inst : awake) {
+  for (const auto& inst : candidates) {
     double load = compute_instance_load(inst, dispatch_load_metric_);
     load_instances.emplace_back(load, inst);
   }
@@ -260,6 +394,9 @@ bool LlumnixInstanceMgr::dispatch_balanced(std::shared_ptr<Request> request) {
   if (awake.empty()) return false;
 
   // Pick instance with fewest total requests
+  // R3-3: Python's Balanced.select() uses instance_num_requests (a cumulative dispatch
+  // counter that doesn't decrease). C++ uses get_reqs_on_instance() which counts
+  // currently RUNNING requests. The C++ approach better reflects real-time load.
   std::string best;
   int32_t best_count = std::numeric_limits<int32_t>::max();
   for (const auto& inst : awake) {
@@ -279,20 +416,28 @@ bool LlumnixInstanceMgr::dispatch_queue(std::shared_ptr<Request> request) {
   auto awake = get_awake_instances(request->model);
   if (awake.empty()) return false;
 
-  // Pick instance with fewest waiting requests (use heartbeat waiting_requests_num)
-  std::string best;
-  uint64_t best_waiting = std::numeric_limits<uint64_t>::max();
+  // Source: Queue.dispatch (dispatch_policy.py:154-164)
+  // Sort by waiting_requests_num ascending (fewest first), then top-K random pick
+  std::vector<std::pair<uint64_t, std::string>> waiting_instances;
   for (const auto& inst : awake) {
     auto lm = get_instance_load_metrics(inst);
     uint64_t waiting = lm.has_value() ? lm->waiting_requests_num : 0;
-    if (waiting < best_waiting) {
-      best_waiting = waiting;
-      best = inst;
-    }
+    waiting_instances.emplace_back(waiting, inst);
+  }
+  std::sort(waiting_instances.begin(), waiting_instances.end());
+
+  // Pick randomly from top-K (same pattern as dispatch_load)
+  int k = std::min(config_.topk_random_dispatch,
+                   static_cast<int32_t>(waiting_instances.size()));
+  int idx = 0;
+  if (k > 1) {
+    std::uniform_int_distribution<int> dist(0, k - 1);
+    idx = dist(rng_);
   }
 
-  request->routing.prefill_name = best;
-  request->routing.decode_name = best;
+  const std::string& selected = waiting_instances[idx].second;
+  request->routing.prefill_name = selected;
+  request->routing.decode_name = selected;
   return true;
 }
 
@@ -303,6 +448,8 @@ bool LlumnixInstanceMgr::dispatch_round_robin(
 
   std::sort(awake.begin(), awake.end());
 
+  // P3-18: Protect rr_index_ with req_mutex_ for thread safety
+  std::lock_guard<std::mutex> lock(req_mutex_);
   size_t& idx = rr_index_[request->model];
   idx = idx % awake.size();
   const std::string& selected = awake[idx];
@@ -484,8 +631,17 @@ LlumnixInstanceMgr::evict_idle_models() {
   std::vector<LlumnixAction> actions;
   double now = now_seconds();
 
-  std::lock_guard<std::mutex> lock(placement_mutex_);
-  for (const auto& [model_id, instances] : model_to_instances_) {
+  // P3-16: Avoid potential deadlock from nested placement_mutex_ + req_mutex_.
+  // Snapshot placement state under placement_mutex_, then release it before
+  // calling get_total_active_count() which acquires req_mutex_.
+  std::unordered_map<std::string, std::unordered_set<std::string>>
+      model_instances_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(placement_mutex_);
+    model_instances_snapshot = model_to_instances_;
+  }
+
+  for (const auto& [model_id, instances] : model_instances_snapshot) {
     // Don't evict if there are active requests
     if (get_total_active_count(model_id) > 0) continue;
 
@@ -497,6 +653,16 @@ LlumnixInstanceMgr::evict_idle_models() {
 
     int32_t evicted = 0;
     for (const auto& inst : instances) {
+      // P3-17: Check D2D protection - don't evict instances being used as D2D source
+      {
+        auto mgr = get_model_instance_mgr(model_id);
+        if (mgr && !mgr->can_sleep(inst)) {
+          DLOG(INFO) << "Llumnix: skip eviction of " << model_id << " on "
+                     << inst << " (D2D locked)";
+          continue;
+        }
+      }
+
       double last_used = 0.0;
       {
         std::lock_guard<std::mutex> lu_lock(last_used_mutex_);
@@ -539,12 +705,26 @@ void LlumnixInstanceMgr::filter_migration_candidates(
   auto awake = get_awake_instances(model_id);
 
   for (const auto& inst : awake) {
+    // P1-7: Skip instances without valid xtensor info (new instance protection).
+    // Source: migration_scheduler.py:74-80 uses DummyLoad for new instances,
+    // and migration filter blocks DummyLoad instances from participating.
+    if (!has_valid_xtensor_info(inst)) continue;
+
     double load = compute_instance_load(inst, migration_load_metric_);
-    if (load > config_.migrate_out_load_threshold) {
+    auto lm = get_instance_load_metrics(inst);
+
+    // Source: LoadFilter (migration_filter.py:82-98)
+    // src condition: num_killed_requests > 0 OR load > threshold
+    // dst condition: num_killed_requests == 0 AND load < threshold
+    bool has_killed = lm.has_value() && lm->num_killed_requests > 0;
+
+    if (has_killed || load > config_.migrate_out_load_threshold) {
       sources.emplace_back(inst, load);
-    } else {
+    } else if (!has_killed && load < config_.migrate_out_load_threshold) {
       destinations.emplace_back(inst, load);
     }
+    // Note: instances with load == threshold and no killed requests are
+    // neither source nor destination (consistent with source's strict < / >)
   }
 
   // Sort: sources descending (most loaded first), destinations ascending
@@ -559,19 +739,27 @@ LlumnixInstanceMgr::pair_balanced_migration(
     const std::string& model_id,
     std::vector<std::pair<std::string, double>>& sources,
     std::vector<std::pair<std::string, double>>& destinations) {
+  // Source: Balanced.pair_migration (migration_policy.py:54-73)
+  // Uses migration_load_metric_after_migrate_out/in which simulate
+  // ±1 request and ±num_blocks_last_running_request blocks.
+  // R3-6: Python's Balanced.pair_migration uses BaseLoad.__sub__ and __gt__ for
+  // load_diff computation and threshold comparison. However, BaseLoad doesn't define
+  // __sub__ or __gt__, so this code path would TypeError at runtime in Python.
+  // Since the default migration_policy is defrag, this is likely untested in the source.
+  // Our C++ implementation uses double arithmetic which works correctly.
   size_t n = std::min(sources.size(), destinations.size());
   for (size_t i = 0; i < n; ++i) {
     double src_load = sources[i].second;
     double dst_load = destinations[i].second;
     double load_diff_before = src_load - dst_load;
 
-    // Simulate migration: src load decreases, dst load increases
-    // Approximate: transfer load proportionally
-    double transfer_load = src_load * 0.2;  // ~20% load transfer per migration
-    double src_after = src_load - transfer_load;
-    double dst_after = dst_load + transfer_load;
+    // Simulate migration using actual load recomputation
+    double src_after = compute_load_after_migrate(
+        sources[i].first, migration_load_metric_, /*is_migrate_in=*/false);
+    double dst_after = compute_load_after_migrate(
+        destinations[i].first, migration_load_metric_, /*is_migrate_in=*/true);
 
-    // Check: dst must stay below threshold
+    // Check: dst must stay below threshold after migration
     if (dst_after > config_.migrate_out_load_threshold) continue;
 
     double load_diff_after = src_after - dst_after;
@@ -590,6 +778,9 @@ LlumnixInstanceMgr::pair_defrag_migration(
     std::vector<std::pair<std::string, double>>& sources,
     std::vector<std::pair<std::string, double>>& destinations) {
   // Aggressive: just pair the most loaded source with least loaded destination
+  // Note: Source (migration_policy.py:76-86) returns min(len(src), len(dst)) pairs.
+  // We only return one because migration_rebalance() breaks after the first pair.
+  // If multi-migration-per-round is needed, change return type to vector.
   if (!sources.empty() && !destinations.empty()) {
     return MigrationPair{sources[0].first, destinations[0].first, model_id};
   }
@@ -685,10 +876,17 @@ void LlumnixInstanceMgr::execute_deactivate(const std::string& model_id,
   }
 
   // Drain and sleep in a detached thread (same pattern as Prism/SLLM)
+  // Check can_sleep() before sleeping to respect D2D protection
   std::string mid = model_id;
   std::string iname = instance_name;
   std::thread([this, mid, iname]() {
     wait_for_model_drain(iname, mid);
+    auto mgr = get_model_instance_mgr(mid);
+    if (mgr && !mgr->can_sleep(iname)) {
+      LOG(WARNING) << "Llumnix: skipping sleep of " << mid << " on " << iname
+                   << " (D2D locked)";
+      return;
+    }
     send_model_sleep(iname, mid);
   }).detach();
 }

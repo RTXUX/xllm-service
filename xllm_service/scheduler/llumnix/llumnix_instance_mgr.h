@@ -88,9 +88,23 @@ class LlumnixInstanceMgr : public InstanceMgr {
   bool dispatch_round_robin(std::shared_ptr<Request> request);
 
   // ===== Load computation =====
-  // Compute load for an instance using the specified metric
+  // Compute load for an instance using the specified metric.
+  // For KV_BLOCKS_RATIO: higher = more loaded (busy when >= threshold).
+  // For REMAINING_STEPS: higher = more loaded (internally inverted from source
+  //   where higher remaining_steps = less loaded).
   double compute_instance_load(const std::string& instance_name,
                                LlumnixLoadMetric metric);
+
+  // Compute load after simulating a migration (add/remove one request).
+  // Used by balanced migration to evaluate post-migration load.
+  double compute_load_after_migrate(const std::string& instance_name,
+                                     LlumnixLoadMetric metric,
+                                     bool is_migrate_in);
+
+  // Check if an instance is "busy" per the source's is_busy() logic.
+  bool is_instance_busy(const std::string& instance_name,
+                        LlumnixLoadMetric metric,
+                        double threshold);
 
   // ===== Migration helpers =====
   struct MigrationPair {

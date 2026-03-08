@@ -213,7 +213,9 @@ DEFINE_double(llumnix_idle_threshold_s,
 
 DEFINE_double(llumnix_migrate_out_load_threshold,
               0.8,
-              "Llumnix load threshold above which an instance is a migration source.");
+              "Llumnix load threshold above which an instance is a migration source. "
+              "Note: Python default is -3.0 in raw remaining_steps scale; C++ uses "
+              "normalized [0,1] load, so 0.8 is the equivalent reasonable threshold.");
 
 DEFINE_int32(llumnix_topk_random_dispatch,
              1,
@@ -232,11 +234,11 @@ DEFINE_int32(llumnix_max_instances,
              "Llumnix maximum instances per model.");
 
 DEFINE_string(llumnix_dispatch_load_metric,
-              "kv_blocks_ratio",
+              "remaining_steps",
               "Llumnix dispatch load metric: kv_blocks_ratio or remaining_steps.");
 
 DEFINE_string(llumnix_migration_load_metric,
-              "kv_blocks_ratio",
+              "remaining_steps",
               "Llumnix migration load metric: kv_blocks_ratio or remaining_steps.");
 
 DEFINE_string(llumnix_dispatch_policy,
@@ -244,5 +246,16 @@ DEFINE_string(llumnix_dispatch_policy,
               "Llumnix dispatch policy: load, balanced, queue, or rr.");
 
 DEFINE_string(llumnix_migration_policy,
-              "balanced",
+              "defrag",
               "Llumnix migration policy: balanced or defrag.");
+
+DEFINE_double(llumnix_dispatch_busy_threshold,
+              1.0,
+              "Llumnix busy threshold for dispatch filtering. "
+              "Source default: KVBLOCKSRATIO_BUSY_THRESHOLD=1.0.");
+
+DEFINE_double(llumnix_dispatch_busy_threshold_remaining_steps,
+              10.0,
+              "Llumnix busy threshold for REMAINING_STEPS dispatch filtering. "
+              "Uses raw remaining_steps scale. Source default: "
+              "REMAININGSTEPS_BUSY_THRESHOLD=10.0.");

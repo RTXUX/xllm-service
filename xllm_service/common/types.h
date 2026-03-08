@@ -91,17 +91,37 @@ enum class ModelState : int32_t {
 
 
 struct LoadMetrics {
-  LoadMetrics() : waiting_requests_num(0), gpu_cache_usage_perc(0) {};
+  LoadMetrics() : waiting_requests_num(0), gpu_cache_usage_perc(0),
+      num_used_gpu_blocks(0), num_total_gpu_blocks(0),
+      num_blocks_all_waiting_requests(0), num_running_requests(0),
+      num_blocks_last_running_request(0), num_killed_requests(0) {};
   LoadMetrics(const uint64_t& waiting_reqs_num, const float& usage)
-      : waiting_requests_num(waiting_reqs_num), gpu_cache_usage_perc(usage) {};
+      : waiting_requests_num(waiting_reqs_num), gpu_cache_usage_perc(usage),
+        num_used_gpu_blocks(0), num_total_gpu_blocks(0),
+        num_blocks_all_waiting_requests(0), num_running_requests(0),
+        num_blocks_last_running_request(0), num_killed_requests(0) {};
 
   uint64_t waiting_requests_num;
   float gpu_cache_usage_perc;
+
+  // Extended fields for Llumnix load computation (populated from heartbeat if available)
+  uint64_t num_used_gpu_blocks;
+  uint64_t num_total_gpu_blocks;
+  uint64_t num_blocks_all_waiting_requests;
+  uint64_t num_running_requests;
+  uint64_t num_blocks_last_running_request;
+  uint64_t num_killed_requests;
 
   nlohmann::json serialize_to_json() const {
     nlohmann::json json_val;
     json_val["waiting_requests_num"] = waiting_requests_num;
     json_val["gpu_cache_usage_perc"] = gpu_cache_usage_perc;
+    json_val["num_used_gpu_blocks"] = num_used_gpu_blocks;
+    json_val["num_total_gpu_blocks"] = num_total_gpu_blocks;
+    json_val["num_blocks_all_waiting_requests"] = num_blocks_all_waiting_requests;
+    json_val["num_running_requests"] = num_running_requests;
+    json_val["num_blocks_last_running_request"] = num_blocks_last_running_request;
+    json_val["num_killed_requests"] = num_killed_requests;
     return json_val;
   }
 
@@ -114,6 +134,20 @@ struct LoadMetrics {
       waiting_requests_num =
           json_value.at("waiting_requests_num").get<uint64_t>();
       gpu_cache_usage_perc = json_value.at("gpu_cache_usage_perc").get<float>();
+
+      // Extended fields (optional, backward-compatible with old heartbeat format)
+      if (json_value.contains("num_used_gpu_blocks"))
+        num_used_gpu_blocks = json_value["num_used_gpu_blocks"].get<uint64_t>();
+      if (json_value.contains("num_total_gpu_blocks"))
+        num_total_gpu_blocks = json_value["num_total_gpu_blocks"].get<uint64_t>();
+      if (json_value.contains("num_blocks_all_waiting_requests"))
+        num_blocks_all_waiting_requests = json_value["num_blocks_all_waiting_requests"].get<uint64_t>();
+      if (json_value.contains("num_running_requests"))
+        num_running_requests = json_value["num_running_requests"].get<uint64_t>();
+      if (json_value.contains("num_blocks_last_running_request"))
+        num_blocks_last_running_request = json_value["num_blocks_last_running_request"].get<uint64_t>();
+      if (json_value.contains("num_killed_requests"))
+        num_killed_requests = json_value["num_killed_requests"].get<uint64_t>();
 
     } catch (const std::exception& e) {
       LOG(ERROR) << "json str:" << json_str
@@ -599,10 +633,19 @@ struct LlumnixConfig {
   int32_t max_models_per_instance = 4;           // Max colocated models per instance
   int32_t min_instances_per_model = 0;           // Min instances per model
   int32_t max_instances_per_model = 8;           // Max instances per model
-  std::string dispatch_load_metric = "kv_blocks_ratio";   // kv_blocks_ratio|remaining_steps
-  std::string migration_load_metric = "kv_blocks_ratio";  // kv_blocks_ratio|remaining_steps
+  std::string dispatch_load_metric = "remaining_steps";   // kv_blocks_ratio|remaining_steps
+  std::string migration_load_metric = "remaining_steps";  // kv_blocks_ratio|remaining_steps
   std::string dispatch_policy = "load";          // load|balanced|queue|rr
-  std::string migration_policy = "balanced";     // balanced|defrag
+  std::string migration_policy = "defrag";       // balanced|defrag
+  // Busy threshold for dispatch filtering (matches LLUMNIX_KVBLOCKSRATIO_BUSY_THRESHOLD /
+  // LLUMNIX_REMAININGSTEPS_BUSY_THRESHOLD from source). Default 1.0 matches Python's
+  // KVBLOCKSRATIO_BUSY_THRESHOLD. For KV_BLOCKS_RATIO, busy when load >= threshold.
+  // For REMAINING_STEPS, busy when normalized load >= threshold.
+  double dispatch_busy_threshold = 1.0;
+  // R3-4: Separate busy threshold for REMAINING_STEPS metric, matching Python's
+  // REMAININGSTEPS_BUSY_THRESHOLD = 10.0 (raw remaining_steps scale).
+  // KV_BLOCKS_RATIO uses dispatch_busy_threshold (normalized load >= 1.0).
+  double dispatch_busy_threshold_remaining_steps = 10.0;
 };
 
 }  // namespace xllm_service

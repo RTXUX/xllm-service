@@ -109,3 +109,5 @@ DECLARE_string(llumnix_dispatch_load_metric);
 DECLARE_string(llumnix_migration_load_metric);
 DECLARE_string(llumnix_dispatch_policy);
 DECLARE_string(llumnix_migration_policy);
+DECLARE_double(llumnix_dispatch_busy_threshold);
+DECLARE_double(llumnix_dispatch_busy_threshold_remaining_steps);

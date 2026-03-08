@@ -108,10 +108,12 @@ class Options {
   PROPERTY(int32_t, llumnix_max_models_per_instance) = 4;
   PROPERTY(int32_t, llumnix_min_instances) = 0;
   PROPERTY(int32_t, llumnix_max_instances) = 8;
-  PROPERTY(std::string, llumnix_dispatch_load_metric) = "kv_blocks_ratio";
-  PROPERTY(std::string, llumnix_migration_load_metric) = "kv_blocks_ratio";
+  PROPERTY(std::string, llumnix_dispatch_load_metric) = "remaining_steps";
+  PROPERTY(std::string, llumnix_migration_load_metric) = "remaining_steps";
   PROPERTY(std::string, llumnix_dispatch_policy) = "load";
-  PROPERTY(std::string, llumnix_migration_policy) = "balanced";
+  PROPERTY(std::string, llumnix_migration_policy) = "defrag";
+  PROPERTY(double, llumnix_dispatch_busy_threshold) = 1.0;
+  PROPERTY(double, llumnix_dispatch_busy_threshold_remaining_steps) = 10.0;
 };
 
 }  // namespace xllm_service

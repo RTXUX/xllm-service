@@ -32,13 +32,13 @@ inline LlumnixDispatchPolicy parse_dispatch_policy(const std::string& s) {
 }
 
 inline LlumnixMigrationPolicy parse_migration_policy(const std::string& s) {
-  if (s == "defrag") return LlumnixMigrationPolicy::DEFRAG;
-  return LlumnixMigrationPolicy::BALANCED;  // default
+  if (s == "balanced") return LlumnixMigrationPolicy::BALANCED;
+  return LlumnixMigrationPolicy::DEFRAG;  // default (matches Python default)
 }
 
 inline LlumnixLoadMetric parse_load_metric(const std::string& s) {
-  if (s == "remaining_steps") return LlumnixLoadMetric::REMAINING_STEPS;
-  return LlumnixLoadMetric::KV_BLOCKS_RATIO;  // default
+  if (s == "kv_blocks_ratio") return LlumnixLoadMetric::KV_BLOCKS_RATIO;
+  return LlumnixLoadMetric::REMAINING_STEPS;  // default (matches Python default)
 }
 
 }  // namespace xllm_service
