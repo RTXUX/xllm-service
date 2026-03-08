@@ -1,5 +1,6 @@
 #include "scheduler/prism/prism_instance_mgr.h"
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <nlohmann/json.hpp>
 
@@ -7,6 +8,8 @@
 #include <cmath>
 #include <limits>
 #include <thread>
+
+DECLARE_double(gpu_hbm_per_gpu_gb);
 
 namespace xllm_service {
 
@@ -24,7 +27,8 @@ PrismInstanceMgr::PrismInstanceMgr(const Options& options,
             << "s, memory_pool_budget=" << config_.memory_pool_budget_gb
             << "GB, idle_threshold=" << config_.model_idle_threshold_s
             << "s, migrate_policy=" << config_.migrate_policy
-            << ", max_models_per_instance=" << config_.max_models_per_instance;
+            << ", max_models_per_instance=" << config_.max_models_per_instance
+            << ", backend_queue_threshold=" << config_.backend_queue_threshold;
 }
 
 PrismInstanceMgr::~PrismInstanceMgr() { stop_global_scheduler(); }
@@ -48,6 +52,22 @@ void PrismInstanceMgr::finish_prism_request(const std::string& rid) {
 }
 
 // ============================================================================
+// CV helpers
+// ============================================================================
+
+std::shared_ptr<std::condition_variable> PrismInstanceMgr::get_model_cv(
+    const std::string& model_id) {
+  std::lock_guard<std::mutex> lock(dispatch_cv_mutex_);
+  auto it = model_dispatch_cvs_.find(model_id);
+  if (it == model_dispatch_cvs_.end()) {
+    auto cv = std::make_shared<std::condition_variable>();
+    model_dispatch_cvs_[model_id] = cv;
+    return cv;
+  }
+  return it->second;
+}
+
+// ============================================================================
 // Request Dispatch
 // ============================================================================
 
@@ -61,11 +81,39 @@ bool PrismInstanceMgr::dispatch_prism_request(
     return false;
   }
 
+  // Filter out instances in DRAINING state and apply admission control
+  auto model_mgr = get_model_instance_mgr(model_id);
+  std::vector<std::string> eligible;
+  for (const auto& inst : awake) {
+    // Skip DRAINING instances
+    if (model_mgr && model_mgr->get_model_state(inst) == ModelState::DRAINING) {
+      continue;
+    }
+
+    // Admission control: skip instances with high GPU cache usage
+    auto load = get_instance_load_metrics(inst);
+    if (load.has_value() && load->gpu_cache_usage_perc > 0.95f) {
+      continue;
+    }
+
+    // Admission control: skip instances at backend queue threshold
+    int32_t running_reqs = req_tracker_.get_total_reqs_on_instance(inst);
+    if (running_reqs >= config_.backend_queue_threshold) {
+      continue;
+    }
+
+    eligible.push_back(inst);
+  }
+
+  if (eligible.empty()) {
+    return false;
+  }
+
   // Select instance with lowest load (fewest running requests)
   std::string best_instance;
   int32_t min_reqs = std::numeric_limits<int32_t>::max();
 
-  for (const auto& inst : awake) {
+  for (const auto& inst : eligible) {
     int32_t reqs = req_tracker_.get_total_reqs_on_instance(inst);
     if (reqs < min_reqs) {
       min_reqs = reqs;
@@ -80,6 +128,26 @@ bool PrismInstanceMgr::dispatch_prism_request(
   request->routing.prefill_name = best_instance;
   request->routing.decode_name = best_instance;
   return true;
+}
+
+bool PrismInstanceMgr::dispatch_prism_request_blocking(
+    std::shared_ptr<Request> request, double timeout_s) {
+  auto cv = get_model_cv(request->model);
+  auto deadline = std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(static_cast<int64_t>(timeout_s * 1000));
+
+  std::mutex wait_mutex;
+  std::unique_lock<std::mutex> lock(wait_mutex);
+
+  while (true) {
+    if (dispatch_prism_request(request)) {
+      return true;
+    }
+    if (cv->wait_until(lock, deadline) == std::cv_status::timeout) {
+      // Final attempt after timeout
+      return dispatch_prism_request(request);
+    }
+  }
 }
 
 // ============================================================================
@@ -114,6 +182,13 @@ void PrismInstanceMgr::start_global_scheduler() {
 
 void PrismInstanceMgr::stop_global_scheduler() {
   prism_running_ = false;
+  // Notify all CVs so blocked dispatchers can exit
+  {
+    std::lock_guard<std::mutex> lock(dispatch_cv_mutex_);
+    for (auto& [_, cv] : model_dispatch_cvs_) {
+      cv->notify_all();
+    }
+  }
   if (prism_sched_thread_ && prism_sched_thread_->joinable()) {
     prism_sched_thread_->join();
   }
@@ -125,10 +200,9 @@ void PrismInstanceMgr::stop_global_scheduler() {
 
 void PrismInstanceMgr::scheduling_loop() {
   while (prism_running_) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(
-        static_cast<int64_t>(config_.schedule_interval_s * 1000)));
-
     if (!prism_running_) break;
+
+    auto cycle_start = std::chrono::steady_clock::now();
 
     try {
       // 1. Update remaining time budgets
@@ -141,7 +215,42 @@ void PrismInstanceMgr::scheduling_loop() {
       violation_tracker_.update(queues);
       model_req_tracker_.update(queues);
 
-      // 4. Generate and execute actions
+      // 4. Update memory tracker with current state
+      {
+        std::unordered_map<std::string, std::vector<std::string>> inst_models;
+        std::unordered_map<std::string, int32_t> inst_total_reqs;
+        std::unordered_map<std::string, double> model_weights;
+        {
+          std::lock_guard<std::mutex> lock(placement_mutex_);
+          for (const auto& [inst, models] : instance_to_models_) {
+            inst_models[inst] =
+                std::vector<std::string>(models.begin(), models.end());
+            int32_t total = 0;
+            for (const auto& m : models) {
+              auto qit = queues.find(m);
+              if (qit != queues.end()) {
+                total += static_cast<int32_t>(
+                    qit->second.waiting_reqs.size() +
+                    qit->second.running_reqs.size());
+              }
+            }
+            inst_total_reqs[inst] = total;
+          }
+        }
+        // Collect model weights
+        for (const auto& [inst, models] : inst_models) {
+          for (const auto& m : models) {
+            if (model_weights.find(m) == model_weights.end()) {
+              model_weights[m] = get_model_weight_gb(m);
+            }
+          }
+        }
+        // Update memory tracker with smoothed stats (uses gpu_hbm_per_gpu_gb gflag)
+        memory_tracker_.update(inst_models, inst_total_reqs, model_weights,
+                               FLAGS_gpu_hbm_per_gpu_gb);
+      }
+
+      // 5. Generate and execute actions
       auto actions = gen_actions(queues);
       if (!actions.empty()) {
         LOG(INFO) << "Prism scheduler: executing " << actions.size()
@@ -150,6 +259,17 @@ void PrismInstanceMgr::scheduling_loop() {
       }
     } catch (const std::exception& e) {
       LOG(ERROR) << "Prism scheduling_loop exception: " << e.what();
+    }
+
+    // Sleep after execution, subtracting elapsed time (match Python baseline)
+    auto cycle_end = std::chrono::steady_clock::now();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          cycle_end - cycle_start)
+                          .count();
+    int64_t sleep_ms =
+        static_cast<int64_t>(config_.schedule_interval_s * 1000) - elapsed_ms;
+    if (sleep_ms > 0 && prism_running_) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
     }
   }
 }
@@ -202,11 +322,31 @@ PrismInstanceMgr::evict_idle_instances(
   std::vector<PrismAction> actions;
   double now = PrismRequestTracker::now_seconds();
 
+  // Match Python: detect first_request_time and initialize all model timestamps
+  if (!first_request_seen_) {
+    for (const auto& [model, queue] : queues) {
+      double last_arrival = req_tracker_.get_model_last_active_time(model);
+      if (last_arrival > 0.0) {
+        first_request_time_ = last_arrival;
+        first_request_seen_ = true;
+        LOG(INFO) << "Prism: first request time detected: " << first_request_time_;
+        break;
+      }
+    }
+    if (!first_request_seen_) {
+      return actions;  // No requests yet, nothing to evict
+    }
+  }
+
   std::lock_guard<std::mutex> lock(placement_mutex_);
   for (const auto& [instance_name, models] : instance_to_models_) {
     for (const auto& model_id : models) {
       double last_active = req_tracker_.get_model_last_active_time(model_id);
-      double idle_time = (last_active > 0) ? (now - last_active) : 0.0;
+      // If model never had a request, use first_request_time as baseline
+      if (last_active <= 0.0) {
+        last_active = first_request_time_;
+      }
+      double idle_time = now - last_active;
 
       // Check if model has zero active requests
       bool has_reqs = false;
@@ -232,6 +372,39 @@ PrismInstanceMgr::evict_idle_instances(
 }
 
 // ============================================================================
+// Migration simulation helper
+// ============================================================================
+
+int PrismInstanceMgr::count_unstable_pairs(
+    const std::vector<InstMemInfo>& infos) const {
+  int count = 0;
+  for (size_t i = 0; i < infos.size(); ++i) {
+    for (size_t j = i + 1; j < infos.size(); ++j) {
+      double mem_i = infos[i].mem_per_req;
+      double mem_j = infos[j].mem_per_req;
+      double reqs_i = infos[i].total_reqs;
+      double reqs_j = infos[j].total_reqs;
+
+      // Match Python: both zero-request GPUs count as unstable
+      if (reqs_i == 0 && reqs_j == 0) {
+        ++count;
+        continue;
+      }
+      // Match Python: zero-request GPU treated as inf memory
+      if (reqs_i == 0) mem_i = std::numeric_limits<double>::infinity();
+      if (reqs_j == 0) mem_j = std::numeric_limits<double>::infinity();
+
+      double hi = std::max(mem_i, mem_j);
+      double lo = std::min(mem_i, mem_j);
+      if (lo > 0 && hi / lo > config_.memory_per_request_ratio_threshold) {
+        ++count;
+      }
+    }
+  }
+  return count;
+}
+
+// ============================================================================
 // Phase 2a: Migration by Memory-Per-Request
 // ============================================================================
 
@@ -241,54 +414,45 @@ PrismInstanceMgr::plan_migration_by_memory(
   std::vector<PrismAction> actions;
 
   // Build instance-to-models mapping
-  std::unordered_map<std::string, std::vector<std::string>> inst_models;
+  std::unordered_map<std::string, std::vector<std::string>> inst_models_map;
   {
     std::lock_guard<std::mutex> lock(placement_mutex_);
     for (const auto& [inst, models] : instance_to_models_) {
-      inst_models[inst] = std::vector<std::string>(models.begin(), models.end());
+      inst_models_map[inst] =
+          std::vector<std::string>(models.begin(), models.end());
     }
   }
 
-  if (inst_models.size() < 2) {
+  if (inst_models_map.size() < 2) {
     return actions;  // Need at least 2 instances for migration
   }
 
-  // Compute memory_per_request for each instance
-  // mem_per_req = (gpu_mem - sum_model_weights) / max(1, avg_reqs)
-  double gpu_mem_gb = 80.0;  // TODO: get from GpuHardwareSpec
-  struct InstMemInfo {
-    std::string name;
-    double mem_per_req;
-    std::vector<std::string> models;
-  };
+  // Compute memory_per_request for each instance using xtensor-based free memory
   std::vector<InstMemInfo> inst_infos;
 
-  for (const auto& [inst, models] : inst_models) {
+  for (const auto& [inst, models] : inst_models_map) {
     if (models.empty()) continue;
 
-    double total_weight = 0.0;
+    // Use xtensor-based free memory instead of hardcoded 80GB
+    double inst_free_gb = 0.0;
+    if (has_valid_xtensor_info(inst)) {
+      inst_free_gb = static_cast<double>(get_instance_free_bytes(inst)) /
+                     (1024.0 * 1024.0 * 1024.0);
+    } else {
+      continue;  // Skip instances without valid xtensor info
+    }
+
     double total_avg_reqs = 0.0;
     for (const auto& model : models) {
-      total_weight += get_model_weight_gb(model);
       total_avg_reqs += model_req_tracker_.get_avg_request_count(model);
     }
 
-    double mem_per_req = (gpu_mem_gb - total_weight) /
-                         std::max(1.0, total_avg_reqs);
-    inst_infos.push_back({inst, mem_per_req, models});
+    double mem_per_req = inst_free_gb / std::max(1.0, total_avg_reqs);
+    inst_infos.push_back({inst, mem_per_req, total_avg_reqs, models});
   }
 
   // Check stability: any pair with ratio > threshold?
-  int unstable_pairs = 0;
-  for (size_t i = 0; i < inst_infos.size(); ++i) {
-    for (size_t j = i + 1; j < inst_infos.size(); ++j) {
-      double hi = std::max(inst_infos[i].mem_per_req, inst_infos[j].mem_per_req);
-      double lo = std::min(inst_infos[i].mem_per_req, inst_infos[j].mem_per_req);
-      if (lo > 0 && hi / lo > config_.memory_per_request_ratio_threshold) {
-        ++unstable_pairs;
-      }
-    }
-  }
+  int unstable_pairs = count_unstable_pairs(inst_infos);
 
   if (unstable_pairs == 0) {
     return actions;  // Stable placement
@@ -303,7 +467,7 @@ PrismInstanceMgr::plan_migration_by_memory(
   // Try to find a migration that reduces unstable_pairs
   for (size_t src_idx = 0; src_idx < inst_infos.size(); ++src_idx) {
     auto& src = inst_infos[src_idx];
-    if (src.models.size() <= 1) continue;  // Can't migrate from single-model instance
+    if (src.models.size() <= 1) continue;
 
     for (size_t dst_idx = inst_infos.size(); dst_idx > 0; --dst_idx) {
       size_t di = dst_idx - 1;
@@ -336,12 +500,60 @@ PrismInstanceMgr::plan_migration_by_memory(
         if (static_cast<int32_t>(dst.models.size()) >=
             config_.max_models_per_instance) continue;
 
-        // Simulate: would this reduce unstable pairs?
-        // Simple heuristic: if we're moving from congested to uncongested, it helps
+        // Simulate migration: create modified inst_infos and recount
+        double model_weight = get_model_weight_gb(model);
+        std::vector<InstMemInfo> simulated = inst_infos;
+        for (auto& si : simulated) {
+          if (si.name == src.name) {
+            // Recover original free memory: mem_per_req * max(1, total_avg_reqs)
+            double src_total_reqs = 0.0;
+            for (const auto& m : si.models) {
+              src_total_reqs += model_req_tracker_.get_avg_request_count(m);
+            }
+            double src_free = si.mem_per_req * std::max(1.0, src_total_reqs);
+            // Remove model from source
+            si.models.erase(
+                std::remove(si.models.begin(), si.models.end(), model),
+                si.models.end());
+            double new_avg_reqs = 0.0;
+            for (const auto& m : si.models) {
+              new_avg_reqs += model_req_tracker_.get_avg_request_count(m);
+            }
+            // Source gains free memory from removed model weight
+            double new_free = src_free + model_weight;
+            si.mem_per_req = new_free / std::max(1.0, new_avg_reqs);
+            si.total_reqs = new_avg_reqs;
+          } else if (si.name == dst.name) {
+            // Recover original free memory
+            double dst_total_reqs = 0.0;
+            for (const auto& m : si.models) {
+              dst_total_reqs += model_req_tracker_.get_avg_request_count(m);
+            }
+            double dst_free = si.mem_per_req * std::max(1.0, dst_total_reqs);
+            // Add model to destination
+            si.models.push_back(model);
+            double new_avg_reqs = 0.0;
+            for (const auto& m : si.models) {
+              new_avg_reqs += model_req_tracker_.get_avg_request_count(m);
+            }
+            // Destination loses free memory for model weight
+            double new_free = std::max(0.0, dst_free - model_weight);
+            si.mem_per_req = new_free / std::max(1.0, new_avg_reqs);
+            si.total_reqs = new_avg_reqs;
+          }
+        }
+
+        int simulated_unstable = count_unstable_pairs(simulated);
+        if (simulated_unstable >= unstable_pairs) {
+          continue;  // Migration doesn't improve stability
+        }
+
         LOG(INFO) << "Prism: planning migration of model " << model
                   << " from " << src.name << " (mem/req="
                   << src.mem_per_req << ") to " << dst.name
-                  << " (mem/req=" << dst.mem_per_req << ")";
+                  << " (mem/req=" << dst.mem_per_req << ")"
+                  << " unstable_pairs: " << unstable_pairs
+                  << " -> " << simulated_unstable;
 
         PrismAction deact;
         deact.type = PrismAction::DEACTIVATE;
@@ -373,15 +585,16 @@ PrismInstanceMgr::plan_migration_by_violation(
     const std::unordered_map<std::string, PrismModelQueue>& queues) {
   std::vector<PrismAction> actions;
 
-  std::unordered_map<std::string, std::vector<std::string>> inst_models;
+  std::unordered_map<std::string, std::vector<std::string>> inst_models_map;
   {
     std::lock_guard<std::mutex> lock(placement_mutex_);
     for (const auto& [inst, models] : instance_to_models_) {
-      inst_models[inst] = std::vector<std::string>(models.begin(), models.end());
+      inst_models_map[inst] =
+          std::vector<std::string>(models.begin(), models.end());
     }
   }
 
-  if (inst_models.size() < 2) return actions;
+  if (inst_models_map.size() < 2) return actions;
 
   // Compute per-instance violation proportion
   struct InstViolInfo {
@@ -393,7 +606,7 @@ PrismInstanceMgr::plan_migration_by_violation(
   };
   std::vector<InstViolInfo> inst_infos;
 
-  for (const auto& [inst, models] : inst_models) {
+  for (const auto& [inst, models] : inst_models_map) {
     int32_t total_violated = 0, total_reqs = 0;
     for (const auto& model : models) {
       auto stats = violation_tracker_.get_model_stats(model);
@@ -456,10 +669,48 @@ PrismInstanceMgr::plan_migration_by_violation(
       if (static_cast<int32_t>(dst.models.size()) >=
           config_.max_models_per_instance) continue;
 
+      // Simulate: count violation unstable pairs before and after
+      auto count_viol_unstable = [&](const std::vector<InstViolInfo>& infos) {
+        int count = 0;
+        for (size_t i = 0; i < infos.size(); ++i) {
+          for (size_t j = i + 1; j < infos.size(); ++j) {
+            double d = std::abs(infos[i].violation_proportion -
+                                infos[j].violation_proportion);
+            if (d > config_.violation_proportion_threshold) ++count;
+          }
+        }
+        return count;
+      };
+
+      int before_unstable = count_viol_unstable(inst_infos);
+
+      // Simulate: move best_model's violation stats from src to dst
+      std::vector<InstViolInfo> simulated = inst_infos;
+      auto model_stats = violation_tracker_.get_model_stats(best_model);
+      for (auto& si : simulated) {
+        if (si.name == src.name) {
+          si.total_violated -= model_stats.violated_count;
+          si.total_reqs -= model_stats.total_reqs;
+          si.violation_proportion = (si.total_reqs > 0)
+              ? static_cast<double>(si.total_violated) / si.total_reqs : 0.0;
+        } else if (si.name == dst.name) {
+          si.total_violated += model_stats.violated_count;
+          si.total_reqs += model_stats.total_reqs;
+          si.violation_proportion = (si.total_reqs > 0)
+              ? static_cast<double>(si.total_violated) / si.total_reqs : 0.0;
+        }
+      }
+
+      int after_unstable = count_viol_unstable(simulated);
+      if (after_unstable > 0) {
+        continue;  // Migration must achieve full stability (match Python baseline)
+      }
+
       LOG(INFO) << "Prism: violation-based migration of model " << best_model
                 << " from " << src.name << " (viol=" << src.violation_proportion
                 << ") to " << dst.name
-                << " (viol=" << dst.violation_proportion << ")";
+                << " (viol=" << dst.violation_proportion << ")"
+                << " unstable: " << before_unstable << " -> " << after_unstable;
 
       PrismAction deact;
       deact.type = PrismAction::DEACTIVATE;
@@ -550,12 +801,27 @@ PrismInstanceMgr::activate_needed_models(
     }
   }
 
+  // Sort clusters by average available memory descending (richest first)
+  std::sort(clusters.begin(), clusters.end(),
+            [](const std::vector<InstAvailInfo>& a,
+               const std::vector<InstAvailInfo>& b) {
+              double avg_a = 0.0, avg_b = 0.0;
+              for (const auto& x : a) avg_a += x.available_gb;
+              for (const auto& x : b) avg_b += x.available_gb;
+              avg_a /= std::max((size_t)1, a.size());
+              avg_b /= std::max((size_t)1, b.size());
+              return avg_a > avg_b;
+            });
+
   // For each model needing activation, find best placement
+  // (within each cluster, sort by avg remaining time budget — highest first)
+  auto queues_snap = req_tracker_.snapshot_queues();
   for (const auto& [model, _viol_prop] : inactive_with_reqs) {
     bool placed = false;
     for (const auto& cluster : clusters) {
+      // Build candidates with time budget within this cluster
+      std::vector<std::pair<std::string, double>> candidates;  // (inst_name, avg_budget)
       for (const auto& inst : cluster) {
-        // Check space and model count limit
         if (!has_enough_space_for_model(inst.name, model)) continue;
         {
           std::lock_guard<std::mutex> lock(placement_mutex_);
@@ -564,14 +830,44 @@ PrismInstanceMgr::activate_needed_models(
             continue;
           }
         }
+        // Calculate avg remaining time budget for requests on this instance
+        double total_budget = 0.0;
+        int32_t total_reqs = 0;
+        {
+          std::lock_guard<std::mutex> lock(placement_mutex_);
+          for (const auto& m : instance_to_models_[inst.name]) {
+            auto qit = queues_snap.find(m);
+            if (qit != queues_snap.end()) {
+              for (const auto& req : qit->second.waiting_reqs) {
+                total_budget += req->remaining_time_budget;
+                ++total_reqs;
+              }
+              for (const auto& req : qit->second.running_reqs) {
+                total_budget += req->remaining_time_budget;
+                ++total_reqs;
+              }
+            }
+          }
+        }
+        double avg_budget = (total_reqs > 0)
+                                ? total_budget / total_reqs
+                                : std::numeric_limits<double>::infinity();
+        candidates.push_back({inst.name, avg_budget});
+      }
+      // Sort by avg_budget descending (most slack first)
+      std::sort(candidates.begin(), candidates.end(),
+                [](const auto& a, const auto& b) {
+                  return a.second > b.second;
+                });
 
+      for (const auto& [inst_name, avg_budget] : candidates) {
         LOG(INFO) << "Prism: activating model " << model << " on instance "
-                  << inst.name << " (available=" << inst.available_gb << "GB)";
+                  << inst_name << " (avg_budget=" << avg_budget << "s)";
 
         PrismAction action;
         action.type = PrismAction::ACTIVATE;
         action.model_id = model;
-        action.instance_name = inst.name;
+        action.instance_name = inst_name;
         action.memory_pool_budget_gb = config_.memory_pool_budget_gb;
         actions.push_back(action);
         placed = true;
@@ -617,7 +913,6 @@ void PrismInstanceMgr::execute_activate(const std::string& model_id,
             << " budget=" << memory_pool_gb << "GB";
 
   // Transition model state from SLEEP to ALLOCATED before wakeup
-  // (wakeup requires ALLOCATED state per the state machine: SLEEP -> ALLOCATED -> WAKEUP)
   auto model_mgr = get_model_instance_mgr(model_id);
   model_mgr->set_model_state(instance_name, ModelState::ALLOCATED);
 
@@ -628,8 +923,12 @@ void PrismInstanceMgr::execute_activate(const std::string& model_id,
   {
     std::lock_guard<std::mutex> lock(placement_mutex_);
     instance_to_models_[instance_name].insert(model_id);
-    model_to_instance_[model_id] = instance_name;
+    model_to_instances_[model_id].insert(instance_name);
   }
+
+  // Notify waiting dispatchers that this model now has an instance
+  auto cv = get_model_cv(model_id);
+  cv->notify_all();
 }
 
 void PrismInstanceMgr::execute_deactivate(const std::string& model_id,
@@ -637,22 +936,32 @@ void PrismInstanceMgr::execute_deactivate(const std::string& model_id,
   LOG(INFO) << "Prism: executing DEACTIVATE model=" << model_id
             << " instance=" << instance_name;
 
-  // Update placement mapping first
-  {
-    std::lock_guard<std::mutex> lock(placement_mutex_);
-    instance_to_models_[instance_name].erase(model_id);
-    if (model_to_instance_.count(model_id) &&
-        model_to_instance_[model_id] == instance_name) {
-      model_to_instance_.erase(model_id);
-    }
+  // Set DRAINING state immediately to prevent new routing
+  auto model_mgr = get_model_instance_mgr(model_id);
+  if (model_mgr) {
+    model_mgr->set_model_state(instance_name, ModelState::DRAINING);
   }
 
-  // Use inherited send_model_sleep (async drain)
-  // Launch in detached thread to avoid blocking scheduling loop
+  // Launch drain + sleep in detached thread, defer placement removal
   std::thread([this, instance_name, model_id]() {
+    // Evict waiting requests for this model (they can't be served anymore)
+    req_tracker_.evict_waiting_reqs(model_id);
     // Wait for inflight requests to drain
     wait_for_model_drain(instance_name, model_id);
     send_model_sleep(instance_name, model_id);
+
+    // Remove from placement AFTER drain completes
+    {
+      std::lock_guard<std::mutex> lock(placement_mutex_);
+      instance_to_models_[instance_name].erase(model_id);
+      auto mit = model_to_instances_.find(model_id);
+      if (mit != model_to_instances_.end()) {
+        mit->second.erase(instance_name);
+        if (mit->second.empty()) {
+          model_to_instances_.erase(mit);
+        }
+      }
+    }
   }).detach();
 }
 
@@ -661,8 +970,6 @@ void PrismInstanceMgr::execute_deactivate(const std::string& model_id,
 // ============================================================================
 
 std::vector<std::string> PrismInstanceMgr::get_all_instance_names() {
-  // Use MODELS list (same as InstanceMgr) to get model_instance_mgrs,
-  // then collect all instance names from them
   std::vector<std::string> result;
   for (const auto& [model_id, _] : MODELS) {
     auto mgr = get_model_instance_mgr(model_id);

@@ -85,6 +85,7 @@ class Options {
   PROPERTY(double, prism_idle_threshold_s) = 50.0;
   PROPERTY(std::string, prism_migrate_policy) = "memory_per_request";
   PROPERTY(int32_t, prism_max_models_per_instance) = 4;
+  PROPERTY(int32_t, prism_backend_queue_threshold) = 10;
 
   // ServerlessLLM baseline options
   PROPERTY(double, sllm_schedule_interval_s) = 1.0;

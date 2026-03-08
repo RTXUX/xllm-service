@@ -19,6 +19,8 @@ struct PrismReq {
   double slo = 30.0;             // TTFT SLO in seconds
   int32_t prompt_len = 0;
   int32_t output_len = 512;      // expected output tokens (default 512)
+  double profiled_prefill_time = 0.0;  // estimated prefill time in seconds
+  double priority = 0.0;         // lower = more urgent (arrival + slo - prefill_time)
   double start_running_time = 0.0;
   double finish_time = 0.0;
   double remaining_time_budget = 0.0;  // = slo - (now - arrival_time)
@@ -53,6 +55,9 @@ class PrismRequestTracker {
 
   // Update remaining_time_budget for all requests
   void update_time_budgets();
+
+  // Evict all waiting requests for a model (used on deactivation)
+  void evict_waiting_reqs(const std::string& model);
 
   // Utility: current time in seconds since epoch
   static double now_seconds();

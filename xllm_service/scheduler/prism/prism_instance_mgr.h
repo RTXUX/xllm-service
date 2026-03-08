@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -36,6 +37,11 @@ class PrismInstanceMgr : public InstanceMgr {
   // Sets request->routing.prefill_name and decode_name.
   // Returns false if no instance is available.
   bool dispatch_prism_request(std::shared_ptr<Request> request);
+
+  // CV-based blocking dispatch: waits up to timeout_s for an instance.
+  // Returns true if dispatched, false on timeout.
+  bool dispatch_prism_request_blocking(std::shared_ptr<Request> request,
+                                       double timeout_s);
 
   // ===== Resize =====
   bool send_model_resize(const std::string& instance_name,
@@ -91,6 +97,17 @@ class PrismInstanceMgr : public InstanceMgr {
   // Get model weight in GB (from xtensor info or model_memory_specs)
   double get_model_weight_gb(const std::string& model_id);
 
+  // ===== Migration simulation helpers =====
+  struct InstMemInfo {
+    std::string name;
+    double mem_per_req;
+    double total_reqs;  // smoothed average total requests
+    std::vector<std::string> models;
+  };
+
+  // Count unstable pairs (memory ratio > threshold)
+  int count_unstable_pairs(const std::vector<InstMemInfo>& infos) const;
+
   // ===== Internal state =====
   PrismConfig config_;
 
@@ -104,9 +121,23 @@ class PrismInstanceMgr : public InstanceMgr {
   // instance_name -> set of active model_ids on that instance
   std::unordered_map<std::string, std::unordered_set<std::string>>
       instance_to_models_;
-  // model_id -> instance_name where the model is active
-  std::unordered_map<std::string, std::string> model_to_instance_;
+  // model_id -> set of instance_names where the model is active
+  std::unordered_map<std::string, std::unordered_set<std::string>>
+      model_to_instances_;
   std::mutex placement_mutex_;
+
+  // CV for dispatch blocking (per-model notification when placement changes)
+  std::mutex dispatch_cv_mutex_;
+  std::unordered_map<std::string, std::shared_ptr<std::condition_variable>>
+      model_dispatch_cvs_;
+
+  // Get or create a CV for a model
+  std::shared_ptr<std::condition_variable> get_model_cv(
+      const std::string& model_id);
+
+  // First request time tracking (for idle eviction baseline)
+  double first_request_time_ = 0.0;
+  bool first_request_seen_ = false;
 
   // Scheduling thread
   std::unique_ptr<std::thread> prism_sched_thread_;

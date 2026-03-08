@@ -18,18 +18,27 @@ void PrismRequestTracker::enqueue_req(const std::string& model,
     req->arrival_time = now_seconds();
   }
   req->remaining_time_budget = req->slo;
+  req->priority = req->arrival_time + req->slo - req->profiled_prefill_time;
 
   auto& queue = model_queues_[model];
   if (queue.model_name.empty()) {
     queue.model_name = model;
   }
-  queue.waiting_reqs.push_back(req);
+  // Insert sorted by priority (lower = more urgent = earlier in deque)
+  auto insert_pos = std::lower_bound(
+      queue.waiting_reqs.begin(), queue.waiting_reqs.end(), req,
+      [](const std::shared_ptr<PrismReq>& a,
+         const std::shared_ptr<PrismReq>& b) {
+        return a->priority < b->priority;
+      });
+  queue.waiting_reqs.insert(insert_pos, req);
   queue.last_active_time = now_seconds();
   all_reqs_[req->rid] = req;
 
   DLOG(INFO) << "Prism: enqueue request " << req->rid
              << " for model " << model
-             << " prompt_len=" << req->prompt_len;
+             << " prompt_len=" << req->prompt_len
+             << " priority=" << req->priority;
 }
 
 void PrismRequestTracker::start_running(const std::string& rid,
@@ -132,6 +141,24 @@ void PrismRequestTracker::update_time_budgets() {
   double now = now_seconds();
   for (auto& [_, req] : all_reqs_) {
     req->remaining_time_budget = req->slo - (now - req->arrival_time);
+  }
+}
+
+void PrismRequestTracker::evict_waiting_reqs(const std::string& model) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = model_queues_.find(model);
+  if (it == model_queues_.end()) return;
+
+  // Remove all waiting requests from all_reqs_
+  for (const auto& req : it->second.waiting_reqs) {
+    all_reqs_.erase(req->rid);
+  }
+  int evicted = static_cast<int>(it->second.waiting_reqs.size());
+  it->second.waiting_reqs.clear();
+
+  if (evicted > 0) {
+    LOG(INFO) << "Prism: evicted " << evicted
+              << " waiting requests for model " << model;
   }
 }
 

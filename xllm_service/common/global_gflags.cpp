@@ -153,6 +153,10 @@ DEFINE_int32(prism_max_models_per_instance,
              4,
              "Prism maximum number of models colocated on one instance.");
 
+DEFINE_int32(prism_backend_queue_threshold,
+             10,
+             "Prism maximum running requests per instance for admission control.");
+
 // ServerlessLLM baseline flags
 DEFINE_double(sllm_schedule_interval_s,
               1.0,

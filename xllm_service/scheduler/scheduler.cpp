@@ -61,6 +61,7 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
     prism_config.model_idle_threshold_s = options.prism_idle_threshold_s();
     prism_config.migrate_policy = options.prism_migrate_policy();
     prism_config.max_models_per_instance = options.prism_max_models_per_instance();
+    prism_config.backend_queue_threshold = options.prism_backend_queue_threshold();
 
     auto prism_mgr = std::make_shared<PrismInstanceMgr>(
         options, etcd_client_, is_master_service_, prism_config);
@@ -323,20 +324,15 @@ void Scheduler::process_prism_request(std::shared_ptr<Request> request) {
   prism_req->rid = request->service_request_id;
   prism_req->model = request->model;
   prism_req->arrival_time = PrismRequestTracker::now_seconds();
-  prism_req->slo = 30.0;  // Default TTFT SLO in seconds
+  prism_req->slo = (request->ttft_slo_ms > 0)
+                       ? request->ttft_slo_ms / 1000.0
+                       : 30.0;
   prism_req->prompt_len = static_cast<int32_t>(request->token_ids.size());
   prism_req->state = PrismReqState::WAITING;
   prism_mgr->enqueue_prism_request(request->model, prism_req);
 
-  // 2. Wait for an available instance (global scheduler will activate models)
-  bool dispatched = false;
-  for (int retry = 0; retry < 300 && !exited_; ++retry) {
-    if (prism_mgr->dispatch_prism_request(request)) {
-      dispatched = true;
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
+  // 2. Wait for an available instance using CV-based blocking (no busy-poll)
+  bool dispatched = prism_mgr->dispatch_prism_request_blocking(request, 30.0);
 
   if (!dispatched) {
     LOG(ERROR) << "Prism: timeout waiting for model " << request->model

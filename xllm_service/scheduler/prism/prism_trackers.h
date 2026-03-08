@@ -33,9 +33,8 @@ class PrismViolationTracker {
  private:
   struct Record {
     double timestamp;
-    std::string rid;
-    bool violated;
-    std::string model;
+    int32_t violated_count;
+    int32_t total_count;
   };
 
   void prune_old_records(double now);

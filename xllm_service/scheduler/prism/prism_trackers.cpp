@@ -28,15 +28,19 @@ void PrismViolationTracker::update(
   prune_old_records(now);
 
   for (const auto& [model, queue] : queues) {
-    auto& records = history_[model];
-    // Record all waiting + running requests
+    int32_t violated = 0;
+    int32_t total = 0;
+    // Count violations across waiting + running requests
     for (const auto& req : queue.waiting_reqs) {
-      records.push_back(
-          {now, req->rid, req->remaining_time_budget <= 0, model});
+      ++total;
+      if (req->remaining_time_budget <= 0) ++violated;
     }
     for (const auto& req : queue.running_reqs) {
-      records.push_back(
-          {now, req->rid, req->remaining_time_budget <= 0, model});
+      ++total;
+      if (req->remaining_time_budget <= 0) ++violated;
+    }
+    if (total > 0) {
+      history_[model].push_back({now, violated, total});
     }
   }
 }
@@ -55,10 +59,8 @@ PrismViolationTracker::get_model_stats(const std::string& model) const {
 
   for (const auto& record : it->second) {
     if (record.timestamp >= cutoff) {
-      ++stats.total_reqs;
-      if (record.violated) {
-        ++stats.violated_count;
-      }
+      stats.total_reqs += record.total_count;
+      stats.violated_count += record.violated_count;
     }
   }
   if (stats.total_reqs > 0) {
@@ -124,19 +126,20 @@ PrismMemoryTracker::MemoryStats PrismMemoryTracker::get_instance_stats(
   double now = PrismRequestTracker::now_seconds();
   double cutoff = now - kWindowSeconds;
 
-  double sum_mem = 0.0;
-  double sum_reqs = 0.0;
+  double weighted_sum = 0.0;
+  double total_reqs_sum = 0.0;
   int count = 0;
   for (const auto& record : it->second) {
     if (record.timestamp >= cutoff) {
-      sum_mem += record.memory_per_request;
-      sum_reqs += record.total_reqs;
+      weighted_sum += record.memory_per_request * record.total_reqs;
+      total_reqs_sum += record.total_reqs;
       ++count;
     }
   }
   if (count > 0) {
-    stats.avg_memory_per_request = sum_mem / count;
-    stats.avg_total_reqs = sum_reqs / count;
+    stats.avg_memory_per_request =
+        (total_reqs_sum > 0) ? weighted_sum / total_reqs_sum : 0.0;
+    stats.avg_total_reqs = total_reqs_sum / count;
   }
   return stats;
 }

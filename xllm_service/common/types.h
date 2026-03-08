@@ -620,6 +620,7 @@ struct PrismConfig {
   std::string migrate_policy = "memory_per_request"; // or "violation"
   double model_transfer_speed_gbps = 6.0;        // Model weight transfer speed
   int32_t max_models_per_instance = 4;           // Max colocated models per instance
+  int32_t backend_queue_threshold = 10;          // Max running requests per instance for admission control
 };
 
 }  // namespace xllm_service
