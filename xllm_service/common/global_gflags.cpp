@@ -131,7 +131,10 @@ DEFINE_double(gpu_compute_sm_per_gpu,
 DEFINE_string(baseline_type,
               "",
               "Baseline scheduling type. Empty = default dual-pool, "
-              "\"PRISM\" = Prism multi-model scheduling.");
+              "\"PRISM\" = Prism multi-model scheduling, "
+              "\"SERVERLESS_LLM\" = ServerlessLLM scheduling, "
+              "\"LLUMNIX\" = Llumnix scheduling, "
+              "\"BLITZSCALE\" = BlitzScale disaggregated scheduling.");
 
 DEFINE_double(prism_schedule_interval_s,
               5.0,
@@ -201,6 +204,71 @@ DEFINE_bool(sllm_enable_knapsack,
 DEFINE_int32(sllm_max_models_per_instance,
              4,
              "ServerlessLLM maximum number of models colocated on one instance.");
+
+// BlitzScale baseline flags
+DEFINE_double(blitzscale_schedule_interval_s,
+              1.0,
+              "BlitzScale control-loop interval in seconds.");
+
+DEFINE_double(blitzscale_scale_down_threshold_ms,
+              5000.0,
+              "BlitzScale hysteresis before applying scale-down, in milliseconds.");
+
+DEFINE_uint32(blitzscale_tokens_prefilled_per_sec,
+              4096,
+              "BlitzScale per-replica prefill throughput in tokens/sec.");
+
+DEFINE_uint32(blitzscale_tokens_transferred_per_sec,
+              4096,
+              "BlitzScale per-replica migration/decode throughput in tokens/sec.");
+
+DEFINE_uint32(blitzscale_max_blocks_per_replica,
+              16384,
+              "BlitzScale maximum KV blocks per replica.");
+
+DEFINE_double(blitzscale_prefill_lower_bound,
+              0.5,
+              "BlitzScale lower prefill throughput bound.");
+
+DEFINE_double(blitzscale_prefill_upper_bound,
+              0.8,
+              "BlitzScale upper prefill throughput bound.");
+
+DEFINE_double(blitzscale_decode_lower_bound,
+              0.5,
+              "BlitzScale lower decode memory-pressure bound.");
+
+DEFINE_double(blitzscale_decode_upper_bound,
+              0.8,
+              "BlitzScale upper decode memory-pressure bound.");
+
+DEFINE_double(blitzscale_migration_lower_bound,
+              0.5,
+              "BlitzScale lower migration-bandwidth bound.");
+
+DEFINE_double(blitzscale_migration_upper_bound,
+              0.8,
+              "BlitzScale upper migration-bandwidth bound.");
+
+DEFINE_int32(blitzscale_min_prefill_instances,
+             1,
+             "BlitzScale minimum prefill replicas for an active model.");
+
+DEFINE_int32(blitzscale_max_prefill_instances,
+             8,
+             "BlitzScale maximum prefill replicas for an active model.");
+
+DEFINE_int32(blitzscale_min_decode_instances,
+             1,
+             "BlitzScale minimum decode replicas for an active model.");
+
+DEFINE_int32(blitzscale_max_decode_instances,
+             8,
+             "BlitzScale maximum decode replicas for an active model.");
+
+DEFINE_int32(blitzscale_max_models_per_instance,
+             4,
+             "BlitzScale maximum number of models colocated on one instance.");
 
 // Llumnix baseline flags
 DEFINE_double(llumnix_schedule_interval_s,

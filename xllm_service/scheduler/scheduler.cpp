@@ -20,6 +20,7 @@ limitations under the License.
 #include "loadbalance_policy/lst_imh_policy.h"
 #include "loadbalance_policy/round_robin.h"
 #include "loadbalance_policy/slo_aware_policy.h"
+#include "scheduler/blitzscale/blitzscale_instance_mgr.h"
 #include "scheduler/prism/prism_instance_mgr.h"
 #include "scheduler/prism/prism_request_tracker.h"
 #include "scheduler/serverless_llm/serverless_llm_instance_mgr.h"
@@ -52,6 +53,7 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
 
   prism_mode_ = (options.baseline_type() == "PRISM");
   serverless_llm_mode_ = (options.baseline_type() == "SERVERLESS_LLM");
+  blitzscale_mode_ = (options.baseline_type() == "BLITZSCALE");
   llumnix_mode_ = (options.baseline_type() == "LLUMNIX");
 
   if (prism_mode_) {
@@ -89,6 +91,48 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
     instance_mgr_ = sllm_mgr;  // polymorphic assignment
 
     LOG(INFO) << "Scheduler: ServerlessLLM mode enabled";
+  } else if (blitzscale_mode_) {
+    BlitzScaleConfig blitzscale_config;
+    blitzscale_config.schedule_interval_s =
+        options.blitzscale_schedule_interval_s();
+    blitzscale_config.scale_down_threshold_ms =
+        options.blitzscale_scale_down_threshold_ms();
+    blitzscale_config.tokens_prefilled_per_sec =
+        options.blitzscale_tokens_prefilled_per_sec();
+    blitzscale_config.tokens_transferred_per_sec =
+        options.blitzscale_tokens_transferred_per_sec();
+    blitzscale_config.max_blocks_per_replica =
+        options.blitzscale_max_blocks_per_replica();
+    blitzscale_config.block_size = options.block_size();
+    blitzscale_config.prefill_lower_bound =
+        options.blitzscale_prefill_lower_bound();
+    blitzscale_config.prefill_upper_bound =
+        options.blitzscale_prefill_upper_bound();
+    blitzscale_config.decode_lower_bound =
+        options.blitzscale_decode_lower_bound();
+    blitzscale_config.decode_upper_bound =
+        options.blitzscale_decode_upper_bound();
+    blitzscale_config.migration_lower_bound =
+        options.blitzscale_migration_lower_bound();
+    blitzscale_config.migration_upper_bound =
+        options.blitzscale_migration_upper_bound();
+    blitzscale_config.min_prefill_instances =
+        options.blitzscale_min_prefill_instances();
+    blitzscale_config.max_prefill_instances =
+        options.blitzscale_max_prefill_instances();
+    blitzscale_config.min_decode_instances =
+        options.blitzscale_min_decode_instances();
+    blitzscale_config.max_decode_instances =
+        options.blitzscale_max_decode_instances();
+    blitzscale_config.max_models_per_instance =
+        options.blitzscale_max_models_per_instance();
+
+    auto blitzscale_mgr = std::make_shared<BlitzScaleInstanceMgr>(
+        options, etcd_client_, is_master_service_, blitzscale_config);
+    blitzscale_mgr->start_global_scheduler();
+    instance_mgr_ = blitzscale_mgr;
+
+    LOG(INFO) << "Scheduler: BlitzScale mode enabled";
   } else if (llumnix_mode_) {
     LlumnixConfig llumnix_config;
     llumnix_config.schedule_interval_s = options.llumnix_schedule_interval_s();
@@ -239,6 +283,12 @@ void Scheduler::process_request_queue(const std::string& model_name) {
     // ServerlessLLM mode: bypass dual-pool, use ServerlessLLMInstanceMgr dispatch
     if (serverless_llm_mode_) {
       process_serverless_llm_request(request);
+      continue;
+    }
+
+    // BlitzScale mode: bypass dual-pool, use BlitzScaleInstanceMgr dispatch
+    if (blitzscale_mode_) {
+      process_blitzscale_request(request);
       continue;
     }
 
@@ -393,6 +443,48 @@ void Scheduler::process_serverless_llm_request(
              << " to " << request->routing.prefill_name;
 
   // 4. Update request metrics
+  if (request->prompt.size() != 0 && !request->metrics_already_updated) {
+    instance_mgr_->update_request_metrics(request, RequestAction::SCHEDULE);
+  }
+
+  if (request->dispatch_callback) {
+    std::thread([request]() { request->dispatch_callback(); }).detach();
+  }
+}
+
+void Scheduler::process_blitzscale_request(std::shared_ptr<Request> request) {
+  auto blitzscale_mgr =
+      std::static_pointer_cast<BlitzScaleInstanceMgr>(instance_mgr_);
+
+  blitzscale_mgr->enqueue_request(
+      request->model,
+      request->service_request_id,
+      static_cast<int32_t>(request->token_ids.size()));
+
+  bool dispatched = false;
+  for (int retry = 0; retry < 300 && !exited_; ++retry) {
+    if (blitzscale_mgr->dispatch_request(request)) {
+      dispatched = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  if (!dispatched) {
+    LOG(ERROR) << "BlitzScale: timeout waiting for model " << request->model
+               << " request_id=" << request->service_request_id;
+    blitzscale_mgr->finish_request(request->service_request_id);
+    return;
+  }
+
+  blitzscale_mgr->start_running(request->service_request_id,
+                                request->routing.prefill_name,
+                                request->routing.decode_name);
+
+  DLOG(INFO) << "BlitzScale: dispatched " << request->service_request_id
+             << " prefill=" << request->routing.prefill_name
+             << " decode=" << request->routing.decode_name;
+
   if (request->prompt.size() != 0 && !request->metrics_already_updated) {
     instance_mgr_->update_request_metrics(request, RequestAction::SCHEDULE);
   }
@@ -646,6 +738,13 @@ void Scheduler::finish_request(const std::string& service_request_id,
     auto sllm_mgr =
         std::static_pointer_cast<ServerlessLLMInstanceMgr>(instance_mgr_);
     sllm_mgr->finish_request(service_request_id);
+  }
+
+  // Notify BlitzScale tracker of request completion
+  if (blitzscale_mode_) {
+    auto blitzscale_mgr =
+        std::static_pointer_cast<BlitzScaleInstanceMgr>(instance_mgr_);
+    blitzscale_mgr->finish_request(service_request_id);
   }
 
   // Notify Llumnix tracker of request completion

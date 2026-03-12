@@ -624,6 +624,27 @@ struct ServerlessLLMConfig {
   double dispatch_poll_interval_ms = 100.0;      // Dispatch polling interval
 };
 
+// BlitzScale baseline configuration
+struct BlitzScaleConfig {
+  double schedule_interval_s = 1.0;              // Global scheduling interval
+  double scale_down_threshold_ms = 5000.0;       // Hysteresis before scale-down
+  uint32_t tokens_prefilled_per_sec = 4096;      // Prefill throughput per replica
+  uint32_t tokens_transferred_per_sec = 4096;    // Migration/decode throughput per replica
+  uint32_t max_blocks_per_replica = 16384;       // KV blocks per replica
+  uint32_t block_size = 16;                      // Tokens per KV block
+  double prefill_lower_bound = 0.5;              // Lower utilization bound
+  double prefill_upper_bound = 0.8;              // Upper utilization bound
+  double decode_lower_bound = 0.5;               // Lower memory-pressure bound
+  double decode_upper_bound = 0.8;               // Upper memory-pressure bound
+  double migration_lower_bound = 0.5;            // Lower migration-bandwidth bound
+  double migration_upper_bound = 0.8;            // Upper migration-bandwidth bound
+  int32_t min_prefill_instances = 1;             // Min prefill replicas when active
+  int32_t max_prefill_instances = 8;             // Max prefill replicas
+  int32_t min_decode_instances = 1;              // Min decode replicas when active
+  int32_t max_decode_instances = 8;              // Max decode replicas
+  int32_t max_models_per_instance = 4;           // Max colocated models per instance
+};
+
 // Llumnix baseline configuration
 struct LlumnixConfig {
   double schedule_interval_s = 1.0;              // Global scheduling interval

@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 #include "common/macros.h"
@@ -78,8 +79,8 @@ class Options {
   // LST-IMH pre-pull threshold in milliseconds
   PROPERTY(int32_t, lst_imh_pre_pull_ms) = 0;
 
-  // Prism baseline options
-  PROPERTY(std::string, baseline_type);  // "" = default, "PRISM" = Prism mode
+  // Baseline options
+  PROPERTY(std::string, baseline_type);  // "" | "PRISM" | "SERVERLESS_LLM" | "LLUMNIX" | "BLITZSCALE"
   PROPERTY(double, prism_schedule_interval_s) = 5.0;
   PROPERTY(double, prism_memory_pool_budget_gb) = 6.0;
   PROPERTY(double, prism_idle_threshold_s) = 50.0;
@@ -99,6 +100,24 @@ class Options {
   PROPERTY(int32_t, sllm_max_instances) = 8;
   PROPERTY(bool, sllm_enable_knapsack) = true;
   PROPERTY(int32_t, sllm_max_models_per_instance) = 4;
+
+  // BlitzScale baseline options
+  PROPERTY(double, blitzscale_schedule_interval_s) = 1.0;
+  PROPERTY(double, blitzscale_scale_down_threshold_ms) = 5000.0;
+  PROPERTY(uint32_t, blitzscale_tokens_prefilled_per_sec) = 4096;
+  PROPERTY(uint32_t, blitzscale_tokens_transferred_per_sec) = 4096;
+  PROPERTY(uint32_t, blitzscale_max_blocks_per_replica) = 16384;
+  PROPERTY(double, blitzscale_prefill_lower_bound) = 0.5;
+  PROPERTY(double, blitzscale_prefill_upper_bound) = 0.8;
+  PROPERTY(double, blitzscale_decode_lower_bound) = 0.5;
+  PROPERTY(double, blitzscale_decode_upper_bound) = 0.8;
+  PROPERTY(double, blitzscale_migration_lower_bound) = 0.5;
+  PROPERTY(double, blitzscale_migration_upper_bound) = 0.8;
+  PROPERTY(int32_t, blitzscale_min_prefill_instances) = 1;
+  PROPERTY(int32_t, blitzscale_max_prefill_instances) = 8;
+  PROPERTY(int32_t, blitzscale_min_decode_instances) = 1;
+  PROPERTY(int32_t, blitzscale_max_decode_instances) = 8;
+  PROPERTY(int32_t, blitzscale_max_models_per_instance) = 4;
 
   // Llumnix baseline options
   PROPERTY(double, llumnix_schedule_interval_s) = 1.0;

@@ -21,6 +21,7 @@ limitations under the License.
 #include "common/options.h"
 #include "common/threadpool.h"
 #include "common/xllm/output.h"
+#include "blitzscale/blitzscale_instance_mgr.h"
 #include "etcd_client/etcd_client.h"
 #include "loadbalance_policy/loadbalance_policy.h"
 #include "managers/global_kvcache_mgr.h"
@@ -92,6 +93,9 @@ class Scheduler final {
   // ServerlessLLM mode: process request through ServerlessLLMInstanceMgr
   void process_serverless_llm_request(std::shared_ptr<Request> request);
 
+  // BlitzScale mode: process request through BlitzScaleInstanceMgr
+  void process_blitzscale_request(std::shared_ptr<Request> request);
+
   // Llumnix mode: process request through LlumnixInstanceMgr
   void process_llumnix_request(std::shared_ptr<Request> request);
 
@@ -109,6 +113,9 @@ class Scheduler final {
 
   // ServerlessLLM mode flag
   bool serverless_llm_mode_ = false;
+
+  // BlitzScale mode flag
+  bool blitzscale_mode_ = false;
 
   // Llumnix mode flag
   bool llumnix_mode_ = false;

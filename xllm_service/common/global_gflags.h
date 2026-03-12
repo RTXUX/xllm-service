@@ -97,6 +97,24 @@ DECLARE_int32(sllm_max_instances);
 DECLARE_bool(sllm_enable_knapsack);
 DECLARE_int32(sllm_max_models_per_instance);
 
+// BlitzScale baseline flags
+DECLARE_double(blitzscale_schedule_interval_s);
+DECLARE_double(blitzscale_scale_down_threshold_ms);
+DECLARE_uint32(blitzscale_tokens_prefilled_per_sec);
+DECLARE_uint32(blitzscale_tokens_transferred_per_sec);
+DECLARE_uint32(blitzscale_max_blocks_per_replica);
+DECLARE_double(blitzscale_prefill_lower_bound);
+DECLARE_double(blitzscale_prefill_upper_bound);
+DECLARE_double(blitzscale_decode_lower_bound);
+DECLARE_double(blitzscale_decode_upper_bound);
+DECLARE_double(blitzscale_migration_lower_bound);
+DECLARE_double(blitzscale_migration_upper_bound);
+DECLARE_int32(blitzscale_min_prefill_instances);
+DECLARE_int32(blitzscale_max_prefill_instances);
+DECLARE_int32(blitzscale_min_decode_instances);
+DECLARE_int32(blitzscale_max_decode_instances);
+DECLARE_int32(blitzscale_max_models_per_instance);
+
 // Llumnix baseline flags
 DECLARE_double(llumnix_schedule_interval_s);
 DECLARE_double(llumnix_idle_threshold_s);

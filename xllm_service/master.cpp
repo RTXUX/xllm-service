@@ -214,6 +214,33 @@ int main(int argc, char* argv[]) {
       .sllm_max_instances(FLAGS_sllm_max_instances)
       .sllm_enable_knapsack(FLAGS_sllm_enable_knapsack)
       .sllm_max_models_per_instance(FLAGS_sllm_max_models_per_instance)
+      .blitzscale_schedule_interval_s(FLAGS_blitzscale_schedule_interval_s)
+      .blitzscale_scale_down_threshold_ms(
+          FLAGS_blitzscale_scale_down_threshold_ms)
+      .blitzscale_tokens_prefilled_per_sec(
+          FLAGS_blitzscale_tokens_prefilled_per_sec)
+      .blitzscale_tokens_transferred_per_sec(
+          FLAGS_blitzscale_tokens_transferred_per_sec)
+      .blitzscale_max_blocks_per_replica(
+          FLAGS_blitzscale_max_blocks_per_replica)
+      .blitzscale_prefill_lower_bound(FLAGS_blitzscale_prefill_lower_bound)
+      .blitzscale_prefill_upper_bound(FLAGS_blitzscale_prefill_upper_bound)
+      .blitzscale_decode_lower_bound(FLAGS_blitzscale_decode_lower_bound)
+      .blitzscale_decode_upper_bound(FLAGS_blitzscale_decode_upper_bound)
+      .blitzscale_migration_lower_bound(
+          FLAGS_blitzscale_migration_lower_bound)
+      .blitzscale_migration_upper_bound(
+          FLAGS_blitzscale_migration_upper_bound)
+      .blitzscale_min_prefill_instances(
+          FLAGS_blitzscale_min_prefill_instances)
+      .blitzscale_max_prefill_instances(
+          FLAGS_blitzscale_max_prefill_instances)
+      .blitzscale_min_decode_instances(
+          FLAGS_blitzscale_min_decode_instances)
+      .blitzscale_max_decode_instances(
+          FLAGS_blitzscale_max_decode_instances)
+      .blitzscale_max_models_per_instance(
+          FLAGS_blitzscale_max_models_per_instance)
       .llumnix_schedule_interval_s(FLAGS_llumnix_schedule_interval_s)
       .llumnix_idle_threshold_s(FLAGS_llumnix_idle_threshold_s)
       .llumnix_migrate_out_load_threshold(FLAGS_llumnix_migrate_out_load_threshold)
@@ -224,7 +251,10 @@ int main(int argc, char* argv[]) {
       .llumnix_dispatch_load_metric(FLAGS_llumnix_dispatch_load_metric)
       .llumnix_migration_load_metric(FLAGS_llumnix_migration_load_metric)
       .llumnix_dispatch_policy(FLAGS_llumnix_dispatch_policy)
-      .llumnix_migration_policy(FLAGS_llumnix_migration_policy);
+      .llumnix_migration_policy(FLAGS_llumnix_migration_policy)
+      .llumnix_dispatch_busy_threshold(FLAGS_llumnix_dispatch_busy_threshold)
+      .llumnix_dispatch_busy_threshold_remaining_steps(
+          FLAGS_llumnix_dispatch_busy_threshold_remaining_steps);
 
   xllm_service::Master master(options);
 
