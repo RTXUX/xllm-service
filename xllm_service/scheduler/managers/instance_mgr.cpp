@@ -74,6 +74,14 @@ void InstanceMgr::init() {
   init_model_memory_specs();
   init_model_resource_coefficients();
 
+  {
+    std::unique_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
+    for (const auto& model_pair : MODELS) {
+      model_instance_mgrs_.try_emplace(
+          model_pair.first, std::make_shared<ModelInstanceMgr>(model_pair.first));
+    }
+  }
+
   // Start steady pool repack timer thread
   static constexpr int kRepackIntervalSeconds = 30;
   repack_thread_ = std::make_unique<std::thread>([this]() {
