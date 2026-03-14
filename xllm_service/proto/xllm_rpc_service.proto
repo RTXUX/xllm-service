@@ -165,6 +165,24 @@ message ServiceConfig {
   bool enable_decode_response_to_service = 1;
 }
 
+enum PoolType {
+  POOL_NONE = 0;
+  POOL_NORMAL = 1;
+  POOL_PREFILL = 2;
+  POOL_DECODE = 3;
+}
+
+message PoolAssignRequest {
+  string instance_name = 1;
+  string model_id = 2;
+  PoolType pool = 3;
+}
+
+message PoolAssignResponse {
+  bool ok = 1;
+  string error_message = 2;
+}
+
 service XllmRpcService {
   rpc Hello(Empty) returns (Status) {}
   rpc RegisterInstance(InstanceMetaInfo) returns (StatusCode) {}
@@ -177,5 +195,12 @@ service XllmRpcService {
   // xllm service receive response from decode instance directly in disagg pd mode.
   // This can eliminate the cost brought by forwarding through prefill.
   rpc Generations(DisaggStreamGenerations) returns (StatusSet) {}
+
+  // Pool management RPCs for MIX PD scheduling
+  // AssignPool: wake up model_id on instance_name with the given role tag (pool).
+  rpc AssignPool(PoolAssignRequest) returns (PoolAssignResponse) {}
+  // RemoveFromPool: sleep model_id on instance_name; tag auto-resets to NONE
+  // when no models remain awake on that instance.
+  rpc RemoveFromPool(PoolAssignRequest) returns (PoolAssignResponse) {}
 }
 

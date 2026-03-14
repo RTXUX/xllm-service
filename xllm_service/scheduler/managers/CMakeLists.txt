@@ -22,6 +22,7 @@ cc_library(
     absl::strings
     glog::glog
     proto::proto_rpc_service
+    proto::proto_disagg_pd_link
     proto_xllm
 )
 target_link_libraries(managers PRIVATE brpc-static)

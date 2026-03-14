@@ -126,3 +126,8 @@ DEFINE_double(gpu_hbm_per_gpu_gb,
 DEFINE_double(gpu_compute_sm_per_gpu,
               1.0,
               "Compute SM units per GPU, used for auto-scaling resource model.");
+
+DEFINE_bool(enable_mix_pd,
+            false,
+            "Enable MixPD instance tagging: each MIX instance gets a role tag "
+            "(PREFILL/DECODE/NORMAL) and LST-IMH routes accordingly.");

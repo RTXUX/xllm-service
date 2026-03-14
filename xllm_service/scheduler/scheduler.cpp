@@ -258,6 +258,18 @@ void Scheduler::handle_instance_heartbeat(const proto::HeartbeatRequest* req) {
   }
 }
 
+void Scheduler::wakeup_model(const std::string& instance_name,
+                             const std::string& model_id,
+                             InstanceTag tag) {
+  instance_mgr_->send_model_wakeup(instance_name, model_id,
+                                   /*memory_increased_in_advance=*/false, tag);
+}
+
+void Scheduler::sleep_model(const std::string& instance_name,
+                            const std::string& model_id) {
+  instance_mgr_->send_model_sleep(instance_name, model_id);
+}
+
 void Scheduler::handle_master_service_watch(const etcd::Response& response,
                                             const uint64_t& prefix_len) {
   if (exited_ || response.events().empty()) {

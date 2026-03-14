@@ -111,7 +111,8 @@ class InstanceMgr final {
 
   void send_model_wakeup(const std::string& instance_name,
                          const std::string& model_id,
-                         bool memory_increased_in_advance);
+                         bool memory_increased_in_advance,
+                         InstanceTag tag = InstanceTag::NONE);
 
   void update_model_heat(const std::string& model_id,
                          int64_t token_count);
@@ -119,6 +120,9 @@ class InstanceMgr final {
   int32_t get_wakeup_count(const std::string& model_id);
 
   std::vector<std::string> get_awake_instances(const std::string& model_id);
+  std::vector<std::string> get_awake_decode_instances(const std::string& model_id);
+  int count_awake_models_on_instance(const std::string& instance_name);
+  InstanceTag get_instance_tag(const std::string& instance_name) const;
   bool is_model_waking_up(const std::string& model_id);
 
   // Trigger per-request auto-scaling. Computes GPU targets for elastic pool models
@@ -225,6 +229,10 @@ class InstanceMgr final {
 
   // Get number of GPUs reserved by the steady pool
   int32_t steady_needed_gpus();
+
+  // Bidirectional D2D linking between a new instance and its peers (MixPD)
+  void link_instance_bidirectional(const std::string& instance_name,
+                                   const std::vector<std::string>& peer_names);
 
  private:
 
@@ -384,6 +392,10 @@ class InstanceMgr final {
   // Instances that have completed fork_master for all models (ready for D2D linking)
   std::mutex fork_done_mutex_;
   std::unordered_set<std::string> fork_done_instances_;
+
+  // MixPD instance role tags
+  mutable std::shared_mutex tag_mutex_;
+  std::unordered_map<std::string, InstanceTag> instance_tag_map_;
 
   ThreadPool threadpool_;
 };

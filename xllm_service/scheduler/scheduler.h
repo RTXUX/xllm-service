@@ -54,6 +54,13 @@ class Scheduler final {
 
   void handle_instance_heartbeat(const proto::HeartbeatRequest* req);
 
+  // MixPD: wakeup/sleep model with instance tag
+  void wakeup_model(const std::string& instance_name,
+                    const std::string& model_id,
+                    InstanceTag tag);
+  void sleep_model(const std::string& instance_name,
+                   const std::string& model_id);
+
   void exited() { exited_ = true; }
 
   // register new requests from http service

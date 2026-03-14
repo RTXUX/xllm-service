@@ -63,6 +63,19 @@ ServiceConfig XllmRpcServiceImpl::get_config() {
   return ServiceConfig(enable_decode_response_to_service_);
 }
 
+bool XllmRpcServiceImpl::wakeup_model(const std::string& instance_name,
+                                      const std::string& model_id,
+                                      InstanceTag tag) {
+  scheduler_->wakeup_model(instance_name, model_id, tag);
+  return true;
+}
+
+bool XllmRpcServiceImpl::sleep_model(const std::string& instance_name,
+                                     const std::string& model_id) {
+  scheduler_->sleep_model(instance_name, model_id);
+  return true;
+}
+
 XllmRpcService::XllmRpcService(const Options& options, Scheduler* scheduler) {
   xllm_rpc_service_impl_ =
       std::make_unique<XllmRpcServiceImpl>(options, scheduler);
@@ -220,6 +233,61 @@ void XllmRpcService::GetConfig(google::protobuf::RpcController* cntl_base,
   auto config = xllm_rpc_service_impl_->get_config();
   resp->set_enable_decode_response_to_service(
       config.enable_decode_response_to_service);
+}
+
+void XllmRpcService::AssignPool(google::protobuf::RpcController* cntl_base,
+                                const proto::PoolAssignRequest* req,
+                                proto::PoolAssignResponse* resp,
+                                google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+
+  InstanceTag tag;
+  switch (req->pool()) {
+    case proto::POOL_NONE:
+      tag = InstanceTag::NONE;
+      break;
+    case proto::POOL_NORMAL:
+      tag = InstanceTag::NORMAL;
+      break;
+    case proto::POOL_PREFILL:
+      tag = InstanceTag::PREFILL;
+      break;
+    case proto::POOL_DECODE:
+      tag = InstanceTag::DECODE;
+      break;
+    default:
+      resp->set_ok(false);
+      resp->set_error_message("Invalid pool type");
+      return;
+  }
+
+  LOG(INFO) << "AssignPool: instance=" << req->instance_name()
+            << " model=" << req->model_id()
+            << " tag=" << static_cast<int>(tag);
+
+  bool ok = xllm_rpc_service_impl_->wakeup_model(
+      req->instance_name(), req->model_id(), tag);
+  resp->set_ok(ok);
+  if (!ok) {
+    resp->set_error_message("Failed to wakeup model with tag");
+  }
+}
+
+void XllmRpcService::RemoveFromPool(google::protobuf::RpcController* cntl_base,
+                                    const proto::PoolAssignRequest* req,
+                                    proto::PoolAssignResponse* resp,
+                                    google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+
+  LOG(INFO) << "RemoveFromPool: instance=" << req->instance_name()
+            << " model=" << req->model_id();
+
+  bool ok = xllm_rpc_service_impl_->sleep_model(
+      req->instance_name(), req->model_id());
+  resp->set_ok(ok);
+  if (!ok) {
+    resp->set_error_message("Failed to sleep model");
+  }
 }
 
 }  // namespace xllm_service

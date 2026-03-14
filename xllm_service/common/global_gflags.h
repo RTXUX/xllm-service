@@ -74,3 +74,5 @@ DECLARE_bool(enable_prefill_only_mode);
 DECLARE_double(gpu_hbm_per_gpu_gb);
 
 DECLARE_double(gpu_compute_sm_per_gpu);
+
+DECLARE_bool(enable_mix_pd);

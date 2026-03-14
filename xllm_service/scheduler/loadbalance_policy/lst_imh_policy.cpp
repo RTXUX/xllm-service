@@ -24,6 +24,8 @@ limitations under the License.
 #include <random>
 #include <unordered_set>
 
+#include "common/types.h"
+
 namespace xllm_service {
 
 LstImhPolicy::LstImhPolicy(const Options& options,
@@ -293,7 +295,28 @@ void LstImhPolicy::dispatch_coordinator() {
 
         // Set routing.
         request->routing.prefill_name = instance;
-        request->routing.decode_name = instance;
+
+        // MixPD-aware decode routing
+        if (options_.enable_mix_pd()) {
+          auto tag = instance_mgr_->get_instance_tag(instance);
+          if (tag == InstanceTag::PREFILL) {
+            // PREFILL-tagged: round-robin select from decode instances
+            auto decode_instances = instance_mgr_->get_awake_decode_instances(model);
+            if (!decode_instances.empty()) {
+              request->routing.decode_name =
+                  decode_instances[decode_rr_idx_ % decode_instances.size()];
+              ++decode_rr_idx_;
+            } else {
+              // Fallback: self-decode if no decode instances available
+              request->routing.decode_name = instance;
+            }
+          } else {
+            // NORMAL or NONE tagged: self-decode
+            request->routing.decode_name = instance;
+          }
+        } else {
+          request->routing.decode_name = instance;
+        }
         request->estimated_ttft = job.processing_time_ms;
 
         // Update request metrics eagerly (prevents double-allocation within

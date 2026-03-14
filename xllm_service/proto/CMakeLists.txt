@@ -10,6 +10,13 @@ proto_library(
 
 proto_library(
   NAME
+    proto_disagg_pd_link
+  SRCS
+    disagg_pd_link.proto
+)
+
+proto_library(
+  NAME
     proto_http_service
   SRCS
     xllm_http_service.proto

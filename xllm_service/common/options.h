@@ -77,6 +77,9 @@ class Options {
 
   // LST-IMH pre-pull threshold in milliseconds
   PROPERTY(int32_t, lst_imh_pre_pull_ms) = 0;
+
+  // MixPD instance tagging
+  PROPERTY(bool, enable_mix_pd) = false;
 };
 
 }  // namespace xllm_service

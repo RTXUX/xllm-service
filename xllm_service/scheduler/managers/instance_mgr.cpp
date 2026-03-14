@@ -33,6 +33,7 @@ limitations under the License.
 #include "common/global_gflags.h"
 #include "common/types.h"
 #include "common/utils.h"
+#include "disagg_pd_link.pb.h"
 
 namespace xllm_service {
 
@@ -224,7 +225,8 @@ std::vector<std::string> InstanceMgr::get_static_decode_list(
   std::vector<std::string> decode_list;
   std::shared_lock<std::shared_mutex> lock(inst_mutex_);
   for (auto& inst : instances_) {
-    if (inst.second.type == InstanceType::DECODE) {
+    if (inst.second.type == InstanceType::DECODE ||
+        inst.second.type == InstanceType::MIX) {
       decode_list.emplace_back(inst.second.name);
     }
   }
@@ -238,7 +240,8 @@ std::vector<std::string> InstanceMgr::get_static_prefill_list(
   std::shared_lock<std::shared_mutex> lock(inst_mutex_);
   for (auto& inst : instances_) {
     if (inst.second.type == InstanceType::PREFILL ||
-        inst.second.type == InstanceType::DEFAULT) {
+        inst.second.type == InstanceType::DEFAULT ||
+        inst.second.type == InstanceType::MIX) {
       prefill_list.emplace_back(inst.second.name);
     }
   }
@@ -367,6 +370,17 @@ void InstanceMgr::fork_master_and_sleep(
       std::lock_guard<std::mutex> lock(fork_done_mutex_);
       fork_done_instances_.insert(instance_name);
     }
+  }
+
+  // Bidirectional DisaggPD RPC linking with all ready peers
+  {
+    std::vector<std::string> done_peers;
+    {
+      std::lock_guard<std::mutex> lock(fork_done_mutex_);
+      done_peers.assign(fork_done_instances_.begin(),
+                        fork_done_instances_.end());
+    }
+    link_instance_bidirectional(instance_name, done_peers);
   }
 }
 
@@ -1159,16 +1173,39 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
   if (model_mgr->send_model_sleep(instance_name, channel)) {
     LOG(INFO) << "Model " << model_id << " on " << instance_name
               << " sleep successful. Memory freed will be reflected in next heartbeat.";
+
+    // MixPD: auto-reset tag to NONE when no awake models remain on this instance
+    if (options_.enable_mix_pd()) {
+      if (count_awake_models_on_instance(instance_name) == 0) {
+        std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+        instance_tag_map_[instance_name] = InstanceTag::NONE;
+        LOG(INFO) << "MixPD: Reset tag for " << instance_name << " to NONE (no awake models)";
+      }
+    }
   }
 }
 
 void InstanceMgr::send_model_wakeup(const std::string& instance_name,
                                     const std::string& model_id,
-                                    bool memory_increased_in_advance) {
+                                    bool memory_increased_in_advance,
+                                    InstanceTag tag) {
 
   if (instance_name.empty() || instance_name == "all") {
     LOG(ERROR) << "Only support fixed instance_name for model trigger now.";
     return;
+  }
+
+  // MixPD tag validation: PREFILL/DECODE instances are limited to 1 awake model
+  if (options_.enable_mix_pd() &&
+      (tag == InstanceTag::PREFILL || tag == InstanceTag::DECODE)) {
+    int awake_count = count_awake_models_on_instance(instance_name);
+    if (awake_count > 0) {
+      LOG(ERROR) << "MixPD: Cannot wakeup model " << model_id << " on "
+                 << instance_name << " with tag "
+                 << static_cast<int>(tag)
+                 << " — instance already has " << awake_count << " awake model(s)";
+      return;
+    }
   }
 
   auto model_mgr = get_model_instance_mgr(model_id);
@@ -1202,6 +1239,14 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
   if (wakeup_success) {
     LOG(INFO) << "Model " << model_id << " wakeup successful on " << instance_name
               << ". Memory usage will be reflected in next heartbeat.";
+
+    // MixPD: assign tag after successful wakeup
+    if (options_.enable_mix_pd() && tag != InstanceTag::NONE) {
+      std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+      instance_tag_map_[instance_name] = tag;
+      LOG(INFO) << "MixPD: Set tag for " << instance_name << " to "
+                << static_cast<int>(tag);
+    }
   } else {
     LOG(ERROR) << "Failed to wakeup model " << model_id
                << " on " << instance_name;
@@ -1262,7 +1307,21 @@ bool InstanceMgr::is_model_waking_up(const std::string& model_id) {
 
 std::vector<std::string> InstanceMgr::get_awake_instances(const std::string& model_id) {
   auto model_mgr = get_model_instance_mgr(model_id);
-  return model_mgr->get_awake_instances();
+  auto all_instances = model_mgr->get_awake_instances();
+
+  // MixPD: exclude DECODE-only instances from prefill routing
+  if (options_.enable_mix_pd()) {
+    std::vector<std::string> filtered;
+    for (const auto& inst : all_instances) {
+      auto tag = get_instance_tag(inst);
+      if (tag != InstanceTag::DECODE) {
+        filtered.push_back(inst);
+      }
+    }
+    return filtered;
+  }
+
+  return all_instances;
 }
 
 void InstanceMgr::update_model_heat(const std::string& model_id,
@@ -2557,6 +2616,196 @@ void InstanceMgr::elastic_to_steady_demotion() {
 
     LOG(INFO) << "elastic_to_steady_demotion: model " << model_id
               << " successfully demoted to STEADY on " << steady_instance;
+  }
+}
+
+std::vector<std::string> InstanceMgr::get_awake_decode_instances(const std::string& model_id) {
+  auto model_mgr = get_model_instance_mgr(model_id);
+  auto all_instances = model_mgr->get_awake_instances();
+
+  std::vector<std::string> decode_instances;
+  for (const auto& inst : all_instances) {
+    auto tag = get_instance_tag(inst);
+    if (tag == InstanceTag::DECODE) {
+      decode_instances.push_back(inst);
+    }
+  }
+  return decode_instances;
+}
+
+int InstanceMgr::count_awake_models_on_instance(const std::string& instance_name) {
+  int count = 0;
+  std::shared_lock<std::shared_mutex> lock(model_instance_mgr_mutex_);
+  for (const auto& [model_id, mgr] : model_instance_mgrs_) {
+    auto awake = mgr->get_awake_instances();
+    for (const auto& inst : awake) {
+      if (inst == instance_name) {
+        ++count;
+        break;
+      }
+    }
+  }
+  return count;
+}
+
+InstanceTag InstanceMgr::get_instance_tag(const std::string& instance_name) const {
+  std::shared_lock<std::shared_mutex> lock(tag_mutex_);
+  auto it = instance_tag_map_.find(instance_name);
+  if (it != instance_tag_map_.end()) {
+    return it->second;
+  }
+  return InstanceTag::NONE;
+}
+
+void InstanceMgr::link_instance_bidirectional(
+    const std::string& instance_name,
+    const std::vector<std::string>& peer_names) {
+  auto parse_device_addr = [](const std::string& device_addr,
+                              std::string* device_ip,
+                              uint32_t* port) -> bool {
+    const auto pos = device_addr.rfind(':');
+    if (pos == std::string::npos || pos == 0 || pos + 1 >= device_addr.size()) {
+      return false;
+    }
+    std::string ip = device_addr.substr(0, pos);
+    std::string port_str = device_addr.substr(pos + 1);
+    try {
+      unsigned long parsed = std::stoul(port_str);
+      if (parsed > std::numeric_limits<uint32_t>::max()) {
+        return false;
+      }
+      *device_ip = std::move(ip);
+      *port = static_cast<uint32_t>(parsed);
+      return true;
+    } catch (...) {
+      return false;
+    }
+  };
+
+  auto build_link_instance_req =
+      [&parse_device_addr](const std::string& source_name,
+                           const InstanceMetaInfo& source_info,
+                           xllm::proto::InstanceClusterInfo* req) -> bool {
+    if (source_name.empty() || req == nullptr) {
+      return false;
+    }
+    if (source_info.cluster_ids.empty() || source_info.addrs.empty() ||
+        source_info.device_addrs.empty() || source_info.dp_size <= 0) {
+      return false;
+    }
+    if (source_info.cluster_ids.size() != source_info.addrs.size() ||
+        source_info.cluster_ids.size() != source_info.device_addrs.size()) {
+      return false;
+    }
+
+    req->set_instance_name(source_name);
+    for (const auto cluster_id : source_info.cluster_ids) {
+      req->add_cluster_ids(cluster_id);
+    }
+    for (const auto& addr : source_info.addrs) {
+      req->add_addrs(addr);
+    }
+    for (const auto& device_addr : source_info.device_addrs) {
+      std::string ip;
+      uint32_t port = 0;
+      if (!parse_device_addr(device_addr, &ip, &port)) {
+        return false;
+      }
+      req->add_device_ips(ip);
+      req->add_ports(port);
+    }
+    req->set_dp_size(source_info.dp_size);
+    return true;
+  };
+
+  auto do_link_instance =
+      [this](const std::string& target_name,
+             const std::string& target_rpc_address,
+             const xllm::proto::InstanceClusterInfo& req) -> bool {
+    brpc::Channel rpc_channel;
+    brpc::ChannelOptions rpc_options;
+    rpc_options.timeout_ms = options_.timeout_ms();
+    rpc_options.max_retry = 3;
+    std::string load_balancer = "";
+    if (rpc_channel.Init(
+            target_rpc_address.c_str(), load_balancer.c_str(), &rpc_options) !=
+        0) {
+      LOG(WARNING) << "Failed to init LinkInstance channel to " << target_name
+                   << " (" << target_rpc_address << ")";
+      return false;
+    }
+
+    xllm::proto::DisaggPDService_Stub stub(&rpc_channel);
+    xllm::proto::Status resp;
+    brpc::Controller cntl;
+    stub.LinkInstance(&cntl, &req, &resp, nullptr);
+    if (cntl.Failed()) {
+      LOG(WARNING) << "LinkInstance RPC failed to " << target_name
+                   << ": " << cntl.ErrorText();
+      return false;
+    }
+    if (!resp.ok()) {
+      LOG(WARNING) << "LinkInstance RPC returned not-ok from " << target_name;
+      return false;
+    }
+    return true;
+  };
+
+  InstanceMetaInfo new_meta_info;
+  std::unordered_map<std::string, InstanceMetaInfo> peer_meta_infos;
+  {
+    std::shared_lock<std::shared_mutex> lock(inst_mutex_);
+    auto new_it = instances_.find(instance_name);
+    if (new_it != instances_.end()) {
+      new_meta_info = new_it->second;
+    }
+    for (const auto& peer_name : peer_names) {
+      auto peer_it = instances_.find(peer_name);
+      if (peer_it != instances_.end()) {
+        peer_meta_infos.emplace(peer_name, peer_it->second);
+      }
+    }
+  }
+
+  if (!new_meta_info.enable_disagg_pd) {
+    LOG(INFO) << "Skip LinkInstance for " << instance_name
+              << " because enable_disagg_pd is false";
+    return;
+  }
+  if (new_meta_info.rpc_address.empty()) {
+    LOG(WARNING) << "Skip LinkInstance for " << instance_name
+                 << " because rpc_address is empty";
+    return;
+  }
+
+  for (const auto& peer_name : peer_names) {
+    auto peer_it = peer_meta_infos.find(peer_name);
+    if (peer_it == peer_meta_infos.end()) {
+      continue;
+    }
+    const auto& peer_meta_info = peer_it->second;
+    if (!peer_meta_info.enable_disagg_pd || peer_meta_info.rpc_address.empty()) {
+      continue;
+    }
+
+    xllm::proto::InstanceClusterInfo new_to_peer_req;
+    if (!build_link_instance_req(instance_name, new_meta_info, &new_to_peer_req)) {
+      LOG(WARNING) << "Skip LinkInstance to peer " << peer_name
+                   << " due to invalid new instance metadata";
+      continue;
+    }
+
+    xllm::proto::InstanceClusterInfo peer_to_new_req;
+    if (!build_link_instance_req(peer_name, peer_meta_info, &peer_to_new_req)) {
+      LOG(WARNING) << "Skip LinkInstance from peer " << peer_name
+                   << " due to invalid peer metadata";
+      continue;
+    }
+
+    // new -> peer
+    do_link_instance(peer_name, peer_meta_info.rpc_address, new_to_peer_req);
+    // peer -> new
+    do_link_instance(instance_name, new_meta_info.rpc_address, peer_to_new_req);
   }
 }
 

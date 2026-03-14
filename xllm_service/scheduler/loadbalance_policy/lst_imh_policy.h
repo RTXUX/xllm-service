@@ -96,6 +96,9 @@ class LstImhPolicy final : public LoadBalancePolicy {
   bool dispatch_signal_ = false;
 
   std::unique_ptr<std::thread> coordinator_thread_;
+
+  // MixPD decode instance round-robin index
+  size_t decode_rr_idx_ = 0;
 };
 
 }  // namespace xllm_service

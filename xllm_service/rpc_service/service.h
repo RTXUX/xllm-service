@@ -59,6 +59,13 @@ class XllmRpcServiceImpl final {
   // handle generations from prefill/decode instance
   bool handle_generation(const llm::RequestOutput& request_output);
 
+  // MixPD: wakeup/sleep model with instance tag
+  bool wakeup_model(const std::string& instance_name,
+                    const std::string& model_id,
+                    InstanceTag tag);
+  bool sleep_model(const std::string& instance_name,
+                   const std::string& model_id);
+
  private:
   Options options_;
 
@@ -122,6 +129,17 @@ class XllmRpcService : public proto::XllmRpcService {
                          const proto::Empty* req,
                          proto::ServiceConfig* resp,
                          google::protobuf::Closure* done) override;
+
+  // Pool management RPCs for MIX PD scheduling
+  virtual void AssignPool(google::protobuf::RpcController* cntl_base,
+                          const proto::PoolAssignRequest* req,
+                          proto::PoolAssignResponse* resp,
+                          google::protobuf::Closure* done) override;
+
+  virtual void RemoveFromPool(google::protobuf::RpcController* cntl_base,
+                              const proto::PoolAssignRequest* req,
+                              proto::PoolAssignResponse* resp,
+                              google::protobuf::Closure* done) override;
 
  private:
   std::unique_ptr<XllmRpcServiceImpl> xllm_rpc_service_impl_;

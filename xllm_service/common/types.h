@@ -539,6 +539,14 @@ struct GpuHardwareSpec {
 // Dual-pool scheduling types
 enum class PoolType : int8_t { NONE = 0, STEADY = 1, ELASTIC = 2 };
 
+// MixPD instance role tag (orthogonal to PoolType)
+enum class InstanceTag : int8_t {
+  NONE = 0,
+  NORMAL = 1,
+  PREFILL = 2,
+  DECODE = 3,
+};
+
 struct ResourceNeeds {
   double hbm_gb = 0.0;
   double compute_sm = 0.0;
