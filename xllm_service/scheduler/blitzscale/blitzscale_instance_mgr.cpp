@@ -415,6 +415,11 @@ void BlitzScaleInstanceMgr::execute_activate(const std::string& model_id,
 
   uint64_t model_bytes = get_model_size_bytes(model_id);
   deduct_free_pages(instance_name, model_bytes);
+  // Transition model state from SLEEP to ALLOCATED before wakeup
+  auto model_mgr = get_model_instance_mgr(model_id);
+  model_mgr->set_model_state(instance_name, ModelState::ALLOCATED);
+
+  // Use inherited send_model_wakeup (D2D with H2D fallback)
   send_model_wakeup(instance_name, model_id,
                     /*memory_increased_in_advance=*/false);
 
