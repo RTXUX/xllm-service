@@ -32,7 +32,7 @@ DEFINE_int32(http_server_idle_timeout_s,
 DEFINE_int32(http_server_num_threads, 32, "Maximum number of threads to use");
 
 DEFINE_int32(http_server_max_concurrency,
-             128,
+             12800,
              "Limit number of requests processed in parallel");
 
 DEFINE_int32(rpc_server_port, 8889, "Port for xllm rpc service to listen on");
@@ -45,7 +45,7 @@ DEFINE_int32(rpc_server_idle_timeout_s,
 DEFINE_int32(rpc_server_num_threads, 32, "Maximum number of threads to use");
 
 DEFINE_int32(rpc_server_max_concurrency,
-             128,
+             12800,
              "Limit number of requests processed in parallel");
 
 DEFINE_string(etcd_addr,
@@ -59,7 +59,7 @@ DEFINE_int32(port, 8888, "Port for xllm service to listen on");
 DEFINE_int32(num_threads, 32, "Number of threads to process requests");
 
 DEFINE_int32(max_concurrency,
-             128,
+             12800,
              "Limit number of requests processed in parallel");
 
 DEFINE_int32(timeout_ms,
