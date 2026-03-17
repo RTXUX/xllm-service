@@ -1192,7 +1192,10 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
   std::shared_ptr<brpc::Channel> channel = get_channel(instance_name);
 
   // Try to find a D2D source instance (also acquires D2D lock if found)
-  auto d2d_info = find_d2d_source(model_id, instance_name);
+  std::optional<D2DWakeupInfo> d2d_info;
+  if (FLAGS_enable_d2d) {
+    d2d_info = find_d2d_source(model_id, instance_name);
+  }
 
   bool wakeup_success = false;
   if (d2d_info.has_value()) {

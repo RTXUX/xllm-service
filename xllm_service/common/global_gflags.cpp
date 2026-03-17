@@ -201,6 +201,10 @@ DEFINE_bool(sllm_enable_knapsack,
             true,
             "ServerlessLLM enable 0/1 knapsack DP eviction.");
 
+DEFINE_bool(enable_d2d,
+            true,
+            "Enable D2D weight transfer. Set to false to force H2D.");
+
 DEFINE_int32(sllm_max_models_per_instance,
              4,
              "ServerlessLLM maximum number of models colocated on one instance.");

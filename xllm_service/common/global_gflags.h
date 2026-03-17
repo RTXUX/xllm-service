@@ -95,6 +95,7 @@ DECLARE_int32(sllm_target_ongoing_requests);
 DECLARE_int32(sllm_min_instances);
 DECLARE_int32(sllm_max_instances);
 DECLARE_bool(sllm_enable_knapsack);
+DECLARE_bool(enable_d2d);
 DECLARE_int32(sllm_max_models_per_instance);
 
 // BlitzScale baseline flags
