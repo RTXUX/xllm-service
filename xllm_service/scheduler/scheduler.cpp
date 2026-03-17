@@ -455,43 +455,7 @@ void Scheduler::process_serverless_llm_request(
 void Scheduler::process_blitzscale_request(std::shared_ptr<Request> request) {
   auto blitzscale_mgr =
       std::static_pointer_cast<BlitzScaleInstanceMgr>(instance_mgr_);
-
-  blitzscale_mgr->enqueue_request(
-      request->model,
-      request->service_request_id,
-      static_cast<int32_t>(request->token_ids.size()));
-
-  bool dispatched = false;
-  for (int retry = 0; retry < 300 && !exited_; ++retry) {
-    if (blitzscale_mgr->dispatch_request(request)) {
-      dispatched = true;
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
-
-  if (!dispatched) {
-    LOG(ERROR) << "BlitzScale: timeout waiting for model " << request->model
-               << " request_id=" << request->service_request_id;
-    blitzscale_mgr->finish_request(request->service_request_id);
-    return;
-  }
-
-  blitzscale_mgr->start_running(request->service_request_id,
-                                request->routing.prefill_name,
-                                request->routing.decode_name);
-
-  DLOG(INFO) << "BlitzScale: dispatched " << request->service_request_id
-             << " prefill=" << request->routing.prefill_name
-             << " decode=" << request->routing.decode_name;
-
-  if (request->prompt.size() != 0 && !request->metrics_already_updated) {
-    instance_mgr_->update_request_metrics(request, RequestAction::SCHEDULE);
-  }
-
-  if (request->dispatch_callback) {
-    std::thread([request]() { request->dispatch_callback(); }).detach();
-  }
+  blitzscale_mgr->add_pending_request(request);
 }
 
 void Scheduler::process_llumnix_request(std::shared_ptr<Request> request) {
@@ -825,6 +789,13 @@ void Scheduler::update_request_metrics_for_prefill(
   // wake its coordinator, other policies ignore it).
   if (!prefill_instance.empty() && lb_policy_) {
     lb_policy_->on_prefill_done(prefill_instance);
+  }
+
+  // Notify BlitzScale dispatch thread: this prefill instance is now idle
+  if (blitzscale_mode_ && !prefill_instance.empty()) {
+    auto blitzscale_mgr =
+        std::static_pointer_cast<BlitzScaleInstanceMgr>(instance_mgr_);
+    blitzscale_mgr->notify_prefill_done(prefill_instance);
   }
 
 }

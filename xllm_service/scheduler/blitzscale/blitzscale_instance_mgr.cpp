@@ -47,15 +47,64 @@ BlitzScaleInstanceMgr::~BlitzScaleInstanceMgr() {
 
 void BlitzScaleInstanceMgr::enqueue_request(const std::string& model,
                                             const std::string& request_id,
-                                            int32_t prompt_tokens) {
+                                            int32_t prompt_tokens,
+                                            double enqueue_time) {
   std::lock_guard<std::mutex> lock(req_mutex_);
   auto info = std::make_shared<ReqInfo>();
   info->rid = request_id;
   info->model = model;
   info->prompt_tokens = prompt_tokens;
   info->prompt_blocks = get_request_blocks(prompt_tokens);
+  info->enqueue_time = enqueue_time;
   requests_[request_id] = info;
   model_requests_[model].push_back(request_id);
+}
+
+void BlitzScaleInstanceMgr::add_pending_request(
+    std::shared_ptr<Request> request) {
+  const double enqueue_time = now_seconds();
+  const int32_t token_count =
+      static_cast<int32_t>(request->token_ids.size());
+
+  {
+    std::lock_guard<std::mutex> lk(pending_mutex_);
+    pending_queues_[request->model].push_back(request);
+    pending_tokens_[request->model] += token_count;
+  }
+
+  enqueue_request(request->model,
+                  request->service_request_id,
+                  token_count,
+                  enqueue_time);
+
+  dispatch_cv_.notify_one();
+}
+
+void BlitzScaleInstanceMgr::enqueue_idle_prefill(
+    const std::string& model_id, const std::string& instance_name) {
+  {
+    std::lock_guard<std::mutex> lk(pending_mutex_);
+    idle_prefill_queues_[model_id].push_back(instance_name);
+  }
+  dispatch_cv_.notify_one();
+}
+
+void BlitzScaleInstanceMgr::notify_prefill_done(
+    const std::string& prefill_instance) {
+  // Find which model(s) this instance serves as prefill, then re-enqueue it
+  // as idle so the dispatch thread can pair it with the next pending request.
+  std::vector<std::string> models;
+  {
+    std::lock_guard<std::mutex> lk(role_mutex_);
+    for (const auto& [model_id, instances] : prefill_instances_) {
+      if (instances.count(prefill_instance)) {
+        models.push_back(model_id);
+      }
+    }
+  }
+  for (const auto& model_id : models) {
+    enqueue_idle_prefill(model_id, prefill_instance);
+  }
 }
 
 void BlitzScaleInstanceMgr::start_running(const std::string& request_id,
@@ -103,6 +152,8 @@ void BlitzScaleInstanceMgr::finish_request(const std::string& request_id) {
   }
 
   requests_.erase(it);
+
+  dispatch_cv_.notify_one();
 }
 
 bool BlitzScaleInstanceMgr::dispatch_request(std::shared_ptr<Request> request) {
@@ -133,12 +184,45 @@ bool BlitzScaleInstanceMgr::dispatch_request(std::shared_ptr<Request> request) {
   return true;
 }
 
+bool BlitzScaleInstanceMgr::dispatch_with_prefill(
+    std::shared_ptr<Request> request,
+    const std::string& prefill_instance) {
+  // Reject dispatch if the instance hasn't finished waking up yet.
+  // execute_activate enqueues the instance immediately but send_model_wakeup
+  // is async; the instance will be re-enqueued via notify_prefill_done once
+  // it actually processes its first request.
+  auto awake = get_awake_instances(request->model);
+  if (!contains_instance(awake, prefill_instance)) {
+    return false;
+  }
+
+  auto decode = select_decode_instance(
+      request->model, get_request_blocks(request->token_ids.size()));
+  if (!decode.has_value()) {
+    decode = prefill_instance;
+  }
+
+  request->routing.prefill_name = prefill_instance;
+  request->routing.decode_name = *decode;
+
+  std::lock_guard<std::mutex> lock(req_mutex_);
+  auto it = requests_.find(request->service_request_id);
+  if (it != requests_.end()) {
+    it->second->prefill_instance = prefill_instance;
+    it->second->decode_instance = *decode;
+  }
+  return true;
+}
+
 void BlitzScaleInstanceMgr::start_global_scheduler() {
   if (running_.exchange(true)) {
     return;
   }
   sched_thread_ =
       std::make_unique<std::thread>(&BlitzScaleInstanceMgr::scheduling_loop,
+                                    this);
+  dispatch_thread_ =
+      std::make_unique<std::thread>(&BlitzScaleInstanceMgr::dispatch_loop,
                                     this);
   LOG(INFO) << "BlitzScale global scheduler started";
 }
@@ -147,8 +231,12 @@ void BlitzScaleInstanceMgr::stop_global_scheduler() {
   if (!running_.exchange(false)) {
     return;
   }
+  dispatch_cv_.notify_all();
   if (sched_thread_ && sched_thread_->joinable()) {
     sched_thread_->join();
+  }
+  if (dispatch_thread_ && dispatch_thread_->joinable()) {
+    dispatch_thread_->join();
   }
   LOG(INFO) << "BlitzScale global scheduler stopped";
 }
@@ -168,77 +256,209 @@ void BlitzScaleInstanceMgr::scheduling_loop() {
                 << " actions";
       execute_actions(actions);
     }
+    // New capacity may have been created; wake dispatch thread
+    dispatch_cv_.notify_one();
+  }
+}
+
+void BlitzScaleInstanceMgr::dispatch_loop() {
+  while (running_.load()) {
+    {
+      std::unique_lock<std::mutex> lk(pending_mutex_);
+      dispatch_cv_.wait(lk, [this] {
+        if (!running_.load()) return true;
+        for (auto& [model, idle_q] : idle_prefill_queues_) {
+          if (idle_q.empty()) continue;
+          auto pq = pending_queues_.find(model);
+          if (pq != pending_queues_.end() && !pq->second.empty()) return true;
+        }
+        return false;
+      });
+    }
+    if (!running_.load()) break;
+    dispatch_pending_requests();
+  }
+}
+
+void BlitzScaleInstanceMgr::dispatch_pending_requests() {
+  // Collect models that have both an idle prefill instance and a pending request
+  std::vector<std::string> dispatchable_models;
+  {
+    std::lock_guard<std::mutex> lk(pending_mutex_);
+    for (auto& [model, idle_q] : idle_prefill_queues_) {
+      if (idle_q.empty()) continue;
+      auto pq = pending_queues_.find(model);
+      if (pq != pending_queues_.end() && !pq->second.empty()) {
+        dispatchable_models.push_back(model);
+      }
+    }
+  }
+
+  for (const auto& model : dispatchable_models) {
+    while (true) {
+      // Pull one idle prefill instance and the front pending request
+      std::string prefill_instance;
+      std::shared_ptr<Request> front;
+      {
+        std::lock_guard<std::mutex> lk(pending_mutex_);
+        auto idle_it = idle_prefill_queues_.find(model);
+        auto pq_it = pending_queues_.find(model);
+        if (idle_it == idle_prefill_queues_.end() || idle_it->second.empty())
+          break;
+        if (pq_it == pending_queues_.end() || pq_it->second.empty()) break;
+        prefill_instance = idle_it->second.front();
+        front = pq_it->second.front();
+      }
+
+      // Check timeout via enqueue_time stored in ReqInfo
+      double enqueue_time = 0.0;
+      {
+        std::lock_guard<std::mutex> lk(req_mutex_);
+        auto it = requests_.find(front->service_request_id);
+        if (it != requests_.end()) {
+          enqueue_time = it->second->enqueue_time;
+        }
+      }
+      if (enqueue_time > 0.0 && now_seconds() - enqueue_time > 30.0) {
+        {
+          std::lock_guard<std::mutex> lk(pending_mutex_);
+          auto it = pending_queues_.find(model);
+          if (it != pending_queues_.end() && !it->second.empty() &&
+              it->second.front() == front) {
+            pending_tokens_[model] -=
+                static_cast<int32_t>(front->token_ids.size());
+            it->second.pop_front();
+          }
+          // prefill instance stays idle — leave it in the queue for next req
+        }
+        LOG(ERROR) << "BlitzScale: timeout waiting for model " << model
+                   << " request_id=" << front->service_request_id;
+        finish_request(front->service_request_id);
+        continue;
+      }
+
+      // Pull model: dispatch the front request to the specific idle instance
+      if (!dispatch_with_prefill(front, prefill_instance)) {
+        break;  // No decode capacity; wait for next wakeup
+      }
+
+      // Successfully dispatched — consume both the instance and the request
+      {
+        std::lock_guard<std::mutex> lk(pending_mutex_);
+        auto idle_it = idle_prefill_queues_.find(model);
+        if (idle_it != idle_prefill_queues_.end() &&
+            !idle_it->second.empty() &&
+            idle_it->second.front() == prefill_instance) {
+          idle_it->second.pop_front();
+        }
+        auto pq_it = pending_queues_.find(model);
+        if (pq_it != pending_queues_.end() && !pq_it->second.empty() &&
+            pq_it->second.front() == front) {
+          pending_tokens_[model] -=
+              static_cast<int32_t>(front->token_ids.size());
+          pq_it->second.pop_front();
+        }
+      }
+
+      start_running(front->service_request_id,
+                    front->routing.prefill_name,
+                    front->routing.decode_name);
+
+      DLOG(INFO) << "BlitzScale: dispatched " << front->service_request_id
+                 << " prefill=" << front->routing.prefill_name
+                 << " decode=" << front->routing.decode_name;
+
+      if (!front->prompt.empty() && !front->metrics_already_updated) {
+        update_request_metrics(front, RequestAction::SCHEDULE);
+      }
+
+      if (front->dispatch_callback) {
+        std::thread([front]() { front->dispatch_callback(); }).detach();
+      }
+    }
   }
 }
 
 void BlitzScaleInstanceMgr::sync_role_state() {
-  std::lock_guard<std::mutex> lock(role_mutex_);
-  instance_to_models_.clear();
-  model_to_instances_.clear();
+  // Collect instances newly assigned to prefill so we can enqueue them as idle
+  // after releasing role_mutex_ (pending_mutex_ must not be acquired under it).
+  std::vector<std::pair<std::string, std::string>> new_prefill;
 
-  for (const auto& [model_id, _] : MODELS) {
-    auto awake = get_awake_instances(model_id);
-    std::unordered_set<std::string> awake_set(awake.begin(), awake.end());
+  {
+    std::lock_guard<std::mutex> lock(role_mutex_);
+    instance_to_models_.clear();
+    model_to_instances_.clear();
 
-    auto& prefill_set = prefill_instances_[model_id];
-    auto& decode_set = decode_instances_[model_id];
+    for (const auto& [model_id, _] : MODELS) {
+      auto awake = get_awake_instances(model_id);
+      std::unordered_set<std::string> awake_set(awake.begin(), awake.end());
 
-    for (auto it = prefill_set.begin(); it != prefill_set.end();) {
-      if (!awake_set.count(*it)) {
-        it = prefill_set.erase(it);
-      } else {
-        ++it;
-      }
-    }
-    for (auto it = decode_set.begin(); it != decode_set.end();) {
-      if (!awake_set.count(*it)) {
-        it = decode_set.erase(it);
-      } else {
-        ++it;
-      }
-    }
+      auto& prefill_set = prefill_instances_[model_id];
+      auto& decode_set = decode_instances_[model_id];
 
-    for (const auto& instance_name : awake) {
-      const bool in_prefill = prefill_set.count(instance_name) > 0;
-      const bool in_decode = decode_set.count(instance_name) > 0;
-
-      if (in_prefill && in_decode) {
-        if (prefill_set.size() <= decode_set.size()) {
-          decode_set.erase(instance_name);
+      for (auto it = prefill_set.begin(); it != prefill_set.end();) {
+        if (!awake_set.count(*it)) {
+          it = prefill_set.erase(it);
         } else {
-          prefill_set.erase(instance_name);
-        }
-        continue;
-      }
-
-      if (!in_prefill && !in_decode) {
-        const bool need_prefill =
-            static_cast<int32_t>(prefill_set.size()) <
-            config_.min_prefill_instances;
-        const bool need_decode =
-            static_cast<int32_t>(decode_set.size()) <
-            config_.min_decode_instances;
-
-        if (need_prefill && !need_decode) {
-          prefill_set.insert(instance_name);
-        } else if (!need_prefill && need_decode) {
-          decode_set.insert(instance_name);
-        } else if (prefill_set.size() <= decode_set.size()) {
-          prefill_set.insert(instance_name);
-        } else {
-          decode_set.insert(instance_name);
+          ++it;
         }
       }
-    }
+      for (auto it = decode_set.begin(); it != decode_set.end();) {
+        if (!awake_set.count(*it)) {
+          it = decode_set.erase(it);
+        } else {
+          ++it;
+        }
+      }
 
-    for (const auto& instance_name : prefill_set) {
-      instance_to_models_[instance_name].insert(model_id);
-      model_to_instances_[model_id].insert(instance_name);
+      for (const auto& instance_name : awake) {
+        const bool in_prefill = prefill_set.count(instance_name) > 0;
+        const bool in_decode = decode_set.count(instance_name) > 0;
+
+        if (in_prefill && in_decode) {
+          if (prefill_set.size() <= decode_set.size()) {
+            decode_set.erase(instance_name);
+          } else {
+            prefill_set.erase(instance_name);
+          }
+          continue;
+        }
+
+        if (!in_prefill && !in_decode) {
+          const bool need_prefill =
+              static_cast<int32_t>(prefill_set.size()) <
+              config_.min_prefill_instances;
+          const bool need_decode =
+              static_cast<int32_t>(decode_set.size()) <
+              config_.min_decode_instances;
+
+          if (need_prefill && !need_decode) {
+            prefill_set.insert(instance_name);
+            new_prefill.emplace_back(model_id, instance_name);
+          } else if (!need_prefill && need_decode) {
+            decode_set.insert(instance_name);
+          } else if (prefill_set.size() <= decode_set.size()) {
+            prefill_set.insert(instance_name);
+            new_prefill.emplace_back(model_id, instance_name);
+          } else {
+            decode_set.insert(instance_name);
+          }
+        }
+      }
+
+      for (const auto& instance_name : prefill_set) {
+        instance_to_models_[instance_name].insert(model_id);
+        model_to_instances_[model_id].insert(instance_name);
+      }
+      for (const auto& instance_name : decode_set) {
+        instance_to_models_[instance_name].insert(model_id);
+        model_to_instances_[model_id].insert(instance_name);
+      }
     }
-    for (const auto& instance_name : decode_set) {
-      instance_to_models_[instance_name].insert(model_id);
-      model_to_instances_[model_id].insert(instance_name);
-    }
+  }
+
+  for (const auto& [model_id, instance_name] : new_prefill) {
+    enqueue_idle_prefill(model_id, instance_name);
   }
 }
 
@@ -423,13 +643,21 @@ void BlitzScaleInstanceMgr::execute_activate(const std::string& model_id,
   send_model_wakeup(instance_name, model_id,
                     /*memory_increased_in_advance=*/false);
 
-  std::lock_guard<std::mutex> lock(role_mutex_);
-  assign_role_locked(model_id, instance_name, role);
-  instance_to_models_[instance_name].insert(model_id);
-  model_to_instances_[model_id].insert(instance_name);
+  {
+    std::lock_guard<std::mutex> lock(role_mutex_);
+    assign_role_locked(model_id, instance_name, role);
+    instance_to_models_[instance_name].insert(model_id);
+    model_to_instances_[model_id].insert(instance_name);
+  }
 
-  std::lock_guard<std::mutex> lu_lock(last_used_mutex_);
-  model_last_used_[model_id][instance_name] = now_seconds();
+  {
+    std::lock_guard<std::mutex> lu_lock(last_used_mutex_);
+    model_last_used_[model_id][instance_name] = now_seconds();
+  }
+
+  if (role == Role::PREFILL) {
+    enqueue_idle_prefill(model_id, instance_name);
+  }
 }
 
 void BlitzScaleInstanceMgr::execute_deactivate(const std::string& model_id,
@@ -469,6 +697,15 @@ void BlitzScaleInstanceMgr::execute_deactivate(const std::string& model_id,
     }
   }
 
+  if (role == Role::PREFILL) {
+    std::lock_guard<std::mutex> lk(pending_mutex_);
+    auto it = idle_prefill_queues_.find(model_id);
+    if (it != idle_prefill_queues_.end()) {
+      auto& q = it->second;
+      q.erase(std::remove(q.begin(), q.end(), instance_name), q.end());
+    }
+  }
+
   std::thread([this, model_id, instance_name]() {
     wait_for_model_drain(instance_name, model_id);
     auto mgr = get_model_instance_mgr(model_id);
@@ -487,10 +724,16 @@ void BlitzScaleInstanceMgr::execute_flip(const std::string& model_id,
   LOG(INFO) << "BlitzScale: flipping " << model_id << " on " << instance_name
             << " to " << (role == Role::PREFILL ? "prefill" : "decode");
 
-  std::lock_guard<std::mutex> lock(role_mutex_);
-  assign_role_locked(model_id, instance_name, role);
-  instance_to_models_[instance_name].insert(model_id);
-  model_to_instances_[model_id].insert(instance_name);
+  {
+    std::lock_guard<std::mutex> lock(role_mutex_);
+    assign_role_locked(model_id, instance_name, role);
+    instance_to_models_[instance_name].insert(model_id);
+    model_to_instances_[model_id].insert(instance_name);
+  }
+
+  if (role == Role::PREFILL) {
+    enqueue_idle_prefill(model_id, instance_name);
+  }
 }
 
 std::vector<std::string> BlitzScaleInstanceMgr::get_all_instance_names() {
@@ -511,40 +754,22 @@ std::vector<std::string> BlitzScaleInstanceMgr::get_all_instance_names() {
 }
 
 int32_t BlitzScaleInstanceMgr::get_waiting_count(const std::string& model_id) {
-  std::lock_guard<std::mutex> lock(req_mutex_);
-  auto it = model_requests_.find(model_id);
-  if (it == model_requests_.end()) {
+  std::lock_guard<std::mutex> lk(pending_mutex_);
+  auto it = pending_queues_.find(model_id);
+  if (it == pending_queues_.end()) {
     return 0;
   }
-
-  int32_t count = 0;
-  for (const auto& rid : it->second) {
-    auto req_it = requests_.find(rid);
-    if (req_it != requests_.end() &&
-        req_it->second->state == ReqInfo::WAITING) {
-      ++count;
-    }
-  }
-  return count;
+  return static_cast<int32_t>(it->second.size());
 }
 
 int32_t BlitzScaleInstanceMgr::get_waiting_prefill_tokens(
     const std::string& model_id) {
-  std::lock_guard<std::mutex> lock(req_mutex_);
-  auto it = model_requests_.find(model_id);
-  if (it == model_requests_.end()) {
+  std::lock_guard<std::mutex> lk(pending_mutex_);
+  auto it = pending_tokens_.find(model_id);
+  if (it == pending_tokens_.end()) {
     return 0;
   }
-
-  int32_t tokens = 0;
-  for (const auto& rid : it->second) {
-    auto req_it = requests_.find(rid);
-    if (req_it != requests_.end() &&
-        req_it->second->state == ReqInfo::WAITING) {
-      tokens += req_it->second->prompt_tokens;
-    }
-  }
-  return tokens;
+  return it->second;
 }
 
 int32_t BlitzScaleInstanceMgr::get_active_count(const std::string& model_id) {

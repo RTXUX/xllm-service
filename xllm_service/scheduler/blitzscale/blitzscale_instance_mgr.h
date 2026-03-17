@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -30,13 +32,18 @@ class BlitzScaleInstanceMgr : public InstanceMgr {
     std::string decode_instance;
     int32_t prompt_tokens = 0;
     int32_t prompt_blocks = 1;
+    double enqueue_time = 0.0;
     enum State { WAITING, RUNNING };
     State state = WAITING;
   };
 
-  void enqueue_request(const std::string& model,
-                       const std::string& request_id,
-                       int32_t prompt_tokens);
+  // Non-blocking: enqueue request into pending queue and wake dispatch thread
+  void add_pending_request(std::shared_ptr<Request> request);
+
+  // Called when prefill_instance finishes a prefill: marks it idle and wakes
+  // the dispatch thread so it can pull the next pending request
+  void notify_prefill_done(const std::string& prefill_instance);
+
   void start_running(const std::string& request_id,
                      const std::string& prefill_instance,
                      const std::string& decode_instance);
@@ -73,7 +80,21 @@ class BlitzScaleInstanceMgr : public InstanceMgr {
     std::optional<double> decode_since_s;
   };
 
+  void enqueue_request(const std::string& model,
+                       const std::string& request_id,
+                       int32_t prompt_tokens,
+                       double enqueue_time);
+
+  // Enqueue prefill_instance as idle for model_id; wakes dispatch thread
+  void enqueue_idle_prefill(const std::string& model_id,
+                            const std::string& instance_name);
+
   void scheduling_loop();
+  void dispatch_loop();
+  void dispatch_pending_requests();
+  // Pull-model dispatch: prefill instance is already known; only selects decode
+  bool dispatch_with_prefill(std::shared_ptr<Request> request,
+                             const std::string& prefill_instance);
   void sync_role_state();
   std::vector<BlitzAction> gen_actions();
   std::vector<BlitzAction> gen_model_actions(const std::string& model_id);
@@ -164,7 +185,21 @@ class BlitzScaleInstanceMgr : public InstanceMgr {
   std::unordered_map<std::string, OverprovisionState> overprovision_state_;
   std::mutex overprovision_mutex_;
 
+  // Per-model pending queue (FCFS; requests are fully tokenized)
+  std::unordered_map<std::string, std::deque<std::shared_ptr<Request>>>
+      pending_queues_;
+  // Per-model sum of prompt tokens for O(1) get_waiting_prefill_tokens()
+  std::unordered_map<std::string, int32_t> pending_tokens_;
+  // Per-model queue of idle prefill instances (pull model)
+  std::unordered_map<std::string, std::deque<std::string>> idle_prefill_queues_;
+  // Protects pending_queues_, pending_tokens_, and idle_prefill_queues_
+  mutable std::mutex pending_mutex_;
+
+  // Reactive dispatch: woken on new request or new instance capacity
+  std::condition_variable dispatch_cv_;
+
   std::unique_ptr<std::thread> sched_thread_;
+  std::unique_ptr<std::thread> dispatch_thread_;
   std::atomic<bool> running_{false};
 };
 
