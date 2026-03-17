@@ -1704,23 +1704,11 @@ void InstanceMgr::update_xtensor_info(
     info.model_weight_segments[model_id] = std::move(segments);
   }
 
-  // Copy device addresses for D2D transfer
-  // Prefer heartbeat-reported addresses; preserve registration-time addresses if heartbeat doesn't include them
-  if (xtensor_info.device_addrs_size() > 0) {
-    for (const auto& addr : xtensor_info.device_addrs()) {
-      info.device_addrs.push_back(addr);
-    }
-  } else {
-    auto it = instance_xtensor_infos_.find(instance_name);
-    if (it != instance_xtensor_infos_.end()) {
-      info.device_addrs = it->second.device_addrs;
-    }
-  }
-
-  // Preserve p2p_addrs from registration (not reported via heartbeat)
+  // Preserve device_addrs and p2p_addrs from registration (not reported via heartbeat)
   {
     auto it = instance_xtensor_infos_.find(instance_name);
     if (it != instance_xtensor_infos_.end()) {
+      info.device_addrs = it->second.device_addrs;
       info.p2p_addrs = it->second.p2p_addrs;
     }
   }
