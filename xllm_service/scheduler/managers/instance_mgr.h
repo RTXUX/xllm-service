@@ -131,6 +131,10 @@ class InstanceMgr final {
   // Budget = total_gpus - steady_needed_gpus.
   void dynamic_part_auto_scaling();
 
+  // Non-blocking variant: try_lock on allocation_mutex_; if the lock is already
+  // held (another scaling in progress), return false immediately without scaling.
+  bool try_dynamic_part_auto_scaling();
+
   std::shared_ptr<ModelInstanceMgr> get_model_instance_mgr(const std::string& model_id);
 
   // --- Dual-pool scheduling ---
@@ -199,9 +203,14 @@ class InstanceMgr final {
  private:
   void init_model_memory_specs();
   void init_model_resource_coefficients();
+  void load_gp_steady_models(const std::string& path);
+  void load_gp_dynamic_models(const std::string& path);
   double get_model_memory_size(const std::string& model_id);
 
   // --- Dual-pool private helpers ---
+
+  // Auto-scaling implementation. Must be called with allocation_mutex_ held.
+  void dynamic_part_auto_scaling_impl();
 
   // 2D First Fit: find a bin for a model, or create a new one.
   // If all instances occupied, reclaims from elastic pool (blocking).
@@ -219,7 +228,11 @@ class InstanceMgr final {
 
   // Remove a model from its steady bin, reclaiming resources.
   // Must be called with allocation_mutex_ held.
-  void remove_model_from_steady_bin(const std::string& model_id);
+  // If removal causes imbalance ratio R(B) < 0.5, triggers per-bin repack:
+  // all remaining models are evicted and re-inserted via min cos heuristic.
+  // Returns (model_id, old_instance, new_instance) moves from repack.
+  std::vector<std::tuple<std::string, std::string, std::string>>
+      remove_model_from_steady_bin(const std::string& model_id);
 
   // Get resource needs for a model using its current heat.
   ResourceNeeds get_model_resource_needs(const std::string& model_id);
@@ -348,6 +361,8 @@ class InstanceMgr final {
   std::atomic<int32_t> total_available_gpus_{0};
   // model_id -> resource model (read-only after init)
   std::unordered_map<std::string, std::unique_ptr<ResourceModel>> model_resource_models_;
+  // model_id -> dynamic pool GP resource model (read-only after init)
+  std::unordered_map<std::string, std::unique_ptr<ResourceModel>> dynamic_resource_models_;
   // GPU hardware spec (read-only after init)
   GpuHardwareSpec gpu_hw_spec_;
 

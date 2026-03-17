@@ -6,8 +6,17 @@ cc_library(
   HDRS
     resource_model.h
     linear_resource_model.h
+    gaussian_process.h
+    gp_steady_resource_model.h
+    gp_dynamic_resource_model.h
   SRCS
     linear_resource_model.cpp
+    gaussian_process.cpp
+    gp_steady_resource_model.cpp
+    gp_dynamic_resource_model.cpp
   DEPS
     :common
+    Eigen3::Eigen
+    nlohmann_json::nlohmann_json
+    glog::glog
 )

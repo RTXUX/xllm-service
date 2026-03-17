@@ -46,6 +46,7 @@ struct MachineInfo {
 struct PendingEntry {
   std::shared_ptr<Request> request;
   std::shared_ptr<std::promise<bool>> result_promise;
+  int slo_expansion_count = 0;
 };
 
 class LstImhPolicy final : public LoadBalancePolicy {

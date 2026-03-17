@@ -77,9 +77,7 @@ message XTensorHeartbeatInfo {
   // Per-worker free physical pages (index = worker rank)
   repeated uint64 worker_free_phy_pages = 1;
   // Model weight segments in GlobalXtensor (key: model_id)
-  map<string, WeightSegmentList> model_weight_segments = 2;
-  // Per-worker device addresses for D2D transfer (format: "IP:port")
-  repeated string device_addrs = 3;
+  map<string, WeightSegmentList> model_weight_segments = 3;
 }
 
 message HeartbeatRequest {
@@ -165,20 +163,20 @@ message ServiceConfig {
   bool enable_decode_response_to_service = 1;
 }
 
-enum PoolType {
-  POOL_NONE = 0;
-  POOL_NORMAL = 1;
-  POOL_PREFILL = 2;
-  POOL_DECODE = 3;
+enum TagType {
+  TAG_NONE = 0;
+  TAG_NORMAL = 1;
+  TAG_PREFILL = 2;
+  TAG_DECODE = 3;
 }
 
-message PoolAssignRequest {
+message TagAssignRequest {
   string instance_name = 1;
   string model_id = 2;
-  PoolType pool = 3;
+  TagType tag = 3;
 }
 
-message PoolAssignResponse {
+message TagAssignResponse {
   bool ok = 1;
   string error_message = 2;
 }
@@ -196,11 +194,11 @@ service XllmRpcService {
   // This can eliminate the cost brought by forwarding through prefill.
   rpc Generations(DisaggStreamGenerations) returns (StatusSet) {}
 
-  // Pool management RPCs for MIX PD scheduling
-  // AssignPool: wake up model_id on instance_name with the given role tag (pool).
-  rpc AssignPool(PoolAssignRequest) returns (PoolAssignResponse) {}
-  // RemoveFromPool: sleep model_id on instance_name; tag auto-resets to NONE
+  // Tag management RPCs for MIX PD scheduling
+  // AssignTag: wake up model_id on instance_name with the given role tag.
+  rpc AssignTag(TagAssignRequest) returns (TagAssignResponse) {}
+  // RemoveTag: sleep model_id on instance_name; tag auto-resets to NONE
   // when no models remain awake on that instance.
-  rpc RemoveFromPool(PoolAssignRequest) returns (PoolAssignResponse) {}
+  rpc RemoveTag(TagAssignRequest) returns (TagAssignResponse) {}
 }
 

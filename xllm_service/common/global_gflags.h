@@ -69,6 +69,10 @@ DECLARE_int32(default_ttft_slo_ms);
 
 DECLARE_int32(lst_imh_pre_pull_ms);
 
+DECLARE_double(slo_penalty_factor);
+
+DECLARE_int32(max_slo_expansions);
+
 DECLARE_bool(enable_prefill_only_mode);
 
 DECLARE_double(gpu_hbm_per_gpu_gb);
@@ -76,3 +80,9 @@ DECLARE_double(gpu_hbm_per_gpu_gb);
 DECLARE_double(gpu_compute_sm_per_gpu);
 
 DECLARE_bool(enable_mix_pd);
+
+DECLARE_double(gpu_bandwidth_per_gpu);
+
+DECLARE_string(gp_steady_data_path);
+
+DECLARE_string(gp_dynamic_data_path);

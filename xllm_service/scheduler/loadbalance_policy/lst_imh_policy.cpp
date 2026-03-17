@@ -19,6 +19,7 @@ limitations under the License.
 #include <absl/time/time.h>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <queue>
 #include <random>
@@ -69,8 +70,13 @@ bool LstImhPolicy::select_instances_pair(std::shared_ptr<Request> request) {
   // Wake the coordinator so it can schedule this request.
   signal_dispatch();
 
-  // Block until the coordinator fulfills the promise or TTFT SLO expires.
-  int64_t wait_ms = request->ttft_slo_ms > 0 ? request->ttft_slo_ms : 30000;
+  // Block until the coordinator fulfills the promise or hard timeout expires.
+  // The wait covers the original SLO plus all possible SLO expansions, so the
+  // coordinator has time to re-enqueue the request with relaxed deadlines.
+  int64_t base_ms = request->ttft_slo_ms > 0 ? request->ttft_slo_ms : 30000;
+  double max_factor =
+      std::pow(options_.slo_penalty_factor(), options_.max_slo_expansions());
+  int64_t wait_ms = static_cast<int64_t>(base_ms * max_factor) + 5000;
   auto status = fut.wait_for(std::chrono::milliseconds(wait_ms));
 
   if (status == std::future_status::timeout) {
@@ -246,7 +252,7 @@ void LstImhPolicy::dispatch_coordinator() {
 
       if (ready_instances.empty()) continue;
 
-      // Purge expired requests and build job list.
+      // Purge expired requests or expand their SLO for re-scheduling.
       std::vector<SchedulingJob> jobs;
       {
         std::lock_guard<std::mutex> lock(pending_mutex_);
@@ -257,17 +263,37 @@ void LstImhPolicy::dispatch_coordinator() {
           int64_t deadline =
               entry->request->arrival_time_ms + entry->request->ttft_slo_ms;
           if (deadline <= now_ms) {
-            // Expired — fulfill promise with false.
-            LOG(WARNING) << "[LST-IMH] Request "
-                         << entry->request->service_request_id
-                         << " expired (TTFT SLO exceeded), discarding.";
-            try {
-              entry->result_promise->set_value(false);
-            } catch (const std::future_error&) {}
-            if (entry->request->timeout_callback) {
-              entry->request->timeout_callback();
+            if (entry->slo_expansion_count <
+                options_.max_slo_expansions()) {
+              // SLO expired — expand and re-enqueue with lower priority.
+              entry->request->ttft_slo_ms = static_cast<int64_t>(
+                  entry->request->ttft_slo_ms * options_.slo_penalty_factor());
+              entry->slo_expansion_count++;
+              int64_t new_deadline =
+                  entry->request->arrival_time_ms + entry->request->ttft_slo_ms;
+              LOG(INFO) << "[LST-IMH] Request "
+                        << entry->request->service_request_id
+                        << " SLO expanded (x" << entry->slo_expansion_count
+                        << ", new_slo=" << entry->request->ttft_slo_ms
+                        << "ms, new_deadline=" << new_deadline << ")";
+              jobs.push_back({entry->request,
+                              entry->request->estimated_processing_time_ms,
+                              new_deadline});
+              ++it;
+            } else {
+              // Max expansions reached — truly discard.
+              LOG(WARNING) << "[LST-IMH] Request "
+                           << entry->request->service_request_id
+                           << " expired after " << entry->slo_expansion_count
+                           << " SLO expansions, discarding.";
+              try {
+                entry->result_promise->set_value(false);
+              } catch (const std::future_error&) {}
+              if (entry->request->timeout_callback) {
+                entry->request->timeout_callback();
+              }
+              it = queue.erase(it);
             }
-            it = queue.erase(it);
           } else {
             jobs.push_back({entry->request,
                             entry->request->estimated_processing_time_ms,

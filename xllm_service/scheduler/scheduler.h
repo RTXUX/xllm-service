@@ -140,6 +140,9 @@ class Scheduler final {
   size_t next_thread_idx = 0;
   std::mutex thread_map_mutex_;
 
+  // dispatch thread pool (replaces std::thread().detach() per request)
+  ThreadPool dispatch_pool_{256};
+
   // used when receive token from decode instance.
   ResponseHandler response_handler_;
 };

@@ -102,6 +102,17 @@ DEFINE_int32(lst_imh_pre_pull_ms,
              "requests when instance estimated remaining time <= this value. "
              "0 means wait until instance is completely idle (default).");
 
+DEFINE_double(slo_penalty_factor,
+              3.0,
+              "When a request's TTFT SLO expires in LST-IMH, multiply its SLO "
+              "by this factor and re-enqueue with lower priority instead of "
+              "discarding.");
+
+DEFINE_int32(max_slo_expansions,
+             2,
+             "Maximum number of times a request's SLO can be expanded by "
+             "slo_penalty_factor before it is truly discarded.");
+
 DEFINE_int32(target_ttft,
              1000,
              "Target Time to First Token (TTFT), in milliseconds.");
@@ -131,3 +142,17 @@ DEFINE_bool(enable_mix_pd,
             false,
             "Enable MixPD instance tagging: each MIX instance gets a role tag "
             "(PREFILL/DECODE/NORMAL) and LST-IMH routes accordingly.");
+
+DEFINE_double(gpu_bandwidth_per_gpu,
+              1.0,
+              "HBM-to-SRAM bandwidth capacity per GPU (normalized).");
+
+DEFINE_string(gp_steady_data_path,
+              "",
+              "Path to JSON file containing GP training data for steady pool "
+              "resource model. Empty means use linear fallback.");
+
+DEFINE_string(gp_dynamic_data_path,
+              "",
+              "Path to JSON file containing GP training data for dynamic pool "
+              "resource model. Empty means use linear fallback.");

@@ -130,16 +130,16 @@ class XllmRpcService : public proto::XllmRpcService {
                          proto::ServiceConfig* resp,
                          google::protobuf::Closure* done) override;
 
-  // Pool management RPCs for MIX PD scheduling
-  virtual void AssignPool(google::protobuf::RpcController* cntl_base,
-                          const proto::PoolAssignRequest* req,
-                          proto::PoolAssignResponse* resp,
-                          google::protobuf::Closure* done) override;
+  // Tag management RPCs for MIX PD scheduling
+  virtual void AssignTag(google::protobuf::RpcController* cntl_base,
+                         const proto::TagAssignRequest* req,
+                         proto::TagAssignResponse* resp,
+                         google::protobuf::Closure* done) override;
 
-  virtual void RemoveFromPool(google::protobuf::RpcController* cntl_base,
-                              const proto::PoolAssignRequest* req,
-                              proto::PoolAssignResponse* resp,
-                              google::protobuf::Closure* done) override;
+  virtual void RemoveTag(google::protobuf::RpcController* cntl_base,
+                         const proto::TagAssignRequest* req,
+                         proto::TagAssignResponse* resp,
+                         google::protobuf::Closure* done) override;
 
  private:
   std::unique_ptr<XllmRpcServiceImpl> xllm_rpc_service_impl_;

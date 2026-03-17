@@ -20,6 +20,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <chrono>
+#include <fstream>
 #include <thread>
 #include <iostream>
 #include <nlohmann/json.hpp>
@@ -29,6 +30,8 @@ limitations under the License.
 #include <shared_mutex>
 
 #include "scheduler/resource_model/linear_resource_model.h"
+#include "scheduler/resource_model/gp_steady_resource_model.h"
+#include "scheduler/resource_model/gp_dynamic_resource_model.h"
 
 #include "common/global_gflags.h"
 #include "common/types.h"
@@ -36,6 +39,30 @@ limitations under the License.
 #include "disagg_pd_link.pb.h"
 
 namespace xllm_service {
+
+// Compute cosine similarity between item needs vector and bin load vector.
+// Both are normalized to [0,1] by dividing by gpu_hw_spec capacities.
+// Returns 2.0 (> any valid cosine) if either vector is zero-length.
+static double compute_cos_similarity(
+    const ResourceNeeds& needs, const SteadyBin& bin,
+    const GpuHardwareSpec& hw) {
+  // Item vector (normalized to [0,1])
+  double v1 = needs.hbm_gb / hw.hbm_per_gpu_gb;
+  double v2 = needs.compute_sm / hw.compute_sm_per_gpu;
+  double v3 = needs.bandwidth / hw.bandwidth_per_gpu;
+
+  // Bin load vector (normalized): used = capacity - remaining
+  double s1 = (hw.hbm_per_gpu_gb - bin.remaining_hbm_gb) / hw.hbm_per_gpu_gb;
+  double s2 = (hw.compute_sm_per_gpu - bin.remaining_compute_sm) / hw.compute_sm_per_gpu;
+  double s3 = (hw.bandwidth_per_gpu - bin.remaining_bandwidth) / hw.bandwidth_per_gpu;
+
+  double dot = v1 * s1 + v2 * s2 + v3 * s3;
+  double norm_v = std::sqrt(v1 * v1 + v2 * v2 + v3 * v3);
+  double norm_s = std::sqrt(s1 * s1 + s2 * s2 + s3 * s3);
+
+  if (norm_v < 1e-12 || norm_s < 1e-12) return 2.0;
+  return dot / (norm_v * norm_s);
+}
 
 static std::unordered_map<InstanceType, std::string> ETCD_KEYS_PREFIX_MAP = {
     {InstanceType::DEFAULT, "XLLM:DEFAULT:"},
@@ -1276,19 +1303,135 @@ void InstanceMgr::init_model_memory_specs() {
 void InstanceMgr::init_model_resource_coefficients() {
   gpu_hw_spec_.hbm_per_gpu_gb = FLAGS_gpu_hbm_per_gpu_gb;
   gpu_hw_spec_.compute_sm_per_gpu = FLAGS_gpu_compute_sm_per_gpu;
+  gpu_hw_spec_.bandwidth_per_gpu = FLAGS_gpu_bandwidth_per_gpu;
 
-  // Hardcoded resource coefficients per model
-  model_resource_models_["Qwen3-8B"] = std::make_unique<LinearResourceModel>(
-      /*hbm_a=*/0.001, /*hbm_b=*/20.0,
-      /*compute_a=*/0.0005, /*compute_b=*/0.0);
-  model_resource_models_["Qwen2-7B"] = std::make_unique<LinearResourceModel>(
-      /*hbm_a=*/0.001, /*hbm_b=*/20.0,
-      /*compute_a=*/0.0005, /*compute_b=*/0.0);
+  // Load GP models from JSON files if paths are provided
+  if (!FLAGS_gp_steady_data_path.empty()) {
+    load_gp_steady_models(FLAGS_gp_steady_data_path);
+  }
+  if (!FLAGS_gp_dynamic_data_path.empty()) {
+    load_gp_dynamic_models(FLAGS_gp_dynamic_data_path);
+  }
+
+  // Fallback: hardcoded linear models for models without GP data
+  if (model_resource_models_.find("Qwen3-8B") == model_resource_models_.end()) {
+    model_resource_models_["Qwen3-8B"] = std::make_unique<LinearResourceModel>(
+        /*hbm_a=*/0.001, /*hbm_b=*/20.0,
+        /*compute_a=*/0.0005, /*compute_b=*/0.0);
+  }
+  if (model_resource_models_.find("Qwen2-7B") == model_resource_models_.end()) {
+    model_resource_models_["Qwen2-7B"] = std::make_unique<LinearResourceModel>(
+        /*hbm_a=*/0.001, /*hbm_b=*/20.0,
+        /*compute_a=*/0.0005, /*compute_b=*/0.0);
+  }
 
   LOG(INFO) << "Initialized model resource models for "
-            << model_resource_models_.size() << " models, "
+            << model_resource_models_.size() << " steady models, "
+            << dynamic_resource_models_.size() << " dynamic models, "
             << "GPU HBM=" << gpu_hw_spec_.hbm_per_gpu_gb << "GB, "
-            << "GPU compute SM=" << gpu_hw_spec_.compute_sm_per_gpu;
+            << "GPU compute SM=" << gpu_hw_spec_.compute_sm_per_gpu << ", "
+            << "GPU bandwidth=" << gpu_hw_spec_.bandwidth_per_gpu;
+}
+
+static std::unique_ptr<GaussianProcess> parse_gp_from_json(
+    const nlohmann::json& j) {
+  const auto& X_arr = j.at("X");
+  const auto& y_arr = j.at("y");
+  const auto& ls_arr = j.at("lengthscales");
+  double signal_var = j.at("signal_variance").get<double>();
+  double noise_var = j.at("noise_variance").get<double>();
+
+  int n = X_arr.size();
+  int d = ls_arr.size();
+
+  Eigen::MatrixXd X(n, d);
+  for (int i = 0; i < n; ++i) {
+    for (int k = 0; k < d; ++k) {
+      X(i, k) = X_arr[i][k].get<double>();
+    }
+  }
+
+  Eigen::VectorXd y(n);
+  for (int i = 0; i < n; ++i) {
+    y(i) = y_arr[i].get<double>();
+  }
+
+  Eigen::VectorXd ls(d);
+  for (int i = 0; i < d; ++i) {
+    ls(i) = ls_arr[i].get<double>();
+  }
+
+  return std::make_unique<GaussianProcess>(X, y, ls, signal_var, noise_var);
+}
+
+void InstanceMgr::load_gp_steady_models(const std::string& path) {
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    LOG(ERROR) << "Failed to open GP steady data file: " << path;
+    return;
+  }
+
+  nlohmann::json data;
+  try {
+    file >> data;
+  } catch (const nlohmann::json::parse_error& e) {
+    LOG(ERROR) << "Failed to parse GP steady data JSON: " << e.what();
+    return;
+  }
+
+  for (auto it = data.begin(); it != data.end(); ++it) {
+    const std::string& model_id = it.key();
+    const auto& model_data = it.value();
+
+    try {
+      auto gp_hbm = parse_gp_from_json(model_data.at("hbm"));
+      auto gp_compute = parse_gp_from_json(model_data.at("compute"));
+      auto gp_bandwidth = parse_gp_from_json(model_data.at("bandwidth"));
+
+      model_resource_models_[model_id] =
+          std::make_unique<GPSteadyResourceModel>(
+              std::move(gp_hbm), std::move(gp_compute),
+              std::move(gp_bandwidth));
+
+      LOG(INFO) << "Loaded GP steady resource model for " << model_id;
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Failed to load GP steady model for " << model_id
+                 << ": " << e.what();
+    }
+  }
+}
+
+void InstanceMgr::load_gp_dynamic_models(const std::string& path) {
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    LOG(ERROR) << "Failed to open GP dynamic data file: " << path;
+    return;
+  }
+
+  nlohmann::json data;
+  try {
+    file >> data;
+  } catch (const nlohmann::json::parse_error& e) {
+    LOG(ERROR) << "Failed to parse GP dynamic data JSON: " << e.what();
+    return;
+  }
+
+  for (auto it = data.begin(); it != data.end(); ++it) {
+    const std::string& model_id = it.key();
+    const auto& model_data = it.value();
+
+    try {
+      auto gp_slo = parse_gp_from_json(model_data);
+
+      dynamic_resource_models_[model_id] =
+          std::make_unique<GPDynamicResourceModel>(std::move(gp_slo));
+
+      LOG(INFO) << "Loaded GP dynamic resource model for " << model_id;
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Failed to load GP dynamic model for " << model_id
+                 << ": " << e.what();
+    }
+  }
 }
 
 // TODO: support dynamic instance memory specs, rather than hardcoded.
@@ -1453,7 +1596,19 @@ bool InstanceMgr::should_accept_scaling_plan(
 
 void InstanceMgr::dynamic_part_auto_scaling() {
   std::unique_lock<std::mutex> alloc_lock(allocation_mutex_);
+  dynamic_part_auto_scaling_impl();
+}
 
+bool InstanceMgr::try_dynamic_part_auto_scaling() {
+  std::unique_lock<std::mutex> alloc_lock(allocation_mutex_, std::try_to_lock);
+  if (!alloc_lock.owns_lock()) {
+    return false;
+  }
+  dynamic_part_auto_scaling_impl();
+  return true;
+}
+
+void InstanceMgr::dynamic_part_auto_scaling_impl() {
   int32_t total_gpus = total_available_gpus_.load();
   // Budget: total GPUs minus steady pool reservation
   int32_t budget = std::max(0, total_gpus - steady_needed_gpus());
@@ -1854,23 +2009,11 @@ void InstanceMgr::update_xtensor_info(
     info.model_weight_segments[model_id] = std::move(segments);
   }
 
-  // Copy device addresses for D2D transfer
-  // Prefer heartbeat-reported addresses; preserve registration-time addresses if heartbeat doesn't include them
-  if (xtensor_info.device_addrs_size() > 0) {
-    for (const auto& addr : xtensor_info.device_addrs()) {
-      info.device_addrs.push_back(addr);
-    }
-  } else {
-    auto it = instance_xtensor_infos_.find(instance_name);
-    if (it != instance_xtensor_infos_.end()) {
-      info.device_addrs = it->second.device_addrs;
-    }
-  }
-
-  // Preserve p2p_addrs from registration (not reported via heartbeat)
+  // Preserve device_addrs and p2p_addrs from registration (not reported via heartbeat)
   {
     auto it = instance_xtensor_infos_.find(instance_name);
     if (it != instance_xtensor_infos_.end()) {
+      info.device_addrs = it->second.device_addrs;
       info.p2p_addrs = it->second.p2p_addrs;
     }
   }
@@ -2041,8 +2184,8 @@ ResourceNeeds InstanceMgr::get_model_resource_needs(const std::string& model_id)
   if (it != model_resource_models_.end()) {
     return it->second->compute_resource_needs(heat);
   }
-  // Default: use hbm_b=20GB, compute_b=0 for unknown models
-  return {20.0, 0.0};
+  // Default: use hbm_b=20GB, compute_b=0, bandwidth=0 for unknown models
+  return {20.0, 0.0, 0.0};
 }
 
 void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
@@ -2074,7 +2217,7 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
     // Steady pool
     ResourceNeeds needs = (res_it != model_resource_models_.end())
         ? res_it->second->compute_resource_needs(heat)
-        : ResourceNeeds{20.0, 0.0};
+        : ResourceNeeds{20.0, 0.0, 0.0};
 
     std::string instance = find_or_create_steady_bin(model_id, needs);
     if (instance.empty()) {
@@ -2106,17 +2249,34 @@ std::string InstanceMgr::find_or_create_steady_bin(
     const std::string& model_id, const ResourceNeeds& needs,
     bool allow_reclaim) {
 
-  // Phase 1: First Fit in existing bins
-  for (auto& bin : steady_bins_) {
-    if (bin.remaining_hbm_gb >= needs.hbm_gb &&
-        bin.remaining_compute_sm >= needs.compute_sm) {
-      bin.remaining_hbm_gb -= needs.hbm_gb;
-      bin.remaining_compute_sm -= needs.compute_sm;
-      bin.models.insert(model_id);
-      LOG(INFO) << "Placed model " << model_id << " in existing steady bin "
-                << bin.instance_name << " (remaining hbm=" << bin.remaining_hbm_gb
-                << "GB, compute=" << bin.remaining_compute_sm << ")";
-      return bin.instance_name;
+  // Phase 1: min cos heuristic — select the feasible bin whose load vector
+  // is most orthogonal to the item's resource vector (minimizes cosine).
+  {
+    SteadyBin* best_bin = nullptr;
+    double best_cos = std::numeric_limits<double>::max();
+
+    for (auto& bin : steady_bins_) {
+      if (bin.remaining_hbm_gb >= needs.hbm_gb &&
+          bin.remaining_compute_sm >= needs.compute_sm &&
+          bin.remaining_bandwidth >= needs.bandwidth) {
+        double cos_val = compute_cos_similarity(needs, bin, gpu_hw_spec_);
+        if (cos_val < best_cos) {
+          best_cos = cos_val;
+          best_bin = &bin;
+        }
+      }
+    }
+    if (best_bin) {
+      best_bin->remaining_hbm_gb -= needs.hbm_gb;
+      best_bin->remaining_compute_sm -= needs.compute_sm;
+      best_bin->remaining_bandwidth -= needs.bandwidth;
+      best_bin->models.insert(model_id);
+      LOG(INFO) << "Placed model " << model_id << " in steady bin "
+                << best_bin->instance_name << " (min_cos=" << best_cos
+                << ", remaining hbm=" << best_bin->remaining_hbm_gb
+                << "GB, compute=" << best_bin->remaining_compute_sm
+                << ", bandwidth=" << best_bin->remaining_bandwidth << ")";
+      return best_bin->instance_name;
     }
   }
 
@@ -2151,6 +2311,7 @@ std::string InstanceMgr::find_or_create_steady_bin(
       new_bin.instance_name = inst_name;
       new_bin.remaining_hbm_gb = gpu_hw_spec_.hbm_per_gpu_gb - needs.hbm_gb;
       new_bin.remaining_compute_sm = gpu_hw_spec_.compute_sm_per_gpu - needs.compute_sm;
+      new_bin.remaining_bandwidth = gpu_hw_spec_.bandwidth_per_gpu - needs.bandwidth;
       new_bin.models.insert(model_id);
       steady_bins_.push_back(std::move(new_bin));
 
@@ -2198,6 +2359,7 @@ std::string InstanceMgr::find_or_create_steady_bin(
       new_bin.instance_name = inst_name;
       new_bin.remaining_hbm_gb = gpu_hw_spec_.hbm_per_gpu_gb - needs.hbm_gb;
       new_bin.remaining_compute_sm = gpu_hw_spec_.compute_sm_per_gpu - needs.compute_sm;
+      new_bin.remaining_bandwidth = gpu_hw_spec_.bandwidth_per_gpu - needs.bandwidth;
       new_bin.models.insert(model_id);
       steady_bins_.push_back(std::move(new_bin));
 
@@ -2210,14 +2372,18 @@ std::string InstanceMgr::find_or_create_steady_bin(
   return "";
 }
 
-void InstanceMgr::remove_model_from_steady_bin(const std::string& model_id) {
+std::vector<std::tuple<std::string, std::string, std::string>>
+InstanceMgr::remove_model_from_steady_bin(const std::string& model_id) {
   // Must be called with allocation_mutex_ held
+  std::vector<std::tuple<std::string, std::string, std::string>> moves;
+
   for (auto it = steady_bins_.begin(); it != steady_bins_.end(); ++it) {
     if (it->models.count(model_id)) {
       // Reclaim resources
       ResourceNeeds needs = get_model_resource_needs(model_id);
       it->remaining_hbm_gb += needs.hbm_gb;
       it->remaining_compute_sm += needs.compute_sm;
+      it->remaining_bandwidth += needs.bandwidth;
       it->models.erase(model_id);
 
       LOG(INFO) << "Removed model " << model_id << " from steady bin "
@@ -2227,10 +2393,76 @@ void InstanceMgr::remove_model_from_steady_bin(const std::string& model_id) {
       if (it->models.empty()) {
         LOG(INFO) << "Steady bin " << it->instance_name << " is now empty, releasing";
         steady_bins_.erase(it);
+        return moves;
       }
-      return;
+
+      // Check imbalance ratio R(B) = min(S_k) / max(S_k)
+      // S_k = normalized load = (capacity - remaining) / capacity
+      double s1 = (gpu_hw_spec_.hbm_per_gpu_gb - it->remaining_hbm_gb)
+                   / gpu_hw_spec_.hbm_per_gpu_gb;
+      double s2 = (gpu_hw_spec_.compute_sm_per_gpu - it->remaining_compute_sm)
+                   / gpu_hw_spec_.compute_sm_per_gpu;
+      double s3 = (gpu_hw_spec_.bandwidth_per_gpu - it->remaining_bandwidth)
+                   / gpu_hw_spec_.bandwidth_per_gpu;
+
+      double s_min = std::min({s1, s2, s3});
+      double s_max = std::max({s1, s2, s3});
+      double R = (s_max > 1e-12) ? (s_min / s_max) : 1.0;
+
+      if (R >= 0.5) {
+        return moves;  // balanced enough
+      }
+
+      // R(B) < 0.5 — trigger per-bin repack (装箱.pdf §2.3)
+      LOG(INFO) << "Bin " << it->instance_name << " imbalance ratio R=" << R
+                << " < 0.5, triggering per-bin repack";
+
+      std::string old_instance = it->instance_name;
+      std::vector<std::string> displaced_models(it->models.begin(),
+                                                it->models.end());
+
+      // Erase the unbalanced bin
+      steady_bins_.erase(it);
+
+      // Re-insert each displaced model via min cos (no elastic reclamation)
+      std::vector<std::string> fallback_models;
+      for (const auto& mid : displaced_models) {
+        ResourceNeeds mid_needs = get_model_resource_needs(mid);
+        std::string new_instance =
+            find_or_create_steady_bin(mid, mid_needs, /*allow_reclaim=*/false);
+
+        if (new_instance.empty()) {
+          // Couldn't place — will go to fallback bin on old_instance
+          fallback_models.push_back(mid);
+        } else if (new_instance != old_instance) {
+          moves.emplace_back(mid, old_instance, new_instance);
+        }
+        // if new_instance == old_instance, model stays put (no move needed)
+      }
+
+      // Create fallback bin on old_instance for unplaced models
+      if (!fallback_models.empty()) {
+        SteadyBin fallback_bin;
+        fallback_bin.instance_name = old_instance;
+        fallback_bin.remaining_hbm_gb = gpu_hw_spec_.hbm_per_gpu_gb;
+        fallback_bin.remaining_compute_sm = gpu_hw_spec_.compute_sm_per_gpu;
+        fallback_bin.remaining_bandwidth = gpu_hw_spec_.bandwidth_per_gpu;
+        for (const auto& mid : fallback_models) {
+          ResourceNeeds mid_needs = get_model_resource_needs(mid);
+          fallback_bin.remaining_hbm_gb -= mid_needs.hbm_gb;
+          fallback_bin.remaining_compute_sm -= mid_needs.compute_sm;
+          fallback_bin.remaining_bandwidth -= mid_needs.bandwidth;
+          fallback_bin.models.insert(mid);
+        }
+        steady_bins_.push_back(std::move(fallback_bin));
+        LOG(INFO) << "Created fallback bin on " << old_instance << " for "
+                  << fallback_models.size() << " unplaced models";
+      }
+
+      return moves;
     }
   }
+  return moves;
 }
 
 bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
@@ -2276,7 +2508,7 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
   // Upgrade to elastic
   pool_it->second = PoolType::ELASTIC;
 
-  remove_model_from_steady_bin(model_id);
+  auto repack_moves = remove_model_from_steady_bin(model_id);
 
   alloc_lock.unlock();
 
@@ -2293,6 +2525,17 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
       if (!wait_for_model_drain(inst, mid)) return;
       send_model_sleep(inst, mid);
     }).detach();
+  }
+
+  // Execute R(B) repack moves: wake on new instance, drain+sleep on old
+  for (const auto& [mid, old_inst, new_inst] : repack_moves) {
+    LOG(INFO) << "R(B) repack: moving model " << mid
+              << " from " << old_inst << " to " << new_inst;
+    send_model_wakeup(new_inst, mid, false);
+    auto mgr = get_model_instance_mgr(mid);
+    if (mgr) mgr->set_model_state(old_inst, ModelState::DRAINING);
+    wait_for_model_drain(old_inst, mid);
+    send_model_sleep(old_inst, mid);
   }
 
   return true;
@@ -2330,9 +2573,10 @@ InstanceMgr::repack_steady_bins() {
       item.model_id = model_id;
       item.needs = get_model_resource_needs(model_id);
       item.old_instance = bin.instance_name;
-      item.dominant_ratio = std::max(
+      item.dominant_ratio = std::max({
           item.needs.hbm_gb / gpu_hw_spec_.hbm_per_gpu_gb,
-          item.needs.compute_sm / gpu_hw_spec_.compute_sm_per_gpu);
+          item.needs.compute_sm / gpu_hw_spec_.compute_sm_per_gpu,
+          item.needs.bandwidth / gpu_hw_spec_.bandwidth_per_gpu});
       items.push_back(std::move(item));
     }
   }
@@ -2354,21 +2598,33 @@ InstanceMgr::repack_steady_bins() {
     old_instances.push_back(bin.instance_name);
   }
 
-  // Build new bins with FFD
+  // Build new bins with FFD + min cos placement
   std::vector<SteadyBin> new_bins;
   size_t next_old_instance = 0;
 
   for (const auto& item : items) {
     bool placed = false;
+
+    // min cos: find the feasible bin with minimum cosine similarity
+    SteadyBin* best = nullptr;
+    double best_cos = std::numeric_limits<double>::max();
     for (auto& bin : new_bins) {
       if (bin.remaining_hbm_gb >= item.needs.hbm_gb &&
-          bin.remaining_compute_sm >= item.needs.compute_sm) {
-        bin.remaining_hbm_gb -= item.needs.hbm_gb;
-        bin.remaining_compute_sm -= item.needs.compute_sm;
-        bin.models.insert(item.model_id);
-        placed = true;
-        break;
+          bin.remaining_compute_sm >= item.needs.compute_sm &&
+          bin.remaining_bandwidth >= item.needs.bandwidth) {
+        double cos_val = compute_cos_similarity(item.needs, bin, gpu_hw_spec_);
+        if (cos_val < best_cos) {
+          best_cos = cos_val;
+          best = &bin;
+        }
       }
+    }
+    if (best) {
+      best->remaining_hbm_gb -= item.needs.hbm_gb;
+      best->remaining_compute_sm -= item.needs.compute_sm;
+      best->remaining_bandwidth -= item.needs.bandwidth;
+      best->models.insert(item.model_id);
+      placed = true;
     }
     if (!placed) {
       // Open new bin, preferring old steady instances
@@ -2402,6 +2658,7 @@ InstanceMgr::repack_steady_bins() {
       new_bin.instance_name = inst_name;
       new_bin.remaining_hbm_gb = gpu_hw_spec_.hbm_per_gpu_gb - item.needs.hbm_gb;
       new_bin.remaining_compute_sm = gpu_hw_spec_.compute_sm_per_gpu - item.needs.compute_sm;
+      new_bin.remaining_bandwidth = gpu_hw_spec_.bandwidth_per_gpu - item.needs.bandwidth;
       new_bin.models.insert(item.model_id);
       new_bins.push_back(std::move(new_bin));
     }

@@ -235,33 +235,33 @@ void XllmRpcService::GetConfig(google::protobuf::RpcController* cntl_base,
       config.enable_decode_response_to_service);
 }
 
-void XllmRpcService::AssignPool(google::protobuf::RpcController* cntl_base,
-                                const proto::PoolAssignRequest* req,
-                                proto::PoolAssignResponse* resp,
-                                google::protobuf::Closure* done) {
+void XllmRpcService::AssignTag(google::protobuf::RpcController* cntl_base,
+                               const proto::TagAssignRequest* req,
+                               proto::TagAssignResponse* resp,
+                               google::protobuf::Closure* done) {
   brpc::ClosureGuard done_guard(done);
 
   InstanceTag tag;
-  switch (req->pool()) {
-    case proto::POOL_NONE:
+  switch (req->tag()) {
+    case proto::TAG_NONE:
       tag = InstanceTag::NONE;
       break;
-    case proto::POOL_NORMAL:
+    case proto::TAG_NORMAL:
       tag = InstanceTag::NORMAL;
       break;
-    case proto::POOL_PREFILL:
+    case proto::TAG_PREFILL:
       tag = InstanceTag::PREFILL;
       break;
-    case proto::POOL_DECODE:
+    case proto::TAG_DECODE:
       tag = InstanceTag::DECODE;
       break;
     default:
       resp->set_ok(false);
-      resp->set_error_message("Invalid pool type");
+      resp->set_error_message("Invalid tag type");
       return;
   }
 
-  LOG(INFO) << "AssignPool: instance=" << req->instance_name()
+  LOG(INFO) << "AssignTag: instance=" << req->instance_name()
             << " model=" << req->model_id()
             << " tag=" << static_cast<int>(tag);
 
@@ -273,13 +273,13 @@ void XllmRpcService::AssignPool(google::protobuf::RpcController* cntl_base,
   }
 }
 
-void XllmRpcService::RemoveFromPool(google::protobuf::RpcController* cntl_base,
-                                    const proto::PoolAssignRequest* req,
-                                    proto::PoolAssignResponse* resp,
-                                    google::protobuf::Closure* done) {
+void XllmRpcService::RemoveTag(google::protobuf::RpcController* cntl_base,
+                               const proto::TagAssignRequest* req,
+                               proto::TagAssignResponse* resp,
+                               google::protobuf::Closure* done) {
   brpc::ClosureGuard done_guard(done);
 
-  LOG(INFO) << "RemoveFromPool: instance=" << req->instance_name()
+  LOG(INFO) << "RemoveTag: instance=" << req->instance_name()
             << " model=" << req->model_id();
 
   bool ok = xllm_rpc_service_impl_->sleep_model(

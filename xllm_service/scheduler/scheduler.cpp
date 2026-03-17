@@ -204,14 +204,13 @@ void Scheduler::process_request_queue(const std::string& model_name) {
         request->routing.prefill_name = awake[0];
         request->routing.decode_name = awake[0];
       } else {
-        // Warm elastic model: route first, then trigger scaling adjustment
+        // Warm elastic model: route first, scaling deferred to post-dispatch
         if (!lb_policy_->select_instances_pair(request)) {
           LOG(WARNING) << "LB policy failed to assign instance for request "
                        << request->service_request_id
                        << " model=" << request->model;
           continue;
         }
-        instance_mgr_->dynamic_part_auto_scaling();
       }
     }
 
@@ -223,7 +222,13 @@ void Scheduler::process_request_queue(const std::string& model_name) {
     }
 
     if (request->dispatch_callback) {
-      std::thread([request]() { request->dispatch_callback(); }).detach();
+      dispatch_pool_.schedule([request]() { request->dispatch_callback(); });
+    }
+
+    // Post-dispatch: trigger elastic scaling with try_lock to avoid blocking.
+    // Cold path already did blocking scaling above; warm path defers to here.
+    if (pool == PoolType::ELASTIC) {
+      instance_mgr_->try_dynamic_part_auto_scaling();
     }
   }
 }

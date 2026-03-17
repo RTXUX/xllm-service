@@ -534,6 +534,7 @@ struct D2DWakeupInfo {
 struct GpuHardwareSpec {
   double hbm_per_gpu_gb = 80.0;
   double compute_sm_per_gpu = 1.0;
+  double bandwidth_per_gpu = 1.0;  // HBM-to-SRAM bandwidth capacity (normalized)
 };
 
 // Dual-pool scheduling types
@@ -550,12 +551,14 @@ enum class InstanceTag : int8_t {
 struct ResourceNeeds {
   double hbm_gb = 0.0;
   double compute_sm = 0.0;
+  double bandwidth = 0.0;  // HBM-to-SRAM bandwidth utilization [0.0, 1.0]
 };
 
 struct SteadyBin {
   std::string instance_name;
   double remaining_hbm_gb;
   double remaining_compute_sm;
+  double remaining_bandwidth;  // HBM-to-SRAM bandwidth remaining
   std::unordered_set<std::string> models;  // models loaded on this instance
 };
 
