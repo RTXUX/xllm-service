@@ -1201,38 +1201,21 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
     LOG(INFO) << "Model " << model_id << " on " << instance_name
               << " sleep successful. Memory freed will be reflected in next heartbeat.";
 
-    // MixPD: auto-reset tag to NONE when no awake models remain on this instance
-    if (options_.enable_mix_pd()) {
-      if (count_awake_models_on_instance(instance_name) == 0) {
-        std::unique_lock<std::shared_mutex> lock(tag_mutex_);
-        instance_tag_map_[instance_name] = InstanceTag::NONE;
-        LOG(INFO) << "MixPD: Reset tag for " << instance_name << " to NONE (no awake models)";
-      }
+    if (count_awake_models_on_instance(instance_name) == 0) {
+      std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+      instance_tag_map_[instance_name] = InstanceTag::NONE;
+      LOG(INFO) << "Reset tag for " << instance_name << " to NONE (no awake models)";
     }
   }
 }
 
 void InstanceMgr::send_model_wakeup(const std::string& instance_name,
                                     const std::string& model_id,
-                                    bool memory_increased_in_advance,
-                                    InstanceTag tag) {
+                                    bool memory_increased_in_advance) {
 
   if (instance_name.empty() || instance_name == "all") {
     LOG(ERROR) << "Only support fixed instance_name for model trigger now.";
     return;
-  }
-
-  // MixPD tag validation: PREFILL/DECODE instances are limited to 1 awake model
-  if (options_.enable_mix_pd() &&
-      (tag == InstanceTag::PREFILL || tag == InstanceTag::DECODE)) {
-    int awake_count = count_awake_models_on_instance(instance_name);
-    if (awake_count > 0) {
-      LOG(ERROR) << "MixPD: Cannot wakeup model " << model_id << " on "
-                 << instance_name << " with tag "
-                 << static_cast<int>(tag)
-                 << " — instance already has " << awake_count << " awake model(s)";
-      return;
-    }
   }
 
   auto model_mgr = get_model_instance_mgr(model_id);
@@ -1266,17 +1249,15 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
   if (wakeup_success) {
     LOG(INFO) << "Model " << model_id << " wakeup successful on " << instance_name
               << ". Memory usage will be reflected in next heartbeat.";
-
-    // MixPD: assign tag after successful wakeup
-    if (options_.enable_mix_pd() && tag != InstanceTag::NONE) {
-      std::unique_lock<std::shared_mutex> lock(tag_mutex_);
-      instance_tag_map_[instance_name] = tag;
-      LOG(INFO) << "MixPD: Set tag for " << instance_name << " to "
-                << static_cast<int>(tag);
-    }
   } else {
     LOG(ERROR) << "Failed to wakeup model " << model_id
                << " on " << instance_name;
+    if (count_awake_models_on_instance(instance_name) == 0) {
+      std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+      instance_tag_map_[instance_name] = InstanceTag::NONE;
+      LOG(INFO) << "Reset tag for " << instance_name
+                << " to NONE (wakeup failed, no awake models)";
+    }
   }
 }
 
@@ -1842,6 +1823,10 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
         down.instance_name, ModelState::ALLOCATED);
     deduct_free_pages(down.instance_name,
                       get_model_size_bytes(up.model_id));
+    {
+      std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+      instance_tag_map_[down.instance_name] = determine_elastic_tag(up.model_id);
+    }
     send_model_wakeup(down.instance_name, up.model_id, true);
 
     // Async: drain + sleep old model
@@ -1853,6 +1838,7 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
       auto mgr = get_model_instance_mgr(old_model);
       if (mgr && !mgr->can_sleep(inst)) return;
       send_model_sleep(inst, old_model);
+      promote_prefill_to_decode(old_model);
     }).detach();
   }
 
@@ -1867,9 +1853,7 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
     std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_);
     for (const auto& [inst_name, _] : instances_) {
       if (deficit <= 0) break;
-      if (t.mgr->get_model_state(inst_name) != ModelState::SLEEP) continue;
-      if (is_steady_pool_instance(inst_name)) continue;
-      if (elastic_occupied_instances_.count(inst_name)) continue;
+      if (get_instance_tag(inst_name) != InstanceTag::NONE) continue;
       if (!has_valid_xtensor_info(inst_name)) {
         LOG(WARNING) << "dynamic_part_auto_scaling: skip " << inst_name
                      << " for model " << t.model_id
@@ -1887,6 +1871,10 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
       t.mgr->set_model_state(inst_name, ModelState::ALLOCATED);
       deduct_free_pages(inst_name, model_size);
       elastic_occupied_instances_.insert(inst_name);
+      {
+        std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+        instance_tag_map_[inst_name] = determine_elastic_tag(t.model_id);
+      }
       inst_lock.unlock();
 
       send_model_wakeup(inst_name, t.model_id, true);  // blocking
@@ -1908,8 +1896,11 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
       auto mgr = get_model_instance_mgr(model);
       if (mgr && !mgr->can_sleep(inst)) return;
       send_model_sleep(inst, model);
-      std::lock_guard<std::mutex> lock(allocation_mutex_);
-      elastic_occupied_instances_.erase(inst);
+      {
+        std::lock_guard<std::mutex> lock(allocation_mutex_);
+        elastic_occupied_instances_.erase(inst);
+      }
+      promote_prefill_to_decode(model);
     }).detach();
   }
 
@@ -2232,6 +2223,10 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
     uint64_t model_size = get_model_size_bytes(model_id);
     model_mgr->set_model_state(instance, ModelState::ALLOCATED);
     deduct_free_pages(instance, model_size);
+    {
+      std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+      instance_tag_map_[instance] = InstanceTag::NORMAL;
+    }
 
     alloc_lock.unlock();
     send_model_wakeup(instance, model_id, true);
@@ -2284,28 +2279,8 @@ std::string InstanceMgr::find_or_create_steady_bin(
   {
     std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_);
     for (const auto& [inst_name, _] : instances_) {
-      if (is_steady_pool_instance(inst_name)) {
-        continue;
-      }
-      if (elastic_occupied_instances_.count(inst_name)) {
-        continue;
-      }
-      if (!has_valid_xtensor_info(inst_name)) {
-        continue;
-      }
-
-      // Check that no model is loaded on this instance
-      bool is_idle = true;
-      {
-        std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
-        for (const auto& [mid, mgr] : model_instance_mgrs_) {
-          if (mgr->get_model_state(inst_name) != ModelState::SLEEP) {
-            is_idle = false;
-            break;
-          }
-        }
-      }
-      if (!is_idle) continue;
+      if (get_instance_tag(inst_name) != InstanceTag::NONE) continue;
+      if (!has_valid_xtensor_info(inst_name)) continue;
 
       SteadyBin new_bin;
       new_bin.instance_name = inst_name;
@@ -2339,21 +2314,8 @@ std::string InstanceMgr::find_or_create_steady_bin(
   {
     std::shared_lock<std::shared_mutex> inst_lock(inst_mutex_);
     for (const auto& [inst_name, _] : instances_) {
-      if (is_steady_pool_instance(inst_name)) continue;
-      if (elastic_occupied_instances_.count(inst_name)) continue;
+      if (get_instance_tag(inst_name) != InstanceTag::NONE) continue;
       if (!has_valid_xtensor_info(inst_name)) continue;
-
-      bool is_idle = true;
-      {
-        std::shared_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
-        for (const auto& [mid, mgr] : model_instance_mgrs_) {
-          if (mgr->get_model_state(inst_name) != ModelState::SLEEP) {
-            is_idle = false;
-            break;
-          }
-        }
-      }
-      if (!is_idle) continue;
 
       SteadyBin new_bin;
       new_bin.instance_name = inst_name;
@@ -2531,6 +2493,10 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
   for (const auto& [mid, old_inst, new_inst] : repack_moves) {
     LOG(INFO) << "R(B) repack: moving model " << mid
               << " from " << old_inst << " to " << new_inst;
+    {
+      std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+      instance_tag_map_[new_inst] = InstanceTag::NORMAL;
+    }
     send_model_wakeup(new_inst, mid, false);
     auto mgr = get_model_instance_mgr(mid);
     if (mgr) mgr->set_model_state(old_inst, ModelState::DRAINING);
@@ -2722,6 +2688,10 @@ void InstanceMgr::steady_part_auto_repacking() {
   for (const auto& [model_id, old_inst, new_inst] : moves) {
     LOG(INFO) << "steady_part_auto_repacking: moving model " << model_id
               << " from " << old_inst << " to " << new_inst;
+    {
+      std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+      instance_tag_map_[new_inst] = InstanceTag::NORMAL;
+    }
     send_model_wakeup(new_inst, model_id, false);
     auto mgr = get_model_instance_mgr(model_id);
     if (mgr) mgr->set_model_state(old_inst, ModelState::DRAINING);
@@ -2830,6 +2800,10 @@ void InstanceMgr::elastic_to_steady_demotion() {
     uint64_t model_size = get_model_size_bytes(model_id);
     model_mgr->set_model_state(steady_instance, ModelState::ALLOCATED);
     deduct_free_pages(steady_instance, model_size);
+    {
+      std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+      instance_tag_map_[steady_instance] = InstanceTag::NORMAL;
+    }
 
     // Change pool assignment to STEADY
     pool_it->second = PoolType::STEADY;
@@ -2912,6 +2886,50 @@ InstanceTag InstanceMgr::get_instance_tag(const std::string& instance_name) cons
     return it->second;
   }
   return InstanceTag::NONE;
+}
+
+void InstanceMgr::set_instance_tag(const std::string& instance_name,
+                                   InstanceTag tag) {
+  std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+  instance_tag_map_[instance_name] = tag;
+  LOG(INFO) << "Set tag for " << instance_name << " to "
+            << instance_tag_name(tag);
+}
+
+InstanceTag InstanceMgr::determine_elastic_tag(const std::string& model_id) {
+  auto decode_instances = get_awake_decode_instances(model_id);
+  return decode_instances.empty() ? InstanceTag::DECODE : InstanceTag::PREFILL;
+}
+
+void InstanceMgr::promote_prefill_to_decode(const std::string& model_id) {
+  {
+    std::lock_guard<std::mutex> lock(allocation_mutex_);
+    auto pool_it = model_pool_assignments_.find(model_id);
+    if (pool_it == model_pool_assignments_.end() ||
+        pool_it->second != PoolType::ELASTIC) {
+      return;
+    }
+  }
+
+  auto decode_instances = get_awake_decode_instances(model_id);
+  if (!decode_instances.empty()) {
+    return;
+  }
+
+  auto model_mgr = get_model_instance_mgr(model_id);
+  if (!model_mgr) return;
+
+  auto awake = model_mgr->get_awake_instances();
+  for (const auto& inst : awake) {
+    auto tag = get_instance_tag(inst);
+    if (tag == InstanceTag::PREFILL) {
+      std::unique_lock<std::shared_mutex> tag_lock(tag_mutex_);
+      instance_tag_map_[inst] = InstanceTag::DECODE;
+      LOG(INFO) << "Promoted instance " << inst << " from PREFILL to DECODE "
+                << "for model " << model_id;
+      return;
+    }
+  }
 }
 
 void InstanceMgr::link_instance_bidirectional(

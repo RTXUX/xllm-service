@@ -263,7 +263,7 @@ void XllmRpcService::AssignTag(google::protobuf::RpcController* cntl_base,
 
   LOG(INFO) << "AssignTag: instance=" << req->instance_name()
             << " model=" << req->model_id()
-            << " tag=" << static_cast<int>(tag);
+            << " tag=" << instance_tag_name(tag);
 
   bool ok = xllm_rpc_service_impl_->wakeup_model(
       req->instance_name(), req->model_id(), tag);

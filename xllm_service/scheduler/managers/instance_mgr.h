@@ -54,7 +54,7 @@ class InstanceMgr final {
     // {"Qwen3-32B-W8A8", "/export/home/models/Qwen3-32B-W8A8"}
   };
 
-  std::atomic<uint16_t> master_node_port = 40000;
+  std::atomic<uint16_t> master_node_port = 40033;
   
   static constexpr int kMaxWakeupTimeoutms = 10000;
 
@@ -111,8 +111,7 @@ class InstanceMgr final {
 
   void send_model_wakeup(const std::string& instance_name,
                          const std::string& model_id,
-                         bool memory_increased_in_advance,
-                         InstanceTag tag = InstanceTag::NONE);
+                         bool memory_increased_in_advance);
 
   void update_model_heat(const std::string& model_id,
                          int64_t token_count);
@@ -123,6 +122,7 @@ class InstanceMgr final {
   std::vector<std::string> get_awake_decode_instances(const std::string& model_id);
   int count_awake_models_on_instance(const std::string& instance_name);
   InstanceTag get_instance_tag(const std::string& instance_name) const;
+  void set_instance_tag(const std::string& instance_name, InstanceTag tag);
   bool is_model_waking_up(const std::string& model_id);
 
   // Trigger per-request auto-scaling. Computes GPU targets for elastic pool models
@@ -242,6 +242,14 @@ class InstanceMgr final {
 
   // Get number of GPUs reserved by the steady pool
   int32_t steady_needed_gpus();
+
+  // Determine the tag for an elastic pool instance: DECODE if the model has no
+  // DECODE instance yet, PREFILL otherwise.
+  InstanceTag determine_elastic_tag(const std::string& model_id);
+
+  // If the model is in the elastic pool and has no DECODE instance, promote
+  // one of its PREFILL instances to DECODE.
+  void promote_prefill_to_decode(const std::string& model_id);
 
   // Bidirectional D2D linking between a new instance and its peers (MixPD)
   void link_instance_bidirectional(const std::string& instance_name,

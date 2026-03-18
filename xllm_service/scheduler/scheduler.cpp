@@ -266,8 +266,9 @@ void Scheduler::handle_instance_heartbeat(const proto::HeartbeatRequest* req) {
 void Scheduler::wakeup_model(const std::string& instance_name,
                              const std::string& model_id,
                              InstanceTag tag) {
+  instance_mgr_->set_instance_tag(instance_name, tag);
   instance_mgr_->send_model_wakeup(instance_name, model_id,
-                                   /*memory_increased_in_advance=*/false, tag);
+                                   /*memory_increased_in_advance=*/false);
 }
 
 void Scheduler::sleep_model(const std::string& instance_name,

@@ -548,6 +548,16 @@ enum class InstanceTag : int8_t {
   DECODE = 3,
 };
 
+inline const char* instance_tag_name(InstanceTag tag) {
+  switch (tag) {
+    case InstanceTag::NONE:    return "NONE";
+    case InstanceTag::NORMAL:  return "NORMAL";
+    case InstanceTag::PREFILL: return "PREFILL";
+    case InstanceTag::DECODE:  return "DECODE";
+  }
+  return "UNKNOWN";
+}
+
 struct ResourceNeeds {
   double hbm_gb = 0.0;
   double compute_sm = 0.0;
