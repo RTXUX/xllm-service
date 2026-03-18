@@ -1639,7 +1639,7 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
     int32_t sum = 0;
     for (auto& t : targets) {
       t.gpu_allocated = (t.gpu_target > 0)
-          ? std::max(1, static_cast<int32_t>(std::floor(t.gpu_target * ratio)))
+          ? std::max(2, static_cast<int32_t>(std::floor(t.gpu_target * ratio)))
           : 0;
       sum += t.gpu_allocated;
     }
@@ -1657,9 +1657,9 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
         if (targets[i].gpu_target == 0) continue;
         double raw = targets[i].gpu_target * ratio;
         int32_t floored = static_cast<int32_t>(std::floor(raw));
-        // Skip models bumped by max(1, ...) guarantee — their fractional
+        // Skip models bumped by min-2 guarantee — their fractional
         // part is artificial and should not compete for remainder GPUs.
-        if (floored < 1 && targets[i].gpu_allocated == 1) continue;
+        if (floored < 2 && targets[i].gpu_allocated == 2) continue;
         double frac = raw - targets[i].gpu_allocated;
         candidates.push_back({i, frac, targets[i].heat});
       }
@@ -1677,7 +1677,8 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
       }
     }
 
-    // Trim overshoot from lowest-heat models (safety net)
+    // Trim overshoot from lowest-heat models (safety net).
+    // Never trim below 2 — elastic pool minimum.
     std::sort(targets.begin(), targets.end(),
               [](const ScalingTarget& a, const ScalingTarget& b) {
                 return a.heat < b.heat;
@@ -1685,7 +1686,7 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
     while (sum > budget) {
       bool trimmed = false;
       for (auto& t : targets) {
-        if (t.gpu_allocated > 1) {
+        if (t.gpu_allocated > 2) {
           t.gpu_allocated--;
           sum--;
           trimmed = true;
@@ -1693,6 +1694,26 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
         }
       }
       if (!trimmed) break;
+    }
+
+    // If budget still exceeded (all models are at minimum 2), demote the
+    // coldest models to steady pool to free budget for the rest.
+    // (targets are sorted by heat ascending — coldest first.)
+    while (sum > budget) {
+      bool demoted = false;
+      for (auto& t : targets) {
+        if (t.gpu_allocated > 0 && t.heat > 0) {
+          LOG(INFO) << "Elastic min-2 enforcement: demoting model "
+                    << t.model_id << " (heat=" << t.heat
+                    << ", gpu_allocated=" << t.gpu_allocated
+                    << ") — insufficient budget (" << budget << ")";
+          sum -= t.gpu_allocated;
+          t.gpu_allocated = 0;
+          demoted = true;
+          break;
+        }
+      }
+      if (!demoted) break;
     }
   }
 
@@ -1740,10 +1761,17 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
     int32_t excess = current_wakeup - targets[i].gpu_allocated;
     if (excess <= 0) continue;
     auto unlocked = targets[i].mgr->get_unlocked_instances();
-    for (int32_t j = 0; j < excess &&
-         j < static_cast<int32_t>(unlocked.size()); ++j) {
+    int32_t added = 0;
+    for (size_t j = 0; j < unlocked.size() && added < excess; ++j) {
+      // Protect DECODE instances from scale-down unless the model is being
+      // fully removed (gpu_allocated == 0).
+      if (targets[i].gpu_allocated > 0 &&
+          get_instance_tag(unlocked[j]) == InstanceTag::DECODE) {
+        continue;
+      }
       scale_down_candidates.push_back(
           {unlocked[j], i, targets[i].model_id, false});
+      ++added;
     }
   }
 
@@ -1825,7 +1853,7 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
                       get_model_size_bytes(up.model_id));
     {
       std::unique_lock<std::shared_mutex> lock(tag_mutex_);
-      instance_tag_map_[down.instance_name] = determine_elastic_tag(up.model_id);
+      instance_tag_map_[down.instance_name] = determine_elastic_tag_locked(up.model_id);
     }
     send_model_wakeup(down.instance_name, up.model_id, true);
 
@@ -1873,7 +1901,7 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
       elastic_occupied_instances_.insert(inst_name);
       {
         std::unique_lock<std::shared_mutex> lock(tag_mutex_);
-        instance_tag_map_[inst_name] = determine_elastic_tag(t.model_id);
+        instance_tag_map_[inst_name] = determine_elastic_tag_locked(t.model_id);
       }
       inst_lock.unlock();
 
@@ -2233,10 +2261,49 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
 
     LOG(INFO) << "Assigned model " << model_id << " to STEADY pool on " << instance;
   } else {
-    // Elastic pool
-    model_pool_assignments_[model_id] = PoolType::ELASTIC;
-    LOG(INFO) << "Assigned model " << model_id << " to ELASTIC pool (gpu_target="
-              << gpu_target << ")";
+    // Elastic pool — verify at least 2 instances are available.
+    int32_t elastic_budget =
+        std::max(0, total_available_gpus_.load() - steady_needed_gpus());
+    int32_t elastic_used =
+        static_cast<int32_t>(elastic_occupied_instances_.size());
+    int32_t free_for_elastic = elastic_budget - elastic_used;
+
+    if (free_for_elastic < 2) {
+      LOG(INFO) << "assign_model_to_pool: elastic budget insufficient for "
+                << model_id << " (free=" << free_for_elastic
+                << " < 2), falling back to STEADY";
+
+      ResourceNeeds needs = (res_it != model_resource_models_.end())
+          ? res_it->second->compute_resource_needs(heat)
+          : ResourceNeeds{20.0, 0.0, 0.0};
+
+      std::string instance = find_or_create_steady_bin(model_id, needs);
+      if (instance.empty()) {
+        LOG(WARNING) << "assign_model_to_pool: no instance for steady pool "
+                     << "fallback either, model " << model_id << " unassigned";
+        return;
+      }
+
+      model_pool_assignments_[model_id] = PoolType::STEADY;
+      uint64_t model_size = get_model_size_bytes(model_id);
+      model_mgr->set_model_state(instance, ModelState::ALLOCATED);
+      deduct_free_pages(instance, model_size);
+      {
+        std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+        instance_tag_map_[instance] = InstanceTag::NORMAL;
+      }
+
+      alloc_lock.unlock();
+      send_model_wakeup(instance, model_id, true);
+
+      LOG(INFO) << "Assigned model " << model_id
+                << " to STEADY pool (elastic budget insufficient) on "
+                << instance;
+    } else {
+      model_pool_assignments_[model_id] = PoolType::ELASTIC;
+      LOG(INFO) << "Assigned model " << model_id
+                << " to ELASTIC pool (gpu_target=" << gpu_target << ")";
+    }
   }
 }
 
@@ -2447,6 +2514,15 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
 
   if (gpu_target <= 1) {
     return false;  // still fits in steady pool
+  }
+
+  // Don't upgrade if elastic pool can't guarantee at least 2 instances.
+  int32_t elastic_budget =
+      std::max(0, total_available_gpus_.load() - steady_needed_gpus());
+  int32_t elastic_used =
+      static_cast<int32_t>(elastic_occupied_instances_.size());
+  if (elastic_budget - elastic_used < 2) {
+    return false;
   }
 
   // Find the steady instance hosting this model
@@ -2897,8 +2973,15 @@ void InstanceMgr::set_instance_tag(const std::string& instance_name,
 }
 
 InstanceTag InstanceMgr::determine_elastic_tag(const std::string& model_id) {
-  auto decode_instances = get_awake_decode_instances(model_id);
-  return decode_instances.empty() ? InstanceTag::DECODE : InstanceTag::PREFILL;
+  auto awake = get_awake_instances(model_id);
+  return awake.empty() ? InstanceTag::DECODE : InstanceTag::PREFILL;
+}
+
+InstanceTag InstanceMgr::determine_elastic_tag_locked(const std::string& model_id) {
+  auto model_mgr = get_model_instance_mgr(model_id);
+  if (!model_mgr) return InstanceTag::DECODE;
+  return model_mgr->get_awake_instances().empty()
+      ? InstanceTag::DECODE : InstanceTag::PREFILL;
 }
 
 void InstanceMgr::promote_prefill_to_decode(const std::string& model_id) {

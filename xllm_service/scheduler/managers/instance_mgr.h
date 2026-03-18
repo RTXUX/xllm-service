@@ -247,6 +247,10 @@ class InstanceMgr final {
   // DECODE instance yet, PREFILL otherwise.
   InstanceTag determine_elastic_tag(const std::string& model_id);
 
+  // Same as determine_elastic_tag but reads instance_tag_map_ directly.
+  // Must be called while holding tag_mutex_ (avoids re-entrant locking).
+  InstanceTag determine_elastic_tag_locked(const std::string& model_id);
+
   // If the model is in the elastic pool and has no DECODE instance, promote
   // one of its PREFILL instances to DECODE.
   void promote_prefill_to_decode(const std::string& model_id);
