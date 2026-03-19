@@ -238,15 +238,21 @@ bool BlitzScaleInstanceMgr::dispatch_with_prefill(
   // execute_activate enqueues the instance immediately but send_model_wakeup
   // is async; the instance will be re-enqueued via notify_prefill_done once
   // it actually processes its first request.
-  auto awake = get_awake_instances(request->model);
-  if (!contains_instance(awake, prefill_instance)) {
-    return false;
+  std::optional<std::string> decode;
+  if (request->max_tokens == 1) {
+    decode = prefill_instance;  // Prefill-only request; decode is a no-op. Skip checks.
   }
-
-  auto decode = select_decode_instance(
-      request->model, get_request_blocks(request->token_ids.size()));
   if (!decode.has_value()) {
-    decode = prefill_instance;
+    auto awake = get_awake_instances(request->model);
+    if (!contains_instance(awake, prefill_instance)) {
+      return false;
+    }
+
+    decode = select_decode_instance(
+        request->model, get_request_blocks(request->token_ids.size()));
+    if (!decode.has_value()) {
+      decode = prefill_instance;
+    }
   }
 
   request->routing.prefill_name = prefill_instance;
