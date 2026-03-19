@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "scheduler/scheduler.h"
 
+#include "common/coro.h"
+
 #include "common/xllm/status.h"
 #include "loadbalance_policy/cache_aware_routing.h"
 #include "loadbalance_policy/lst_imh_policy.h"
@@ -176,8 +178,7 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
   }
 
   if (is_master_service_) {
-    heartbeat_thread_ = std::make_unique<std::thread>(
-        &Scheduler::update_master_service_heartbeat, this);
+    Coroutine(heartbeat_coro(), /*detach=*/true);
   } else {
     auto handle_master = std::bind(&Scheduler::handle_master_service_watch,
                                    this,
@@ -359,7 +360,7 @@ void Scheduler::process_request_queue(const std::string& model_name) {
     }
 
     if (request->dispatch_callback) {
-      std::thread([request]() { request->dispatch_callback(); }).detach();
+      Coroutine(request->dispatch_callback(), /*detach=*/true);
     }
   }
 }
@@ -406,7 +407,7 @@ void Scheduler::process_prism_request(std::shared_ptr<Request> request) {
   }
 
   if (request->dispatch_callback) {
-    std::thread([request]() { request->dispatch_callback(); }).detach();
+    Coroutine(request->dispatch_callback(), /*detach=*/true);
   }
 }
 
@@ -448,7 +449,7 @@ void Scheduler::process_serverless_llm_request(
   }
 
   if (request->dispatch_callback) {
-    std::thread([request]() { request->dispatch_callback(); }).detach();
+    Coroutine(request->dispatch_callback(), /*detach=*/true);
   }
 }
 
@@ -495,16 +496,14 @@ void Scheduler::process_llumnix_request(std::shared_ptr<Request> request) {
   }
 
   if (request->dispatch_callback) {
-    std::thread([request]() { request->dispatch_callback(); }).detach();
+    Coroutine(request->dispatch_callback(), /*detach=*/true);
   }
 }
 
-void Scheduler::update_master_service_heartbeat() {
+CoroTask Scheduler::heartbeat_coro() {
   while (!exited_) {
-    std::this_thread::sleep_for(std::chrono::seconds(kHeartbeatInterval));
-
+    co_await Coroutine::usleep(kHeartbeatInterval * 1'000'000);
     global_kvcache_mgr_->upload_kvcache();
-
     instance_mgr_->upload_load_metrics();
   }
 }
@@ -535,8 +534,7 @@ void Scheduler::handle_master_service_watch(const etcd::Response& response,
                         kHeartbeatInterval)) {
     is_master_service_ = true;
 
-    heartbeat_thread_ = std::make_unique<std::thread>(
-        &Scheduler::update_master_service_heartbeat, this);
+    Coroutine(heartbeat_coro(), /*detach=*/true);
 
     global_kvcache_mgr_->set_as_master();
     instance_mgr_->set_as_master();

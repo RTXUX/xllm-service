@@ -80,7 +80,7 @@ class Scheduler final {
  private:
   DISALLOW_COPY_AND_ASSIGN(Scheduler);
 
-  void update_master_service_heartbeat();
+  CoroTask heartbeat_coro();
 
   void handle_master_service_watch(const etcd::Response& response,
                                    const uint64_t& prefix_len);
@@ -135,7 +135,6 @@ class Scheduler final {
 
   std::unique_ptr<LoadBalancePolicy> lb_policy_;
 
-  std::unique_ptr<std::thread> heartbeat_thread_;
 
   // `model name` -> `request queue` map
   std::unordered_map<std::string,

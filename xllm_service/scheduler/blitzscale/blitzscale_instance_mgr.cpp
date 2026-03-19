@@ -1,5 +1,7 @@
 #include "scheduler/blitzscale/blitzscale_instance_mgr.h"
 
+#include "common/coro.h"
+
 #include <glog/logging.h>
 
 #include <algorithm>
@@ -387,7 +389,7 @@ void BlitzScaleInstanceMgr::dispatch_pending_requests() {
       }
 
       if (front->dispatch_callback) {
-        std::thread([front]() { front->dispatch_callback(); }).detach();
+        Coroutine(front->dispatch_callback(), /*detach=*/true);
       }
     }
   }
