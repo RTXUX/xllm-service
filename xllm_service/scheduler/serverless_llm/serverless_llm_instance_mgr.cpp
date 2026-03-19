@@ -331,14 +331,20 @@ std::vector<ServerlessLLMInstanceMgr::SLLMAction>
 ServerlessLLMInstanceMgr::activate_needed_models() {
   std::vector<SLLMAction> actions;
 
-  // Find models with waiting requests but no WAKEUP instance
-  std::vector<std::string> models_needing_activation;
+  // Snapshot pending activations before acquiring req_mutex_
+  std::unordered_set<std::string> pending_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(placement_mutex_);
+    pending_snapshot = pending_activation_models_;
+  }
+
+  // Find models with waiting requests (skip those already activating)
+  std::vector<std::string> candidates;
   {
     std::lock_guard<std::mutex> lock(req_mutex_);
     for (const auto& [model_id, req_ids] : model_requests_) {
       if (req_ids.empty()) continue;
-
-      // Check if any request is waiting
+      if (pending_snapshot.count(model_id)) continue;  // activation in flight
       bool has_waiting = false;
       for (const auto& rid : req_ids) {
         auto it = requests_.find(rid);
@@ -348,17 +354,15 @@ ServerlessLLMInstanceMgr::activate_needed_models() {
           break;
         }
       }
-      if (!has_waiting) continue;
-
-      auto awake = get_awake_instances(model_id);
-      if (awake.empty()) {
-        models_needing_activation.push_back(model_id);
-      }
+      if (has_waiting) candidates.push_back(model_id);
     }
   }
 
-  // For each model, use storage-aware allocation
-  for (const auto& model_id : models_needing_activation) {
+  // Check awake instances OUTSIDE req_mutex_ (avoids lock ordering issues)
+  for (const auto& model_id : candidates) {
+    auto awake = get_awake_instances(model_id);
+    if (!awake.empty()) continue;  // already awake
+
     auto plan = find_best_allocation(model_id);
     if (!plan.has_value()) {
       LOG(WARNING) << "ServerlessLLM: no allocation found for model "
@@ -371,12 +375,9 @@ ServerlessLLMInstanceMgr::activate_needed_models() {
               << " (tier=" << plan->storage_tier
               << " latency=" << plan->total_latency << "s)";
 
-    // Add eviction actions first
     for (const auto& eviction : plan->evictions) {
       actions.push_back(eviction);
     }
-
-    // Add activation action
     SLLMAction action;
     action.type = SLLMAction::ACTIVATE;
     action.model_id = model_id;
@@ -752,26 +753,49 @@ void ServerlessLLMInstanceMgr::execute_actions(
 
 void ServerlessLLMInstanceMgr::execute_activate(
     const std::string& model_id, const std::string& instance_name) {
-  LOG(INFO) << "ServerlessLLM: executing ACTIVATE model=" << model_id
+  LOG(INFO) << "ServerlessLLM: scheduling async ACTIVATE model=" << model_id
             << " instance=" << instance_name;
 
-  store_mgr_.record_io_start(instance_name);
-
-  // Use inherited send_model_wakeup (D2D with H2D fallback)
-  send_model_wakeup(instance_name, model_id,
-                    /*memory_increased_in_advance=*/false);
-
-  store_mgr_.record_io_complete(instance_name);
-
-  // Update placement mapping
+  // Mark activation as pending to prevent double-scheduling
   {
     std::lock_guard<std::mutex> lock(placement_mutex_);
-    instance_to_models_[instance_name].insert(model_id);
-    model_to_instances_[model_id].insert(instance_name);
+    // if (pending_activation_models_.count(model_id) > 0) {
+    //   LOG(WARNING) << "ServerlessLLM: model " << model_id
+    //                << " already pending activation, skipping duplicate";
+    //   return;
+    // }
+    pending_activation_models_.insert(model_id);
   }
 
-  // Touch model for LRU
-  store_mgr_.touch_model(model_id, instance_name);
+  // Transition SLEEP -> ALLOCATED (fast, synchronous)
+  auto model_mgr = get_model_instance_mgr(model_id);
+  if (model_mgr->get_model_state(instance_name) != ModelState::SLEEP) {
+    LOG(WARNING) << "ServerlessLLM: model " << model_id
+                 << " is not sleep on instance " << instance_name;
+    return;
+  }
+  model_mgr->set_model_state(instance_name, ModelState::ALLOCATED);
+
+  // Run blocking HTTP wakeup in background (same pattern as execute_deactivate)
+  std::thread([this, model_id, instance_name]() {
+    store_mgr_.record_io_start(instance_name);
+
+    // Blocking HTTP call (D2D or H2D)
+    send_model_wakeup(instance_name, model_id,
+                      /*memory_increased_in_advance=*/false);
+
+    store_mgr_.record_io_complete(instance_name);
+
+    // Update placement map and remove pending marker
+    {
+      std::lock_guard<std::mutex> lock(placement_mutex_);
+      instance_to_models_[instance_name].insert(model_id);
+      model_to_instances_[model_id].insert(instance_name);
+      pending_activation_models_.erase(model_id);
+    }
+
+    store_mgr_.touch_model(model_id, instance_name);
+  }).detach();
 }
 
 void ServerlessLLMInstanceMgr::execute_deactivate(
@@ -787,6 +811,14 @@ void ServerlessLLMInstanceMgr::execute_deactivate(
     if (model_to_instances_[model_id].empty()) {
       model_to_instances_.erase(model_id);
     }
+  }
+
+  // Immediately mark DRAINING — stops dispatch_request from routing new
+  // requests here while in-flight requests finish draining.
+  // Matches the pattern used by every other sleep path in InstanceMgr.
+  auto model_mgr = get_model_instance_mgr(model_id);
+  if (model_mgr) {
+    model_mgr->set_model_state(instance_name, ModelState::DRAINING);
   }
 
   // Async drain + sleep (non-blocking)

@@ -154,6 +154,8 @@ class ServerlessLLMInstanceMgr : public InstanceMgr {
   // model_id -> set of instances where it's active
   std::unordered_map<std::string, std::unordered_set<std::string>>
       model_to_instances_;
+  // Tracks model_ids for which an async activation is in-flight
+  std::unordered_set<std::string> pending_activation_models_;
   std::mutex placement_mutex_;
 
   // Scheduling thread
