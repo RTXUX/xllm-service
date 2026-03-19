@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -165,7 +166,14 @@ class BlitzScaleInstanceMgr : public InstanceMgr {
 
   std::unordered_map<std::string, std::shared_ptr<ReqInfo>> requests_;
   std::unordered_map<std::string, std::vector<std::string>> model_requests_;
-  mutable std::mutex req_mutex_;
+  // Per-instance running request counts; incremented/decremented under
+  // exclusive req_mutex_, readable lock-free via atomic load once the entry
+  // exists (entry lifetime is tied to req_mutex_ exclusive sections).
+  std::unordered_map<std::string, std::unique_ptr<std::atomic<int32_t>>>
+      instance_prefill_count_;
+  std::unordered_map<std::string, std::unique_ptr<std::atomic<int32_t>>>
+      instance_decode_count_;
+  mutable std::shared_mutex req_mutex_;
 
   std::unordered_map<std::string, std::unordered_set<std::string>>
       prefill_instances_;

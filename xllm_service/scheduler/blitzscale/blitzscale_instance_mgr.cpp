@@ -49,7 +49,7 @@ void BlitzScaleInstanceMgr::enqueue_request(const std::string& model,
                                             const std::string& request_id,
                                             int32_t prompt_tokens,
                                             double enqueue_time) {
-  std::lock_guard<std::mutex> lock(req_mutex_);
+  std::unique_lock<std::shared_mutex> lock(req_mutex_);
   auto info = std::make_shared<ReqInfo>();
   info->rid = request_id;
   info->model = model;
@@ -110,48 +110,86 @@ void BlitzScaleInstanceMgr::notify_prefill_done(
 void BlitzScaleInstanceMgr::start_running(const std::string& request_id,
                                           const std::string& prefill_instance,
                                           const std::string& decode_instance) {
-  std::lock_guard<std::mutex> lock(req_mutex_);
-  auto it = requests_.find(request_id);
-  if (it == requests_.end()) {
-    return;
-  }
-  it->second->state = ReqInfo::RUNNING;
-  it->second->prefill_instance = prefill_instance;
-  it->second->decode_instance = decode_instance;
+  std::string model;
+  {
+    std::unique_lock<std::shared_mutex> lock(req_mutex_);
+    auto it = requests_.find(request_id);
+    if (it == requests_.end()) {
+      return;
+    }
+    it->second->state = ReqInfo::RUNNING;
+    it->second->prefill_instance = prefill_instance;
+    it->second->decode_instance = decode_instance;
+    model = it->second->model;
 
+    // Maintain per-instance counters (atomic, under exclusive lock for
+    // map-structural safety; value updates are relaxed atomics).
+    auto& pc = instance_prefill_count_[prefill_instance];
+    if (!pc) pc = std::make_unique<std::atomic<int32_t>>(0);
+    pc->fetch_add(1, std::memory_order_relaxed);
+
+    auto& dc = instance_decode_count_[decode_instance];
+    if (!dc) dc = std::make_unique<std::atomic<int32_t>>(0);
+    dc->fetch_add(1, std::memory_order_relaxed);
+  }
+  // Update last_used without holding req_mutex_ (eliminates nested lock).
+  const double now = now_seconds();
   std::lock_guard<std::mutex> lu_lock(last_used_mutex_);
-  model_last_used_[it->second->model][prefill_instance] = now_seconds();
-  model_last_used_[it->second->model][decode_instance] = now_seconds();
+  model_last_used_[model][prefill_instance] = now;
+  model_last_used_[model][decode_instance] = now;
 }
 
 void BlitzScaleInstanceMgr::finish_request(const std::string& request_id) {
-  std::lock_guard<std::mutex> lock(req_mutex_);
-  auto it = requests_.find(request_id);
-  if (it == requests_.end()) {
-    return;
-  }
-
+  std::string model;
+  std::string prefill_instance;
+  std::string decode_instance;
   {
+    std::unique_lock<std::shared_mutex> lock(req_mutex_);
+    auto it = requests_.find(request_id);
+    if (it == requests_.end()) {
+      return;
+    }
+
+    model = it->second->model;
+    prefill_instance = it->second->prefill_instance;
+    decode_instance = it->second->decode_instance;
+
+    // Decrement per-instance counters.
+    if (!prefill_instance.empty()) {
+      auto cit = instance_prefill_count_.find(prefill_instance);
+      if (cit != instance_prefill_count_.end()) {
+        cit->second->fetch_sub(1, std::memory_order_relaxed);
+      }
+    }
+    if (!decode_instance.empty()) {
+      auto cit = instance_decode_count_.find(decode_instance);
+      if (cit != instance_decode_count_.end()) {
+        cit->second->fetch_sub(1, std::memory_order_relaxed);
+      }
+    }
+
+    auto& model_reqs = model_requests_[model];
+    model_reqs.erase(
+        std::remove(model_reqs.begin(), model_reqs.end(), request_id),
+        model_reqs.end());
+    if (model_reqs.empty()) {
+      model_requests_.erase(model);
+    }
+
+    requests_.erase(it);
+  }
+
+  // Update last_used without holding req_mutex_ (eliminates nested lock).
+  if (!prefill_instance.empty() || !decode_instance.empty()) {
+    const double now = now_seconds();
     std::lock_guard<std::mutex> lu_lock(last_used_mutex_);
-    if (!it->second->prefill_instance.empty()) {
-      model_last_used_[it->second->model][it->second->prefill_instance] =
-          now_seconds();
+    if (!prefill_instance.empty()) {
+      model_last_used_[model][prefill_instance] = now;
     }
-    if (!it->second->decode_instance.empty()) {
-      model_last_used_[it->second->model][it->second->decode_instance] =
-          now_seconds();
+    if (!decode_instance.empty()) {
+      model_last_used_[model][decode_instance] = now;
     }
   }
-
-  auto& model_reqs = model_requests_[it->second->model];
-  model_reqs.erase(
-      std::remove(model_reqs.begin(), model_reqs.end(), request_id),
-      model_reqs.end());
-  if (model_reqs.empty()) {
-    model_requests_.erase(it->second->model);
-  }
-
-  requests_.erase(it);
 
   dispatch_cv_.notify_one();
 }
@@ -175,7 +213,7 @@ bool BlitzScaleInstanceMgr::dispatch_request(std::shared_ptr<Request> request) {
   request->routing.prefill_name = *prefill;
   request->routing.decode_name = *decode;
 
-  std::lock_guard<std::mutex> lock(req_mutex_);
+  std::unique_lock<std::shared_mutex> lock(req_mutex_);
   auto it = requests_.find(request->service_request_id);
   if (it != requests_.end()) {
     it->second->prefill_instance = *prefill;
@@ -205,7 +243,7 @@ bool BlitzScaleInstanceMgr::dispatch_with_prefill(
   request->routing.prefill_name = prefill_instance;
   request->routing.decode_name = *decode;
 
-  std::lock_guard<std::mutex> lock(req_mutex_);
+  std::unique_lock<std::shared_mutex> lock(req_mutex_);
   auto it = requests_.find(request->service_request_id);
   if (it != requests_.end()) {
     it->second->prefill_instance = prefill_instance;
@@ -310,10 +348,10 @@ void BlitzScaleInstanceMgr::dispatch_pending_requests() {
         front = pq_it->second.front();
       }
 
-      // Check timeout via enqueue_time stored in ReqInfo
+      // Check timeout via enqueue_time stored in ReqInfo (shared read lock).
       double enqueue_time = 0.0;
       {
-        std::lock_guard<std::mutex> lk(req_mutex_);
+        std::shared_lock<std::shared_mutex> lk(req_mutex_);
         auto it = requests_.find(front->service_request_id);
         if (it != requests_.end()) {
           enqueue_time = it->second->enqueue_time;
@@ -787,7 +825,7 @@ int32_t BlitzScaleInstanceMgr::get_waiting_prefill_tokens(
 }
 
 int32_t BlitzScaleInstanceMgr::get_active_count(const std::string& model_id) {
-  std::lock_guard<std::mutex> lock(req_mutex_);
+  std::shared_lock<std::shared_mutex> lock(req_mutex_);
   auto it = model_requests_.find(model_id);
   if (it == model_requests_.end()) {
     return 0;
@@ -819,27 +857,19 @@ int32_t BlitzScaleInstanceMgr::estimate_used_blocks(
 
 int32_t BlitzScaleInstanceMgr::get_prefill_load(
     const std::string& instance_name) {
-  std::lock_guard<std::mutex> lock(req_mutex_);
-  int32_t count = 0;
-  for (const auto& [_, info] : requests_) {
-    if (info->prefill_instance == instance_name) {
-      ++count;
-    }
-  }
-  return count;
+  // Shared lock only to protect map-structural access; value is an atomic.
+  std::shared_lock<std::shared_mutex> lock(req_mutex_);
+  auto it = instance_prefill_count_.find(instance_name);
+  if (it == instance_prefill_count_.end()) return 0;
+  return it->second->load(std::memory_order_relaxed);
 }
 
 int32_t BlitzScaleInstanceMgr::get_decode_load(
     const std::string& instance_name) {
-  std::lock_guard<std::mutex> lock(req_mutex_);
-  int32_t count = 0;
-  for (const auto& [_, info] : requests_) {
-    if (info->decode_instance == instance_name &&
-        info->state == ReqInfo::RUNNING) {
-      ++count;
-    }
-  }
-  return count;
+  std::shared_lock<std::shared_mutex> lock(req_mutex_);
+  auto it = instance_decode_count_.find(instance_name);
+  if (it == instance_decode_count_.end()) return 0;
+  return it->second->load(std::memory_order_relaxed);
 }
 
 std::vector<std::string> BlitzScaleInstanceMgr::get_role_instances(

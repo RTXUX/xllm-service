@@ -18,7 +18,9 @@ limitations under the License.
 
 #include <absl/synchronization/mutex.h>
 
-#include <queue>
+#include <algorithm>
+#include <deque>
+#include <optional>
 
 #if __has_attribute(guarded_by)
 #define GUARDED_BY(x) __attribute__((guarded_by(x)))
@@ -29,7 +31,7 @@ limitations under the License.
 namespace xllm_service {
 
 // a simple thread-safe queue that supports multiple producers and multiple
-// consumers concurrently the queue is implemented as a queue with condition
+// consumers concurrently the queue is implemented as a deque with condition
 // variable and mutex lock
 template <typename T>
 class ConcurrentQueue {
@@ -49,7 +51,7 @@ class ConcurrentQueue {
       auto not_full = [this]() { return queue_.size() < capacity_; };
       mutex_.Await(absl::Condition(&not_full));
     }
-    queue_.push(std::move(value));
+    queue_.push_back(std::move(value));
   }
 
   template <typename... Args>
@@ -59,7 +61,7 @@ class ConcurrentQueue {
       auto not_full = [this]() { return queue_.size() < capacity_; };
       mutex_.Await(absl::Condition(&not_full));
     }
-    queue_.emplace(std::forward<Args>(args)...);
+    queue_.emplace_back(std::forward<Args>(args)...);
   }
 
   // pop an element from the queue, block if the queue is empty
@@ -70,8 +72,41 @@ class ConcurrentQueue {
     mutex_.Await(absl::Condition(&not_empty));
 
     T value = std::move(queue_.front());
-    queue_.pop();
+    queue_.pop_front();
     return value;
+  }
+
+  // non-blocking peek of the front element; returns nullopt if empty
+  std::optional<T> try_front() {
+    absl::MutexLock lock(&mutex_);
+    if (queue_.empty()) return std::nullopt;
+    return queue_.front();
+  }
+
+  // non-blocking pop; returns false if empty
+  bool try_pop(T& out) {
+    absl::MutexLock lock(&mutex_);
+    if (queue_.empty()) return false;
+    out = std::move(queue_.front());
+    queue_.pop_front();
+    return true;
+  }
+
+  // atomically pops front only if it equals expected; returns true if popped
+  bool pop_front_if(const T& expected) {
+    absl::MutexLock lock(&mutex_);
+    if (queue_.empty() || queue_.front() != expected) return false;
+    queue_.pop_front();
+    return true;
+  }
+
+  // removes first occurrence of value; returns true if found and removed
+  bool erase_first(const T& value) {
+    absl::MutexLock lock(&mutex_);
+    auto it = std::find(queue_.begin(), queue_.end(), value);
+    if (it == queue_.end()) return false;
+    queue_.erase(it);
+    return true;
   }
 
   // return the size of the queue
@@ -87,8 +122,8 @@ class ConcurrentQueue {
   }
 
  private:
-  // the underlying queue
-  std::queue<T> queue_ GUARDED_BY(mutex_);
+  // the underlying deque
+  std::deque<T> queue_ GUARDED_BY(mutex_);
   // mutex lock for the queue
   absl::Mutex mutex_;
 
