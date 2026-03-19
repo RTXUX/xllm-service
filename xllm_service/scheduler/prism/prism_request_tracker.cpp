@@ -64,17 +64,18 @@ void PrismRequestTracker::start_running(const std::string& rid,
   queue.running_reqs.push_back(req);
 }
 
-void PrismRequestTracker::finish_req(const std::string& rid) {
+std::string PrismRequestTracker::finish_req(const std::string& rid) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = all_reqs_.find(rid);
   if (it == all_reqs_.end()) {
-    return;  // Already finished or unknown
+    return {};  // Already finished or unknown
   }
   auto& req = it->second;
+  std::string model = req->model;
   req->state = PrismReqState::FINISHED;
   req->finish_time = now_seconds();
 
-  auto& queue = model_queues_[req->model];
+  auto& queue = model_queues_[model];
   queue.last_active_time = now_seconds();
 
   // Remove from running
@@ -89,6 +90,7 @@ void PrismRequestTracker::finish_req(const std::string& rid) {
   }
 
   all_reqs_.erase(it);
+  return model;
 }
 
 std::unordered_map<std::string, PrismModelQueue>

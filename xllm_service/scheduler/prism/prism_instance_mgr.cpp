@@ -48,7 +48,13 @@ void PrismInstanceMgr::start_prism_running(const std::string& rid,
 }
 
 void PrismInstanceMgr::finish_prism_request(const std::string& rid) {
-  req_tracker_.finish_req(rid);
+  std::string model = req_tracker_.finish_req(rid);
+  // Notify blocked dispatchers: a running request finished, so capacity may
+  // have dropped below backend_queue_threshold and dispatch can now succeed.
+  if (!model.empty()) {
+    auto cv = get_model_cv(model);
+    cv->notify_all();
+  }
 }
 
 // ============================================================================

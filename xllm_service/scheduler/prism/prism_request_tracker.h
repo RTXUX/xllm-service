@@ -42,7 +42,8 @@ class PrismRequestTracker {
   // Request lifecycle
   void enqueue_req(const std::string& model, std::shared_ptr<PrismReq> req);
   void start_running(const std::string& rid, const std::string& instance_name);
-  void finish_req(const std::string& rid);
+  // Returns the model_id of the finished request, or empty string if not found.
+  std::string finish_req(const std::string& rid);
 
   // Queries (thread-safe deep copy)
   std::unordered_map<std::string, PrismModelQueue> snapshot_queues();
