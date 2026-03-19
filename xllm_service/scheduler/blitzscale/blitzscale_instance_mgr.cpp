@@ -505,9 +505,19 @@ BlitzScaleInstanceMgr::gen_model_actions(const std::string& model_id) {
     return actions;
   }
 
+  
+
   const int32_t waiting_prefill_tokens = get_waiting_prefill_tokens(model_id);
   const int32_t waiting_decode_blocks = compute_waiting_decode_blocks(model_id);
   const int32_t prefill_tokens = compute_prefill_tokens(model_id);
+
+  LOG(INFO) << "BlitzScale: planning actions for model " << model_id
+            << " waiting_count=" << waiting_count
+            << " current_prefill=" << current_prefill
+            << " current_decode=" << current_decode
+            << " waiting_prefill_tokens=" << waiting_prefill_tokens
+            << " waiting_decode_blocks=" << waiting_decode_blocks
+            << " prefill_tokens=" << prefill_tokens;
 
   auto [delta_prefill, delta_decode] =
       compute_scale_plan(model_id,
@@ -516,6 +526,10 @@ BlitzScaleInstanceMgr::gen_model_actions(const std::string& model_id) {
                          waiting_prefill_tokens,
                          waiting_decode_blocks,
                          prefill_tokens);
+
+  LOG(INFO) << "BlitzScale: computed scale plan for model " << model_id
+            << " delta_prefill=" << delta_prefill
+            << " delta_decode=" << delta_decode;
 
   while (delta_prefill > 0 && delta_decode < 0) {
     auto flip = select_flip_instance(model_id, Role::DECODE);
