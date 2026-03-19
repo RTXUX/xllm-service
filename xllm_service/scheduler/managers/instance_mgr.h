@@ -55,6 +55,7 @@ class InstanceMgr final {
   };
 
   std::atomic<uint16_t> master_node_port = 40033;
+  std::atomic<uint16_t> disagg_pd_port_ = 29084;
   
   static constexpr int kMaxWakeupTimeoutms = 10000;
 

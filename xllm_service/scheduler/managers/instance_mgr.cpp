@@ -278,6 +278,7 @@ std::vector<std::string> InstanceMgr::get_static_prefill_list(
 void InstanceMgr::fork_master_and_sleep(
     const std::string& instance_name,
     std::shared_ptr<brpc::Channel> channel) {
+  LOG(INFO) << "Forking master and sleeping for instance " << instance_name;
   for (const auto& model : MODELS) {
     // 1. Fork Master
 
@@ -286,6 +287,7 @@ void InstanceMgr::fork_master_and_sleep(
     fork_body["master_node_addr"] = "127.0.0.1:" + std::to_string(++master_node_port);
     fork_body["master_status"] = 1;
     fork_body["nnodes"] = kTensorParallelSize;
+    fork_body["disagg_pd_port"] = static_cast<int>(++disagg_pd_port_);
 
     auto model_id = model.first;
 
@@ -294,6 +296,8 @@ void InstanceMgr::fork_master_and_sleep(
 
     std::vector<std::thread> fork_threads;
     std::atomic<int> fork_success_count(0);
+
+    LOG(INFO) << "Forking master and sleeping for model " << model_id << " on instance " << instance_name;
 
     for (int node_idx = 0; node_idx < kTensorParallelSize; ++node_idx) {
       
@@ -319,7 +323,7 @@ void InstanceMgr::fork_master_and_sleep(
           LOG(WARNING) << "Failed to fork master for model " << model_id << " on "
                        << tmp_instance_name << ", retry " << i + 1;
           std::this_thread::sleep_for(std::chrono::seconds(1));
-        }      
+        }
 
       });
 
@@ -348,9 +352,12 @@ void InstanceMgr::fork_master_and_sleep(
     send_http_request(channel, "/sleep", sleep_body.dump());
   }
 
+  LOG(INFO) << "All models fork_master'd — bidirectional D2D linking with all ready instances";
+
   // All models fork_master'd — bidirectional D2D linking with all ready instances
   {
     auto new_info = get_instance_xtensor_info(instance_name);
+    LOG(INFO) << "New instance " << instance_name << " has " << new_info->device_addrs.size() << " device addrs";
     if (new_info && !new_info->device_addrs.empty()) {
       // Snapshot fork_done instances (release lock before acquiring xtensor_info_mutex_)
       std::vector<std::string> done_peers;
@@ -379,6 +386,7 @@ void InstanceMgr::fork_master_and_sleep(
 
       // Use first model's mgr for the link call (mooncake session is model-agnostic)
       auto mgr = get_model_instance_mgr(MODELS[0].first);
+      LOG(INFO) << "Linking D2D bidirectional for model " << MODELS[0].first << " with " << peers.size() << " peers";
       if (mgr) {
         mgr->link_d2d_bidirectional(channel, new_info->device_addrs, peers);
       }
@@ -1853,7 +1861,11 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
                       get_model_size_bytes(up.model_id));
     {
       std::unique_lock<std::shared_mutex> lock(tag_mutex_);
-      instance_tag_map_[down.instance_name] = determine_elastic_tag_locked(up.model_id);
+      auto new_tag = determine_elastic_tag_locked(up.model_id);
+      instance_tag_map_[down.instance_name] = new_tag;
+      LOG(INFO) << "Tag change: instance " << down.instance_name
+                << " -> " << instance_tag_name(new_tag)
+                << " (overlapped scale-up for model " << up.model_id << ")";
     }
     send_model_wakeup(down.instance_name, up.model_id, true);
 
@@ -1901,7 +1913,11 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
       elastic_occupied_instances_.insert(inst_name);
       {
         std::unique_lock<std::shared_mutex> lock(tag_mutex_);
-        instance_tag_map_[inst_name] = determine_elastic_tag_locked(t.model_id);
+        auto new_tag = determine_elastic_tag_locked(t.model_id);
+        instance_tag_map_[inst_name] = new_tag;
+        LOG(INFO) << "Tag change: instance " << inst_name
+                  << " -> " << instance_tag_name(new_tag)
+                  << " (elastic scale-up for model " << t.model_id << ")";
       }
       inst_lock.unlock();
 
@@ -2254,6 +2270,8 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
     {
       std::unique_lock<std::shared_mutex> lock(tag_mutex_);
       instance_tag_map_[instance] = InstanceTag::NORMAL;
+      LOG(INFO) << "Tag change: instance " << instance
+                << " -> NORMAL (steady pool assign for model " << model_id << ")";
     }
 
     alloc_lock.unlock();
@@ -2291,6 +2309,9 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
       {
         std::unique_lock<std::shared_mutex> lock(tag_mutex_);
         instance_tag_map_[instance] = InstanceTag::NORMAL;
+        LOG(INFO) << "Tag change: instance " << instance
+                  << " -> NORMAL (elastic fallback to steady for model "
+                  << model_id << ")";
       }
 
       alloc_lock.unlock();
@@ -2572,6 +2593,8 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
     {
       std::unique_lock<std::shared_mutex> lock(tag_mutex_);
       instance_tag_map_[new_inst] = InstanceTag::NORMAL;
+      LOG(INFO) << "Tag change: instance " << new_inst
+                << " -> NORMAL (R(B) repack for model " << mid << ")";
     }
     send_model_wakeup(new_inst, mid, false);
     auto mgr = get_model_instance_mgr(mid);
@@ -2767,6 +2790,8 @@ void InstanceMgr::steady_part_auto_repacking() {
     {
       std::unique_lock<std::shared_mutex> lock(tag_mutex_);
       instance_tag_map_[new_inst] = InstanceTag::NORMAL;
+      LOG(INFO) << "Tag change: instance " << new_inst
+                << " -> NORMAL (steady repack for model " << model_id << ")";
     }
     send_model_wakeup(new_inst, model_id, false);
     auto mgr = get_model_instance_mgr(model_id);
@@ -2879,6 +2904,9 @@ void InstanceMgr::elastic_to_steady_demotion() {
     {
       std::unique_lock<std::shared_mutex> lock(tag_mutex_);
       instance_tag_map_[steady_instance] = InstanceTag::NORMAL;
+      LOG(INFO) << "Tag change: instance " << steady_instance
+                << " -> NORMAL (elastic-to-steady demotion for model "
+                << model_id << ")";
     }
 
     // Change pool assignment to STEADY
