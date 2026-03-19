@@ -283,6 +283,10 @@ std::shared_ptr<Request> XllmHttpServiceImpl::generate_request(
         };
   }
 
+  if (req_pb->has_max_tokens()) {
+    request->max_tokens = static_cast<int32_t>(req_pb->max_tokens());
+  }
+
   // Set arrival time and TTFT SLO
   request->arrival_time_ms = absl::ToUnixMillis(absl::Now());
   if (req_pb->has_ttft_slo()) {
