@@ -39,6 +39,16 @@ BlitzScaleInstanceMgr::BlitzScaleInstanceMgr(
             << " max_prefill=" << config_.max_prefill_instances
             << " min_decode=" << config_.min_decode_instances
             << " max_decode=" << config_.max_decode_instances;
+
+  // Pre-initialize per-model entries so map structure never changes at runtime.
+  for (const auto& [model_id, _] : MODELS) {
+    pending_queues_[model_id] =
+        std::make_shared<ConcurrentQueue<std::shared_ptr<Request>>>();
+    idle_prefill_queues_[model_id] =
+        std::make_shared<ConcurrentQueue<std::string>>();
+    pending_tokens_[model_id] =
+        std::make_shared<std::atomic<int32_t>>(0);
+  }
 }
 
 BlitzScaleInstanceMgr::~BlitzScaleInstanceMgr() {
@@ -66,27 +76,22 @@ void BlitzScaleInstanceMgr::add_pending_request(
   const int32_t token_count =
       static_cast<int32_t>(request->token_ids.size());
 
-  {
-    std::lock_guard<std::mutex> lk(pending_mutex_);
-    pending_queues_[request->model].push_back(request);
-    pending_tokens_[request->model] += token_count;
-  }
+  pending_tokens_[request->model]->fetch_add(token_count,
+                                             std::memory_order_relaxed);
+  pending_queues_[request->model]->push(request);
 
   enqueue_request(request->model,
                   request->service_request_id,
                   token_count,
                   enqueue_time);
 
-  dispatch_cv_.notify_one();
+  dispatch_notify_.push(request->model);
 }
 
 void BlitzScaleInstanceMgr::enqueue_idle_prefill(
     const std::string& model_id, const std::string& instance_name) {
-  {
-    std::lock_guard<std::mutex> lk(pending_mutex_);
-    idle_prefill_queues_[model_id].push_back(instance_name);
-  }
-  dispatch_cv_.notify_one();
+  idle_prefill_queues_[model_id]->push(instance_name);
+  dispatch_notify_.push(model_id);
 }
 
 void BlitzScaleInstanceMgr::notify_prefill_done(
@@ -191,7 +196,9 @@ void BlitzScaleInstanceMgr::finish_request(const std::string& request_id) {
     }
   }
 
-  dispatch_cv_.notify_one();
+  if (!model.empty()) {
+    dispatch_notify_.push(model);
+  }
 }
 
 bool BlitzScaleInstanceMgr::dispatch_request(std::shared_ptr<Request> request) {
@@ -269,7 +276,7 @@ void BlitzScaleInstanceMgr::stop_global_scheduler() {
   if (!running_.exchange(false)) {
     return;
   }
-  dispatch_cv_.notify_all();
+  dispatch_notify_.push("");  // unblock dispatch_loop's blocking pop
   if (sched_thread_ && sched_thread_->joinable()) {
     sched_thread_->join();
   }
@@ -294,59 +301,39 @@ void BlitzScaleInstanceMgr::scheduling_loop() {
                 << " actions";
       execute_actions(actions);
     }
-    // New capacity may have been created; wake dispatch thread
-    dispatch_cv_.notify_one();
+    // New capacity may have been created; wake dispatch thread for all models
+    for (const auto& [model_id, _] : MODELS) {
+      dispatch_notify_.push(model_id);
+    }
   }
 }
 
 void BlitzScaleInstanceMgr::dispatch_loop() {
   while (running_.load()) {
-    {
-      std::unique_lock<std::mutex> lk(pending_mutex_);
-      dispatch_cv_.wait(lk, [this] {
-        if (!running_.load()) return true;
-        for (auto& [model, idle_q] : idle_prefill_queues_) {
-          if (idle_q.empty()) continue;
-          auto pq = pending_queues_.find(model);
-          if (pq != pending_queues_.end() && !pq->second.empty()) return true;
-        }
-        return false;
-      });
-    }
+    std::string model = dispatch_notify_.pop();  // blocks until notified
     if (!running_.load()) break;
+
+    // Drain additional pending notifications to avoid redundant dispatch calls
+    std::string extra;
+    while (dispatch_notify_.try_pop(extra)) {
+      if (extra.empty()) break;  // shutdown sentinel re-encountered
+    }
+
     dispatch_pending_requests();
   }
 }
 
 void BlitzScaleInstanceMgr::dispatch_pending_requests() {
-  // Collect models that have both an idle prefill instance and a pending request
-  std::vector<std::string> dispatchable_models;
-  {
-    std::lock_guard<std::mutex> lk(pending_mutex_);
-    for (auto& [model, idle_q] : idle_prefill_queues_) {
-      if (idle_q.empty()) continue;
-      auto pq = pending_queues_.find(model);
-      if (pq != pending_queues_.end() && !pq->second.empty()) {
-        dispatchable_models.push_back(model);
-      }
-    }
-  }
-
-  for (const auto& model : dispatchable_models) {
+  for (auto& [model, idle_q] : idle_prefill_queues_) {
+    auto& pq = pending_queues_[model];
     while (true) {
-      // Pull one idle prefill instance and the front pending request
-      std::string prefill_instance;
-      std::shared_ptr<Request> front;
-      {
-        std::lock_guard<std::mutex> lk(pending_mutex_);
-        auto idle_it = idle_prefill_queues_.find(model);
-        auto pq_it = pending_queues_.find(model);
-        if (idle_it == idle_prefill_queues_.end() || idle_it->second.empty())
-          break;
-        if (pq_it == pending_queues_.end() || pq_it->second.empty()) break;
-        prefill_instance = idle_it->second.front();
-        front = pq_it->second.front();
-      }
+      auto prefill_opt = idle_q->try_front();
+      if (!prefill_opt) break;
+      auto front_opt = pq->try_front();
+      if (!front_opt) break;
+
+      const std::string& prefill_instance = *prefill_opt;
+      const auto& front = *front_opt;
 
       // Check timeout via enqueue_time stored in ReqInfo (shared read lock).
       double enqueue_time = 0.0;
@@ -358,16 +345,12 @@ void BlitzScaleInstanceMgr::dispatch_pending_requests() {
         }
       }
       if (enqueue_time > 0.0 && now_seconds() - enqueue_time > 30.0) {
-        {
-          std::lock_guard<std::mutex> lk(pending_mutex_);
-          auto it = pending_queues_.find(model);
-          if (it != pending_queues_.end() && !it->second.empty() &&
-              it->second.front() == front) {
-            pending_tokens_[model] -=
-                static_cast<int32_t>(front->token_ids.size());
-            it->second.pop_front();
-          }
-          // prefill instance stays idle — leave it in the queue for next req
+        // Timeout: remove request, leave idle instance for next request
+        std::shared_ptr<Request> timed_out;
+        if (pq->try_pop(timed_out)) {
+          pending_tokens_[model]->fetch_sub(
+              static_cast<int32_t>(timed_out->token_ids.size()),
+              std::memory_order_relaxed);
         }
         LOG(ERROR) << "BlitzScale: timeout waiting for model " << model
                    << " request_id=" << front->service_request_id;
@@ -380,22 +363,15 @@ void BlitzScaleInstanceMgr::dispatch_pending_requests() {
         break;  // No decode capacity; wait for next wakeup
       }
 
-      // Successfully dispatched — consume both the instance and the request
-      {
-        std::lock_guard<std::mutex> lk(pending_mutex_);
-        auto idle_it = idle_prefill_queues_.find(model);
-        if (idle_it != idle_prefill_queues_.end() &&
-            !idle_it->second.empty() &&
-            idle_it->second.front() == prefill_instance) {
-          idle_it->second.pop_front();
-        }
-        auto pq_it = pending_queues_.find(model);
-        if (pq_it != pending_queues_.end() && !pq_it->second.empty() &&
-            pq_it->second.front() == front) {
-          pending_tokens_[model] -=
-              static_cast<int32_t>(front->token_ids.size());
-          pq_it->second.pop_front();
-        }
+      // Successfully dispatched — consume the idle instance and the request.
+      // pop_front_if may no-op if execute_deactivate erased it concurrently.
+      idle_q->pop_front_if(prefill_instance);
+      // Only dispatch thread pops from pq, so front is stable.
+      std::shared_ptr<Request> consumed;
+      if (pq->try_pop(consumed)) {
+        pending_tokens_[model]->fetch_sub(
+            static_cast<int32_t>(consumed->token_ids.size()),
+            std::memory_order_relaxed);
       }
 
       start_running(front->service_request_id,
@@ -419,7 +395,7 @@ void BlitzScaleInstanceMgr::dispatch_pending_requests() {
 
 void BlitzScaleInstanceMgr::sync_role_state() {
   // Collect instances newly assigned to prefill so we can enqueue them as idle
-  // after releasing role_mutex_ (pending_mutex_ must not be acquired under it).
+  // after releasing role_mutex_ (enqueue_idle_prefill must not be called under it).
   std::vector<std::pair<std::string, std::string>> new_prefill;
 
   {
@@ -545,9 +521,12 @@ BlitzScaleInstanceMgr::gen_model_actions(const std::string& model_id) {
 
   
 
+  const int32_t active_count = get_active_count(model_id);
   const int32_t waiting_prefill_tokens = get_waiting_prefill_tokens(model_id);
-  const int32_t waiting_decode_blocks = compute_waiting_decode_blocks(model_id);
-  const int32_t prefill_tokens = compute_prefill_tokens(model_id);
+  const int32_t waiting_decode_blocks =
+      (active_count > 0) ? compute_waiting_decode_blocks(model_id) : 0;
+  const int32_t prefill_tokens =
+      (active_count > 0) ? compute_prefill_tokens(model_id) : 0;
 
   LOG(INFO) << "BlitzScale: planning actions for model " << model_id
             << " waiting_count=" << waiting_count
@@ -750,11 +729,9 @@ void BlitzScaleInstanceMgr::execute_deactivate(const std::string& model_id,
   }
 
   if (role == Role::PREFILL) {
-    std::lock_guard<std::mutex> lk(pending_mutex_);
     auto it = idle_prefill_queues_.find(model_id);
     if (it != idle_prefill_queues_.end()) {
-      auto& q = it->second;
-      q.erase(std::remove(q.begin(), q.end(), instance_name), q.end());
+      it->second->erase_first(instance_name);
     }
   }
 
@@ -806,22 +783,20 @@ std::vector<std::string> BlitzScaleInstanceMgr::get_all_instance_names() {
 }
 
 int32_t BlitzScaleInstanceMgr::get_waiting_count(const std::string& model_id) {
-  std::lock_guard<std::mutex> lk(pending_mutex_);
   auto it = pending_queues_.find(model_id);
   if (it == pending_queues_.end()) {
     return 0;
   }
-  return static_cast<int32_t>(it->second.size());
+  return static_cast<int32_t>(it->second->size());
 }
 
 int32_t BlitzScaleInstanceMgr::get_waiting_prefill_tokens(
-    const std::string& model_id) {
-  std::lock_guard<std::mutex> lk(pending_mutex_);
+    const std::string& model_id) const {
   auto it = pending_tokens_.find(model_id);
   if (it == pending_tokens_.end()) {
     return 0;
   }
-  return it->second;
+  return it->second->load(std::memory_order_relaxed);
 }
 
 int32_t BlitzScaleInstanceMgr::get_active_count(const std::string& model_id) {

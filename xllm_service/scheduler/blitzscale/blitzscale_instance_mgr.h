@@ -1,8 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <condition_variable>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -13,6 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common/concurrent_queue.h"
 #include "common/types.h"
 #include "scheduler/managers/instance_mgr.h"
 
@@ -112,7 +111,7 @@ class BlitzScaleInstanceMgr : public InstanceMgr {
 
   std::vector<std::string> get_all_instance_names();
   int32_t get_waiting_count(const std::string& model_id);
-  int32_t get_waiting_prefill_tokens(const std::string& model_id);
+  int32_t get_waiting_prefill_tokens(const std::string& model_id) const;
   int32_t get_active_count(const std::string& model_id);
   int32_t get_request_blocks(int32_t prompt_tokens) const;
   int32_t estimate_used_blocks(const std::string& instance_name);
@@ -194,17 +193,17 @@ class BlitzScaleInstanceMgr : public InstanceMgr {
   std::mutex overprovision_mutex_;
 
   // Per-model pending queue (FCFS; requests are fully tokenized)
-  std::unordered_map<std::string, std::deque<std::shared_ptr<Request>>>
-      pending_queues_;
+  std::unordered_map<std::string,
+      std::shared_ptr<ConcurrentQueue<std::shared_ptr<Request>>>> pending_queues_;
   // Per-model sum of prompt tokens for O(1) get_waiting_prefill_tokens()
-  std::unordered_map<std::string, int32_t> pending_tokens_;
+  std::unordered_map<std::string,
+      std::shared_ptr<std::atomic<int32_t>>> pending_tokens_;
   // Per-model queue of idle prefill instances (pull model)
-  std::unordered_map<std::string, std::deque<std::string>> idle_prefill_queues_;
-  // Protects pending_queues_, pending_tokens_, and idle_prefill_queues_
-  mutable std::mutex pending_mutex_;
+  std::unordered_map<std::string,
+      std::shared_ptr<ConcurrentQueue<std::string>>> idle_prefill_queues_;
 
-  // Reactive dispatch: woken on new request or new instance capacity
-  std::condition_variable dispatch_cv_;
+  // Wake dispatch thread: producers push model name; empty string = shutdown.
+  ConcurrentQueue<std::string> dispatch_notify_;
 
   std::unique_ptr<std::thread> sched_thread_;
   std::unique_ptr<std::thread> dispatch_thread_;
