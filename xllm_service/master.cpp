@@ -199,7 +199,32 @@ int main(int argc, char* argv[]) {
       .lst_imh_pre_pull_ms(FLAGS_lst_imh_pre_pull_ms)
       .enable_mix_pd(FLAGS_enable_mix_pd)
       .slo_penalty_factor(FLAGS_slo_penalty_factor)
-      .max_slo_expansions(FLAGS_max_slo_expansions);
+      .max_slo_expansions(FLAGS_max_slo_expansions)
+      .disable_steady_pool(FLAGS_disable_steady_pool)
+      .elastic_instance_count(FLAGS_elastic_instance_count);
+
+  if (options.disable_steady_pool()) {
+    LOG(INFO) << "Steady pool DISABLED: all models will use elastic pool "
+              << "with PD disaggregation.";
+    if (options.elastic_instance_count() == 1) {
+      LOG(ERROR) << "elastic_instance_count must be 0 (all instances) or >= 2, "
+                 << "got 1.";
+      return -1;
+    }
+    if (options.elastic_instance_count() < 0) {
+      LOG(ERROR) << "elastic_instance_count must be non-negative, got "
+                 << options.elastic_instance_count();
+      return -1;
+    }
+    if (options.elastic_instance_count() >= 2) {
+      LOG(INFO) << "Elastic scaling DISABLED: fixed "
+                << options.elastic_instance_count()
+                << " instances per model.";
+    } else {
+      LOG(INFO) << "Elastic scaling DISABLED: using ALL available instances "
+                << "per model.";
+    }
+  }
 
   xllm_service::Master master(options);
 

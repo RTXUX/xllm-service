@@ -188,21 +188,27 @@ void Scheduler::process_request_queue(const std::string& model_name) {
       }
     } else {
       // Elastic pool: set prefill_only mode
-      request->prefill_only = true;
+      // request->prefill_only = true;
 
       int32_t model_count = instance_mgr_->get_wakeup_count(request->model);
       if (model_count == 0) {
         // Cold elastic model: blocking wakeup
         instance_mgr_->dynamic_part_auto_scaling();
 
-        auto awake = instance_mgr_->get_awake_instances(request->model);
+        auto awake = instance_mgr_->get_awake_prefill_instances(request->model);
         if (awake.empty()) {
           LOG(ERROR) << "dynamic_part_auto_scaling failed to wake model " << request->model
                      << " (request silently dropped!)";
           continue;
         }
         request->routing.prefill_name = awake[0];
-        request->routing.decode_name = awake[0];
+        auto decode_instances = instance_mgr_->get_awake_decode_instances(request->model);
+        if (decode_instances.empty()) {
+          LOG(ERROR) << "No awake decode instances found for model " << request->model;
+          continue;
+        }
+        request->routing.decode_name = decode_instances[0];
+        LOG(INFO) << "Warm elastic model: route first, scaling deferred to post-dispatch";
       } else {
         // Warm elastic model: route first, scaling deferred to post-dispatch
         if (!lb_policy_->select_instances_pair(request)) {
@@ -214,7 +220,10 @@ void Scheduler::process_request_queue(const std::string& model_name) {
       }
     }
 
-    DLOG(INFO) << request->routing.debug_string();
+    LOG(INFO) << "Dispatching request " << request->service_request_id
+               << " model=" << request->model
+               << " prefill=" << request->routing.prefill_name
+               << " decode=" << request->routing.decode_name;
 
     // update request metrics (skip if already updated by LstImhPolicy coordinator)
     if (request->prompt.size() != 0 && !request->metrics_already_updated) {

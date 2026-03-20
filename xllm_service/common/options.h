@@ -86,6 +86,13 @@ class Options {
 
   // Max number of SLO expansions before truly discarding
   PROPERTY(int32_t, max_slo_expansions) = 3;
+
+  // Disable steady pool: all models go to elastic pool with PD disaggregation
+  PROPERTY(bool, disable_steady_pool) = false;
+
+  // Fixed instance count per model when disable_steady_pool is true.
+  // 0 = use all available instances; >= 2 = fixed count.
+  PROPERTY(int32_t, elastic_instance_count) = 0;
 };
 
 }  // namespace xllm_service

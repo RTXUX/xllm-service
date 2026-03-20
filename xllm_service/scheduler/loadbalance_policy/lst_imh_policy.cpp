@@ -184,7 +184,7 @@ void LstImhPolicy::dispatch_coordinator() {
     }
 
     for (const auto& model : active_models) {
-      auto instances = instance_mgr_->get_awake_instances(model);
+      auto instances = instance_mgr_->get_awake_prefill_instances(model);
       for (const auto& inst : instances) {
         int64_t epdt =
             instance_mgr_->get_estimated_prefill_done_time(inst);
@@ -233,7 +233,7 @@ void LstImhPolicy::dispatch_coordinator() {
 
     // ---- Phase 3: For each model, run LST-IMH and dispatch ----
     for (const auto& model : active_models) {
-      auto awake_instances = instance_mgr_->get_awake_instances(model);
+      auto awake_instances = instance_mgr_->get_awake_prefill_instances(model);
       if (awake_instances.empty()) continue;
 
       // Build machine list with real-time availability estimates using EPDT.
@@ -322,25 +322,20 @@ void LstImhPolicy::dispatch_coordinator() {
         // Set routing.
         request->routing.prefill_name = instance;
 
-        // MixPD-aware decode routing
-        if (options_.enable_mix_pd()) {
-          auto tag = instance_mgr_->get_instance_tag(instance);
-          if (tag == InstanceTag::PREFILL) {
-            // PREFILL-tagged: round-robin select from decode instances
-            auto decode_instances = instance_mgr_->get_awake_decode_instances(model);
-            if (!decode_instances.empty()) {
-              request->routing.decode_name =
-                  decode_instances[decode_rr_idx_ % decode_instances.size()];
-              ++decode_rr_idx_;
-            } else {
-              // Fallback: self-decode if no decode instances available
-              request->routing.decode_name = instance;
-            }
+        auto tag = instance_mgr_->get_instance_tag(instance);
+        if (tag == InstanceTag::PREFILL) {
+          // PREFILL-tagged: round-robin select from decode instances
+          auto decode_instances = instance_mgr_->get_awake_decode_instances(model);
+          if (!decode_instances.empty()) {
+            request->routing.decode_name =
+                decode_instances[decode_rr_idx_ % decode_instances.size()];
+            ++decode_rr_idx_;
           } else {
-            // NORMAL or NONE tagged: self-decode
+            // Fallback: self-decode if no decode instances available
             request->routing.decode_name = instance;
           }
         } else {
+          // NORMAL or NONE tagged: self-decode
           request->routing.decode_name = instance;
         }
         request->estimated_ttft = job.processing_time_ms;

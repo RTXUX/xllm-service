@@ -198,6 +198,9 @@ struct InstanceMetaInfo {
   // P2P addresses for mooncake transfer engine (format: "IP:port")
   std::vector<std::string> p2p_addrs;
 
+  // Per-model DisaggPD RPC addresses: model_id -> rpc_address
+  std::unordered_map<std::string, std::string> disagg_pd_rpc_addresses;
+
   // ttft profiling data per model: model_id -> profiling_data
   std::unordered_map<std::string, std::vector<std::pair<int32_t, double>>> ttft_profiling_data;
   // tpot profiling data per model: model_id -> profiling_data
@@ -276,6 +279,13 @@ struct InstanceMetaInfo {
 
       if (json_value.contains("enable_disagg_pd")) {
         enable_disagg_pd = json_value.at("enable_disagg_pd").get<bool>();
+      }
+
+      if (json_value.contains("model_id")) {
+        std::string mid = json_value["model_id"].get<std::string>();
+        if (!mid.empty() && !rpc_address.empty()) {
+          disagg_pd_rpc_addresses[mid] = rpc_address;
+        }
       }
 
       // Parse device_ips and ports, combine into device_addrs ("IP:port")

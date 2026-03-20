@@ -102,26 +102,28 @@ void InstanceMgr::init() {
   init_model_memory_specs();
   init_model_resource_coefficients();
 
-  // Start steady pool repack timer thread
-  static constexpr int kRepackIntervalSeconds = 30;
-  repack_thread_ = std::make_unique<std::thread>([this]() {
-    while (!exited_) {
-      std::this_thread::sleep_for(std::chrono::seconds(kRepackIntervalSeconds));
-      if (exited_) break;
-      steady_part_auto_repacking();
-    }
-  });
+  if (!options_.disable_steady_pool()) {
+    // Start steady pool repack timer thread
+    static constexpr int kRepackIntervalSeconds = 30;
+    repack_thread_ = std::make_unique<std::thread>([this]() {
+      while (!exited_) {
+        std::this_thread::sleep_for(std::chrono::seconds(kRepackIntervalSeconds));
+        if (exited_) break;
+        steady_part_auto_repacking();
+      }
+    });
 
-  // Start elastic-to-steady demotion check thread
-  static constexpr int kDemotionCheckIntervalSeconds = 10;
-  demotion_thread_ = std::make_unique<std::thread>([this]() {
-    while (!exited_) {
-      std::this_thread::sleep_for(
-          std::chrono::seconds(kDemotionCheckIntervalSeconds));
-      if (exited_) break;
-      elastic_to_steady_demotion();
-    }
-  });
+    // Start elastic-to-steady demotion check thread
+    static constexpr int kDemotionCheckIntervalSeconds = 10;
+    demotion_thread_ = std::make_unique<std::thread>([this]() {
+      while (!exited_) {
+        std::this_thread::sleep_for(
+            std::chrono::seconds(kDemotionCheckIntervalSeconds));
+        if (exited_) break;
+        elastic_to_steady_demotion();
+      }
+    });
+  }
 
   {
     std::unique_lock<std::shared_mutex> lock(inst_mutex_);
@@ -739,6 +741,11 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
           auto& exist_info = instances_[iter.first];
           auto& new_info = iter.second;
           
+          // Merge per-model DisaggPD RPC addresses
+          for (auto& [mid, addr] : new_info.disagg_pd_rpc_addresses) {
+            exist_info.disagg_pd_rpc_addresses[mid] = addr;
+          }
+
           // Merge TTFT profiling data
           for (auto& [model_id, data] : new_info.ttft_profiling_data) {
             exist_info.ttft_profiling_data[model_id] = std::move(data);
@@ -763,7 +770,12 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
         {
           std::lock_guard<std::mutex> lock(pending_mutex_);
           if (pending_infos_.count(iter.first)) {
-            LOG(INFO) << "Instance is pending, instance_name: " << iter.first;
+            auto& pending = pending_infos_[iter.first];
+            for (auto& [mid, addr] : iter.second.disagg_pd_rpc_addresses) {
+              pending.disagg_pd_rpc_addresses[mid] = addr;
+            }
+            LOG(INFO) << "Merged disagg_pd_rpc_addresses for pending instance: "
+                      << iter.first;
             continue;
           }
           pending_infos_.insert(
@@ -1212,7 +1224,7 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
     if (count_awake_models_on_instance(instance_name) == 0) {
       std::unique_lock<std::shared_mutex> lock(tag_mutex_);
       instance_tag_map_[instance_name] = InstanceTag::NONE;
-      LOG(INFO) << "Reset tag for " << instance_name << " to NONE (no awake models)";
+      LOG(INFO) << "Tag change: Reset tag for " << instance_name << " to NONE (no awake models)";
     }
   }
 }
@@ -1263,7 +1275,7 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
     if (count_awake_models_on_instance(instance_name) == 0) {
       std::unique_lock<std::shared_mutex> lock(tag_mutex_);
       instance_tag_map_[instance_name] = InstanceTag::NONE;
-      LOG(INFO) << "Reset tag for " << instance_name
+      LOG(INFO) << "Tag change:  Reset tag for " << instance_name
                 << " to NONE (wakeup failed, no awake models)";
     }
   }
@@ -1439,21 +1451,20 @@ bool InstanceMgr::is_model_waking_up(const std::string& model_id) {
 
 std::vector<std::string> InstanceMgr::get_awake_instances(const std::string& model_id) {
   auto model_mgr = get_model_instance_mgr(model_id);
+  return model_mgr->get_awake_instances();
+}
+
+std::vector<std::string> InstanceMgr::get_awake_prefill_instances(const std::string& model_id) {
+  auto model_mgr = get_model_instance_mgr(model_id);
   auto all_instances = model_mgr->get_awake_instances();
 
-  // MixPD: exclude DECODE-only instances from prefill routing
-  if (options_.enable_mix_pd()) {
-    std::vector<std::string> filtered;
-    for (const auto& inst : all_instances) {
-      auto tag = get_instance_tag(inst);
-      if (tag != InstanceTag::DECODE) {
-        filtered.push_back(inst);
-      }
+  std::vector<std::string> filtered;
+  for (const auto& inst : all_instances) {
+    if (get_instance_tag(inst) != InstanceTag::DECODE) {
+      filtered.push_back(inst);
     }
-    return filtered;
   }
-
-  return all_instances;
+  return filtered;
 }
 
 void InstanceMgr::update_model_heat(const std::string& model_id,
@@ -1626,35 +1637,101 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
       t.model_id = id;
       t.mgr = mgr;
       t.heat = mgr->get_model_heat();
-      auto it = model_resource_models_.find(id);
-      t.gpu_target = (t.heat == 0) ? 0
-          : (it != model_resource_models_.end())
-              ? it->second->compute_gpu_target(t.heat, gpu_hw_spec_)
-              : 1;
+
+      if (options_.disable_steady_pool()) {
+        // Steady pool disabled: use fixed instance count or all available
+        int32_t fixed_count = options_.elastic_instance_count();
+        t.gpu_target = (t.heat == 0) ? 0
+            : (fixed_count >= 2) ? fixed_count : budget;
+      } else {
+        auto it = model_resource_models_.find(id);
+        t.gpu_target = (t.heat == 0) ? 0
+            : (it != model_resource_models_.end())
+                ? it->second->compute_gpu_target(t.heat, gpu_hw_spec_)
+                : 1;
+      }
+
       t.gpu_allocated = 0;
       targets.push_back(std::move(t));
     }
   }
 
-  // 2. Budget constraint with proportional scaling
-  int32_t demand = 0;
-  for (auto& t : targets) demand += t.gpu_target;
-
-  if (demand <= budget) {
-    for (auto& t : targets) t.gpu_allocated = t.gpu_target;
-  } else if (demand > 0) {
-    double ratio = static_cast<double>(budget) / demand;
-    int32_t sum = 0;
-    for (auto& t : targets) {
-      t.gpu_allocated = (t.gpu_target > 0)
-          ? std::max(2, static_cast<int32_t>(std::floor(t.gpu_target * ratio)))
-          : 0;
-      sum += t.gpu_allocated;
+  // 2. Budget constraint with proportional scaling.
+  // gpu_target = number of PREFILL instances needed.  Each active model
+  // also requires exactly 1 DECODE instance.  Algorithm:
+  //   (a) Reserve 1 DECODE GPU per active model.
+  //   (b) Distribute the remaining budget as PREFILL instances.
+  //   (c) If a model gets 0 PREFILL, revoke its DECODE reservation and
+  //       redistribute the freed GPU.  Iterate until stable.
+  std::vector<bool> eligible(targets.size(), false);
+  int32_t num_eligible = 0;
+  for (size_t i = 0; i < targets.size(); ++i) {
+    if (targets[i].gpu_target > 0) {
+      eligible[i] = true;
+      num_eligible++;
     }
-    // Distribute remainder GPUs using Largest Remainder Method
-    // (Hamilton apportionment) to avoid wasting budget.
-    int32_t remainder = budget - sum;
-    if (remainder > 0) {
+  }
+
+  bool converged = false;
+  while (!converged && num_eligible > 0) {
+    converged = true;
+
+    // Reserve 1 DECODE GPU per eligible model.
+    int32_t prefill_budget = budget - num_eligible;
+
+    if (prefill_budget <= 0) {
+      // Cannot even reserve 1 DECODE per model — demote coldest.
+      size_t coldest = 0;
+      int64_t min_heat = std::numeric_limits<int64_t>::max();
+      for (size_t i = 0; i < targets.size(); ++i) {
+        if (eligible[i] && targets[i].heat < min_heat) {
+          min_heat = targets[i].heat;
+          coldest = i;
+        }
+      }
+      LOG(INFO) << "Decode reservation exhausted budget: demoting model "
+                << targets[coldest].model_id
+                << " (heat=" << targets[coldest].heat
+                << ") — budget=" << budget;
+      eligible[coldest] = false;
+      targets[coldest].gpu_allocated = 0;
+      num_eligible--;
+      converged = false;
+      continue;
+    }
+
+    // Compute total PREFILL demand among eligible models.
+    int32_t prefill_demand = 0;
+    for (size_t i = 0; i < targets.size(); ++i) {
+      if (eligible[i]) prefill_demand += targets[i].gpu_target;
+    }
+
+    if (prefill_demand <= prefill_budget) {
+      // Full allocation: every eligible model gets gpu_target P + 1 D.
+      for (size_t i = 0; i < targets.size(); ++i) {
+        targets[i].gpu_allocated = eligible[i]
+            ? targets[i].gpu_target + 1 : 0;
+      }
+      break;
+    }
+
+    // Proportional scaling of PREFILL instances (floor, min 1P guarantee).
+    double ratio = static_cast<double>(prefill_budget) / prefill_demand;
+    int32_t sum_prefill = 0;
+    for (size_t i = 0; i < targets.size(); ++i) {
+      if (!eligible[i]) {
+        targets[i].gpu_allocated = 0;
+        continue;
+      }
+      int32_t p = std::max(1, static_cast<int32_t>(
+          std::floor(targets[i].gpu_target * ratio)));
+      targets[i].gpu_allocated = p;          // prefill only; decode added later
+      sum_prefill += p;
+    }
+
+    // Distribute leftover PREFILL GPUs via Largest Remainder Method.
+    if (sum_prefill < prefill_budget) {
+      int32_t prefill_remainder = prefill_budget - sum_prefill;
       struct RemainderCandidate {
         size_t index;
         double fractional;
@@ -1662,16 +1739,14 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
       };
       std::vector<RemainderCandidate> candidates;
       for (size_t i = 0; i < targets.size(); ++i) {
-        if (targets[i].gpu_target == 0) continue;
+        if (!eligible[i] || targets[i].gpu_target == 0) continue;
         double raw = targets[i].gpu_target * ratio;
-        int32_t floored = static_cast<int32_t>(std::floor(raw));
-        // Skip models bumped by min-2 guarantee — their fractional
-        // part is artificial and should not compete for remainder GPUs.
-        if (floored < 2 && targets[i].gpu_allocated == 2) continue;
+        int32_t floored = std::max(1, static_cast<int32_t>(std::floor(raw)));
+        if (floored > static_cast<int32_t>(std::floor(raw)) &&
+            targets[i].gpu_allocated == floored) continue;
         double frac = raw - targets[i].gpu_allocated;
         candidates.push_back({i, frac, targets[i].heat});
       }
-      // Sort: largest fractional first; tiebreak by lower heat (colder first)
       std::sort(candidates.begin(), candidates.end(),
                 [](const RemainderCandidate& a, const RemainderCandidate& b) {
                   if (a.fractional != b.fractional)
@@ -1679,50 +1754,68 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
                   return a.heat < b.heat;
                 });
       for (int32_t r = 0;
-           r < remainder && r < static_cast<int32_t>(candidates.size()); ++r) {
+           r < prefill_remainder &&
+           r < static_cast<int32_t>(candidates.size()); ++r) {
         targets[candidates[r].index].gpu_allocated++;
-        sum++;
+        sum_prefill++;
       }
     }
 
-    // Trim overshoot from lowest-heat models (safety net).
-    // Never trim below 2 — elastic pool minimum.
-    std::sort(targets.begin(), targets.end(),
-              [](const ScalingTarget& a, const ScalingTarget& b) {
-                return a.heat < b.heat;
+    // Build index list sorted by heat ascending (coldest first)
+    // for trim and demotion phases.
+    std::vector<size_t> by_heat;
+    for (size_t i = 0; i < targets.size(); ++i) {
+      if (eligible[i]) by_heat.push_back(i);
+    }
+    std::sort(by_heat.begin(), by_heat.end(),
+              [&targets](size_t a, size_t b) {
+                return targets[a].heat < targets[b].heat;
               });
-    while (sum > budget) {
+
+    // Trim overshoot from coldest models (never below 1P).
+    while (sum_prefill > prefill_budget) {
       bool trimmed = false;
-      for (auto& t : targets) {
-        if (t.gpu_allocated > 2) {
-          t.gpu_allocated--;
-          sum--;
+      for (size_t idx : by_heat) {
+        if (targets[idx].gpu_allocated > 1) {
+          targets[idx].gpu_allocated--;
+          sum_prefill--;
           trimmed = true;
-          if (sum <= budget) break;
+          if (sum_prefill <= prefill_budget) break;
         }
       }
       if (!trimmed) break;
     }
 
-    // If budget still exceeded (all models are at minimum 2), demote the
-    // coldest models to steady pool to free budget for the rest.
-    // (targets are sorted by heat ascending — coldest first.)
-    while (sum > budget) {
+    // Still over budget (all eligible at 1P) → demote coldest entirely.
+    while (sum_prefill > prefill_budget) {
       bool demoted = false;
-      for (auto& t : targets) {
-        if (t.gpu_allocated > 0 && t.heat > 0) {
-          LOG(INFO) << "Elastic min-2 enforcement: demoting model "
-                    << t.model_id << " (heat=" << t.heat
-                    << ", gpu_allocated=" << t.gpu_allocated
-                    << ") — insufficient budget (" << budget << ")";
-          sum -= t.gpu_allocated;
-          t.gpu_allocated = 0;
-          demoted = true;
-          break;
-        }
+      for (size_t idx : by_heat) {
+        if (!eligible[idx]) continue;
+        LOG(INFO) << "Prefill budget exceeded: demoting model "
+                  << targets[idx].model_id << " (heat=" << targets[idx].heat
+                  << ", prefill=" << targets[idx].gpu_allocated
+                  << ") — budget=" << budget;
+        sum_prefill -= targets[idx].gpu_allocated;
+        targets[idx].gpu_allocated = 0;
+        eligible[idx] = false;
+        num_eligible--;
+        converged = false;
+        demoted = true;
+        if (sum_prefill <= prefill_budget) break;
       }
       if (!demoted) break;
     }
+
+    if (converged) {
+      // Add 1 DECODE instance per eligible model.
+      for (size_t i = 0; i < targets.size(); ++i) {
+        if (eligible[i]) targets[i].gpu_allocated += 1;
+      }
+    }
+  }
+
+  if (num_eligible == 0) {
+    for (auto& t : targets) t.gpu_allocated = 0;
   }
 
   for (auto& t : targets) {
@@ -2238,6 +2331,14 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
     return;
   }
 
+  // When steady pool is disabled, always assign to elastic pool
+  if (options_.disable_steady_pool()) {
+    model_pool_assignments_[model_id] = PoolType::ELASTIC;
+    LOG(INFO) << "assign_model_to_pool: model=" << model_id
+              << " -> ELASTIC (steady pool disabled)";
+    return;
+  }
+
   int64_t heat = model_mgr->get_model_heat();
   auto res_it = model_resource_models_.find(model_id);
   int32_t gpu_target = (heat == 0) ? 1
@@ -2516,6 +2617,10 @@ InstanceMgr::remove_model_from_steady_bin(const std::string& model_id) {
 }
 
 bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
+  if (options_.disable_steady_pool()) {
+    return false;
+  }
+
   std::unique_lock<std::mutex> alloc_lock(allocation_mutex_);
 
   auto pool_it = model_pool_assignments_.find(model_id);
@@ -2753,6 +2858,10 @@ InstanceMgr::repack_steady_bins() {
 }
 
 void InstanceMgr::steady_part_auto_repacking() {
+  if (options_.disable_steady_pool()) {
+    return;
+  }
+
   std::unique_lock<std::mutex> alloc_lock(allocation_mutex_);
 
   // Phase 1: collect models with 0 heat → schedule sleep
@@ -2802,6 +2911,10 @@ void InstanceMgr::steady_part_auto_repacking() {
 }
 
 void InstanceMgr::elastic_to_steady_demotion() {
+  if (options_.disable_steady_pool()) {
+    return;
+  }
+
   static constexpr int kDemotionThresholdSeconds = 30;
   auto now = std::chrono::steady_clock::now();
 
@@ -2996,7 +3109,7 @@ void InstanceMgr::set_instance_tag(const std::string& instance_name,
                                    InstanceTag tag) {
   std::unique_lock<std::shared_mutex> lock(tag_mutex_);
   instance_tag_map_[instance_name] = tag;
-  LOG(INFO) << "Set tag for " << instance_name << " to "
+  LOG(INFO) << "Tag change: Set tag for " << instance_name << " to "
             << instance_tag_name(tag);
 }
 
@@ -3036,7 +3149,7 @@ void InstanceMgr::promote_prefill_to_decode(const std::string& model_id) {
     if (tag == InstanceTag::PREFILL) {
       std::unique_lock<std::shared_mutex> tag_lock(tag_mutex_);
       instance_tag_map_[inst] = InstanceTag::DECODE;
-      LOG(INFO) << "Promoted instance " << inst << " from PREFILL to DECODE "
+      LOG(INFO) << "Tag change: Promoted instance " << inst << " from PREFILL to DECODE "
                 << "for model " << model_id;
       return;
     }
@@ -3165,6 +3278,10 @@ void InstanceMgr::link_instance_bidirectional(
   }
 
   for (const auto& peer_name : peer_names) {
+    if (peer_name == instance_name) {
+      // LOG(INFO) << "Skip LinkInstance to self: " << instance_name;
+      continue;
+    }
     auto peer_it = peer_meta_infos.find(peer_name);
     if (peer_it == peer_meta_infos.end()) {
       continue;

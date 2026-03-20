@@ -156,3 +156,14 @@ DEFINE_string(gp_dynamic_data_path,
               "",
               "Path to JSON file containing GP training data for dynamic pool "
               "resource model. Empty means use linear fallback.");
+
+DEFINE_bool(disable_steady_pool,
+            false,
+            "When true, disable steady pool entirely. All models are assigned "
+            "to the elastic pool with PD disaggregation enabled.");
+
+DEFINE_int32(elastic_instance_count,
+             0,
+             "Fixed number of instances per model when disable_steady_pool is "
+             "true. 0 means use all available instances. Must be >= 2 if set "
+             "to a positive value.");

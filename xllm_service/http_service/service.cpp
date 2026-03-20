@@ -435,6 +435,19 @@ void XllmHttpServiceImpl::Completions(
     req_pb->mutable_routing()->set_decode_name(
         service_request->routing.decode_name);
 
+    {
+      auto decode_meta = scheduler_->get_instance_info(
+          service_request->routing.decode_name);
+      auto it = decode_meta.disagg_pd_rpc_addresses.find(
+          service_request->model);
+      if (it != decode_meta.disagg_pd_rpc_addresses.end()) {
+        req_pb->mutable_routing()->set_decode_rpc_address(it->second);
+      } else if (!decode_meta.rpc_address.empty()) {
+        req_pb->mutable_routing()->set_decode_rpc_address(
+            decode_meta.rpc_address);
+      }
+    }
+
     if (service_request->prefill_only || FLAGS_enable_prefill_only_mode) {
       req_pb->set_max_tokens(1);
     }
@@ -525,6 +538,19 @@ void XllmHttpServiceImpl::ChatCompletions(
         service_request->routing.prefill_name);
     req_pb->mutable_routing()->set_decode_name(
         service_request->routing.decode_name);
+
+    {
+      auto decode_meta = scheduler_->get_instance_info(
+          service_request->routing.decode_name);
+      auto it = decode_meta.disagg_pd_rpc_addresses.find(
+          service_request->model);
+      if (it != decode_meta.disagg_pd_rpc_addresses.end()) {
+        req_pb->mutable_routing()->set_decode_rpc_address(it->second);
+      } else if (!decode_meta.rpc_address.empty()) {
+        req_pb->mutable_routing()->set_decode_rpc_address(
+            decode_meta.rpc_address);
+      }
+    }
 
     if (service_request->prefill_only || FLAGS_enable_prefill_only_mode) {
       req_pb->set_max_tokens(1);

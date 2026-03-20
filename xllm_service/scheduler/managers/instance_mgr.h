@@ -120,6 +120,7 @@ class InstanceMgr final {
   int32_t get_wakeup_count(const std::string& model_id);
 
   std::vector<std::string> get_awake_instances(const std::string& model_id);
+  std::vector<std::string> get_awake_prefill_instances(const std::string& model_id);
   std::vector<std::string> get_awake_decode_instances(const std::string& model_id);
   int count_awake_models_on_instance(const std::string& instance_name);
   InstanceTag get_instance_tag(const std::string& instance_name) const;

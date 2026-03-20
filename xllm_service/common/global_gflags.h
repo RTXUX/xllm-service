@@ -86,3 +86,7 @@ DECLARE_double(gpu_bandwidth_per_gpu);
 DECLARE_string(gp_steady_data_path);
 
 DECLARE_string(gp_dynamic_data_path);
+
+DECLARE_bool(disable_steady_pool);
+
+DECLARE_int32(elastic_instance_count);
