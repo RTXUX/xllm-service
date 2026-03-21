@@ -108,6 +108,7 @@ void handle_first_response(brpc::Controller* cntl,
   if (cntl->Failed()) {
     call_data->finish_with_error(
         std::string("Redirect failed: ") + cntl->ErrorText());
+    scheduler->finish_request(service_request_id);
     return;
   }
   auto status = cntl->http_response().status_code();

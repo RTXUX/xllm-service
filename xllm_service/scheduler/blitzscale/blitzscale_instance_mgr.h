@@ -192,6 +192,10 @@ class BlitzScaleInstanceMgr : public InstanceMgr {
   std::unordered_map<std::string, OverprovisionState> overprovision_state_;
   std::mutex overprovision_mutex_;
 
+  // Tracks instances whose wakeup is in-flight (under role_mutex_).
+  // Key format: "<instance_name>:<model_id>"
+  std::unordered_set<std::string> pending_activation_instances_;
+
   // Per-model pending queue (FCFS; requests are fully tokenized)
   std::unordered_map<std::string,
       std::shared_ptr<ConcurrentQueue<std::shared_ptr<Request>>>> pending_queues_;

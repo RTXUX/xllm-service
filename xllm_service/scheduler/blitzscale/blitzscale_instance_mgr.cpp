@@ -109,7 +109,15 @@ void BlitzScaleInstanceMgr::notify_prefill_done(
       }
     }
   }
+  if (models.empty()) {
+    LOG(WARNING) << "BlitzScale: notify_prefill_done(" << prefill_instance
+                 << ") found no model in prefill_instances_"
+                 << " — likely removed by concurrent sync_role_state."
+                 << " Will recover within " << config_.schedule_interval_s << "s.";
+  }
   for (const auto& model_id : models) {
+    LOG(INFO) << "BlitzScale: notify_prefill_done re-enqueuing "
+              << prefill_instance << " for model=" << model_id;
     enqueue_idle_prefill(model_id, prefill_instance);
   }
 }
@@ -160,6 +168,11 @@ void BlitzScaleInstanceMgr::finish_request(const std::string& request_id) {
     model = it->second->model;
     prefill_instance = it->second->prefill_instance;
     decode_instance = it->second->decode_instance;
+
+    LOG(INFO) << "BlitzScale: finish_request id=" << request_id
+              << " model=" << model
+              << " prefill=" << prefill_instance
+              << " decode=" << decode_instance;
 
     // Decrement per-instance counters.
     if (!prefill_instance.empty()) {
@@ -235,9 +248,9 @@ bool BlitzScaleInstanceMgr::dispatch_with_prefill(
     std::shared_ptr<Request> request,
     const std::string& prefill_instance) {
   // Reject dispatch if the instance hasn't finished waking up yet.
-  // execute_activate enqueues the instance immediately but send_model_wakeup
-  // is async; the instance will be re-enqueued via notify_prefill_done once
-  // it actually processes its first request.
+  // execute_activate now runs send_model_wakeup asynchronously and only calls
+  // enqueue_idle_prefill after wakeup succeeds, so this guard handles races
+  // where the dispatch thread is woken by other events before wakeup finishes.
   std::optional<std::string> decode;
   if (request->max_tokens == 1) {
     decode = prefill_instance;  // Prefill-only request; decode is a no-op. Skip checks.
@@ -245,6 +258,8 @@ bool BlitzScaleInstanceMgr::dispatch_with_prefill(
   if (!decode.has_value()) {
     auto awake = get_awake_instances(request->model);
     if (!contains_instance(awake, prefill_instance)) {
+      LOG(INFO) << "BlitzScale: skip dispatch, prefill=" << prefill_instance
+                << " not yet awake for model=" << request->model;
       return false;
     }
 
@@ -303,6 +318,38 @@ void BlitzScaleInstanceMgr::scheduling_loop() {
     }
 
     sync_role_state();
+
+    // Periodic state dump: log non-empty model queues
+    for (const auto& [model_id, _] : MODELS) {
+      const int32_t pending = get_waiting_count(model_id);
+      const size_t idle = idle_prefill_queues_[model_id]->size();
+      const int32_t active = get_active_count(model_id);
+      if (pending > 0 || idle > 0 || active > 0) {
+        LOG(INFO) << "BlitzScale state: model=" << model_id
+                  << " pending=" << pending
+                  << " idle_prefill=" << idle
+                  << " active=" << active;
+      }
+    }
+
+    // Stuck RUNNING request detector
+    {
+      const double now = now_seconds();
+      constexpr double kRunningTimeoutS = 300.0;
+      std::shared_lock<std::shared_mutex> lk(req_mutex_);
+      for (const auto& [rid, info] : requests_) {
+        if (info->state == ReqInfo::RUNNING &&
+            info->enqueue_time > 0.0 &&
+            now - info->enqueue_time > kRunningTimeoutS) {
+          LOG(ERROR) << "BlitzScale: STUCK RUNNING request id=" << rid
+                     << " model=" << info->model
+                     << " prefill=" << info->prefill_instance
+                     << " decode=" << info->decode_instance
+                     << " age=" << (now - info->enqueue_time) << "s";
+        }
+      }
+    }
+
     auto actions = gen_actions();
     if (!actions.empty()) {
       LOG(INFO) << "BlitzScale scheduler: executing " << actions.size()
@@ -320,6 +367,7 @@ void BlitzScaleInstanceMgr::dispatch_loop() {
   while (running_.load()) {
     std::string model = dispatch_notify_.pop();  // blocks until notified
     if (!running_.load()) break;
+    DLOG(INFO) << "BlitzScale: dispatch_loop woken by model=" << model;
 
     // Drain additional pending notifications to avoid redundant dispatch calls
     std::string extra;
@@ -328,6 +376,7 @@ void BlitzScaleInstanceMgr::dispatch_loop() {
     }
 
     dispatch_pending_requests();
+    DLOG(INFO) << "BlitzScale: dispatch_loop going to sleep";
   }
 }
 
@@ -336,7 +385,14 @@ void BlitzScaleInstanceMgr::dispatch_pending_requests() {
     auto& pq = pending_queues_[model];
     while (true) {
       auto prefill_opt = idle_q->try_front();
-      if (!prefill_opt) break;
+      if (!prefill_opt) {
+        if (!pq->empty()) {
+          LOG(INFO) << "BlitzScale: no idle prefill for model=" << model
+                    << " pending=" << pq->size()
+                    << " active=" << get_active_count(model);
+        }
+        break;
+      }
       auto front_opt = pq->try_front();
       if (!front_opt) break;
 
@@ -368,7 +424,11 @@ void BlitzScaleInstanceMgr::dispatch_pending_requests() {
 
       // Pull model: dispatch the front request to the specific idle instance
       if (!dispatch_with_prefill(front, prefill_instance)) {
-        break;  // No decode capacity; wait for next wakeup
+        LOG(WARNING) << "BlitzScale: dispatch_with_prefill failed"
+                     << " model=" << model
+                     << " prefill=" << prefill_instance
+                     << " request=" << front->service_request_id;
+        break;  // No decode capacity or prefill not awake; wait for next wakeup
       }
 
       // Successfully dispatched — consume the idle instance and the request.
@@ -386,9 +446,9 @@ void BlitzScaleInstanceMgr::dispatch_pending_requests() {
                     front->routing.prefill_name,
                     front->routing.decode_name);
 
-      DLOG(INFO) << "BlitzScale: dispatched " << front->service_request_id
-                 << " prefill=" << front->routing.prefill_name
-                 << " decode=" << front->routing.decode_name;
+      LOG(INFO) << "BlitzScale: dispatched " << front->service_request_id
+                << " prefill=" << front->routing.prefill_name
+                << " decode=" << front->routing.decode_name;
 
       if (!front->prompt.empty() && !front->metrics_already_updated) {
         update_request_metrics(front, RequestAction::SCHEDULE);
@@ -406,13 +466,19 @@ void BlitzScaleInstanceMgr::sync_role_state() {
   // after releasing role_mutex_ (enqueue_idle_prefill must not be called under it).
   std::vector<std::pair<std::string, std::string>> new_prefill;
 
+  // Pre-fetch awake instances outside role_mutex_ to avoid nested lock acquisition.
+  std::unordered_map<std::string, std::vector<std::string>> awake_map;
+  for (const auto& [model_id, _] : MODELS) {
+    awake_map[model_id] = get_awake_instances(model_id);
+  }
+
   {
     std::lock_guard<std::mutex> lock(role_mutex_);
     instance_to_models_.clear();
     model_to_instances_.clear();
 
     for (const auto& [model_id, _] : MODELS) {
-      auto awake = get_awake_instances(model_id);
+      const auto& awake = awake_map[model_id];
       std::unordered_set<std::string> awake_set(awake.begin(), awake.end());
 
       auto& prefill_set = prefill_instances_[model_id];
@@ -420,6 +486,8 @@ void BlitzScaleInstanceMgr::sync_role_state() {
 
       for (auto it = prefill_set.begin(); it != prefill_set.end();) {
         if (!awake_set.count(*it)) {
+          LOG(INFO) << "BlitzScale: sync_role_state: removing " << *it
+                    << " from prefill of " << model_id << " (not awake)";
           it = prefill_set.erase(it);
         } else {
           ++it;
@@ -427,6 +495,8 @@ void BlitzScaleInstanceMgr::sync_role_state() {
       }
       for (auto it = decode_set.begin(); it != decode_set.end();) {
         if (!awake_set.count(*it)) {
+          LOG(INFO) << "BlitzScale: sync_role_state: removing " << *it
+                    << " from decode of " << model_id << " (not awake)";
           it = decode_set.erase(it);
         } else {
           ++it;
@@ -447,6 +517,8 @@ void BlitzScaleInstanceMgr::sync_role_state() {
         }
 
         if (!in_prefill && !in_decode) {
+          LOG(INFO) << "BlitzScale: sync_role_state: assigning newly-awake "
+                    << instance_name << " to " << model_id;
           const bool need_prefill =
               static_cast<int32_t>(prefill_set.size()) <
               config_.min_prefill_instances;
@@ -678,15 +750,12 @@ void BlitzScaleInstanceMgr::execute_activate(const std::string& model_id,
   auto model_mgr = get_model_instance_mgr(model_id);
   model_mgr->set_model_state(instance_name, ModelState::ALLOCATED);
 
-  // Use inherited send_model_wakeup (D2D with H2D fallback)
-  send_model_wakeup(instance_name, model_id,
-                    /*memory_increased_in_advance=*/false);
-
   {
     std::lock_guard<std::mutex> lock(role_mutex_);
     assign_role_locked(model_id, instance_name, role);
     instance_to_models_[instance_name].insert(model_id);
     model_to_instances_[model_id].insert(instance_name);
+    pending_activation_instances_.insert(instance_name + ":" + model_id);
   }
 
   {
@@ -694,9 +763,35 @@ void BlitzScaleInstanceMgr::execute_activate(const std::string& model_id,
     model_last_used_[model_id][instance_name] = now_seconds();
   }
 
-  if (role == Role::PREFILL) {
-    enqueue_idle_prefill(model_id, instance_name);
-  }
+  // Run blocking wakeup (D2D with H2D fallback) in background so the
+  // scheduling loop is not stalled.  Only enqueue as idle prefill after
+  // wakeup succeeds so dispatch_with_prefill sees a truly awake instance.
+  std::thread([this, model_id, instance_name, role]() {
+    LOG(INFO) << "BlitzScale: async wakeup starting for model=" << model_id
+              << " instance=" << instance_name;
+    send_model_wakeup(instance_name, model_id,
+                      /*memory_increased_in_advance=*/false);
+
+    {
+      std::lock_guard<std::mutex> lock(role_mutex_);
+      pending_activation_instances_.erase(instance_name + ":" + model_id);
+    }
+
+    // Wakeup succeeded iff state is now WAKEUP (0).
+    auto mgr = get_model_instance_mgr(model_id);
+    const bool ok = mgr && mgr->get_model_state(instance_name) == ModelState::WAKEUP;
+    LOG(INFO) << "BlitzScale: async wakeup " << (ok ? "succeeded" : "FAILED")
+              << " for model=" << model_id << " instance=" << instance_name;
+    if (!ok) {
+      return;
+    }
+
+    if (role == Role::PREFILL) {
+      LOG(INFO) << "BlitzScale: enqueue_idle_prefill after wakeup: "
+                << instance_name << " for model=" << model_id;
+      enqueue_idle_prefill(model_id, instance_name);
+    }
+  }).detach();
 }
 
 void BlitzScaleInstanceMgr::execute_deactivate(const std::string& model_id,
@@ -744,7 +839,10 @@ void BlitzScaleInstanceMgr::execute_deactivate(const std::string& model_id,
   }
 
   std::thread([this, model_id, instance_name]() {
-    wait_for_model_drain(instance_name, model_id);
+    if (!wait_for_model_drain(instance_name, model_id)) {
+      // Instance was deleted before drain completed; nothing to sleep.
+      return;
+    }
     auto mgr = get_model_instance_mgr(model_id);
     if (mgr && !mgr->can_sleep(instance_name)) {
       LOG(WARNING) << "BlitzScale: skipping sleep of " << model_id << " on "
@@ -955,6 +1053,10 @@ std::optional<std::string> BlitzScaleInstanceMgr::select_activation_instance(
               : static_cast<int32_t>(active_models_it->second.size());
       if (active_models_it != instance_to_models_.end() &&
           active_models_it->second.count(model_id) > 0) {
+        continue;
+      }
+      // Skip instances whose wakeup is already in-flight.
+      if (pending_activation_instances_.count(instance_name + ":" + model_id) > 0) {
         continue;
       }
       if (colocated_models >= config_.max_models_per_instance) {

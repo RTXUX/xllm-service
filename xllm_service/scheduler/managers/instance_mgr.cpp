@@ -289,6 +289,7 @@ void InstanceMgr::fork_master_and_sleep(
     const std::string& instance_name,
     std::shared_ptr<brpc::Channel> channel) {
   LOG(INFO) << "Forking master and sleeping for instance " << instance_name;
+  bool already_slept = false;
   for (const auto& model : MODELS) {
     // 1. Fork Master
 
@@ -355,11 +356,16 @@ void InstanceMgr::fork_master_and_sleep(
     mgr->set_model_state(instance_name, ModelState::SLEEP);
 
     // 2. force sleep (the initial model of xllm instance fails to fork_master)
-    nlohmann::json sleep_body;
-    sleep_body["model_id"] = model.first;
-    sleep_body["master_status"] = 1;
-    
-    send_http_request(channel, "/sleep", sleep_body.dump());
+    // /sleep is instance-global: once the default model is sleeping we must not
+    // send it again — the backend returns 500 "already sleeping" for duplicates.
+    if (!already_slept) {
+      nlohmann::json sleep_body;
+      sleep_body["model_id"] = model.first;
+      sleep_body["master_status"] = 1;
+      if (send_http_request(channel, "/sleep", sleep_body.dump())) {
+        already_slept = true;
+      }
+    }
   }
 
   LOG(INFO) << "All models fork_master'd — bidirectional D2D linking with all ready instances";
@@ -1232,6 +1238,11 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
   auto model_mgr = get_model_instance_mgr(model_id);
 
   std::shared_ptr<brpc::Channel> channel = get_channel(instance_name);
+  if (!channel) {
+    LOG(WARNING) << "send_model_sleep: no channel for " << instance_name
+                 << ", instance may have been deleted";
+    return;
+  }
 
   if (model_mgr->send_model_sleep(instance_name, channel)) {
     LOG(INFO) << "Model " << model_id << " on " << instance_name
