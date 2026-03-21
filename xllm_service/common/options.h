@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 #include "common/macros.h"
@@ -93,6 +94,61 @@ class Options {
   // Fixed instance count per model when disable_steady_pool is true.
   // 0 = use all available instances; >= 2 = fixed count.
   PROPERTY(int32_t, elastic_instance_count) = 0;
+
+  // Baseline options
+  PROPERTY(std::string, baseline_type);  // "" | "PRISM" | "SERVERLESS_LLM" | "LLUMNIX" | "BLITZSCALE"
+  PROPERTY(double, prism_schedule_interval_s) = 5.0;
+  PROPERTY(double, prism_memory_pool_budget_gb) = 6.0;
+  PROPERTY(double, prism_idle_threshold_s) = 50.0;
+  PROPERTY(std::string, prism_migrate_policy) = "memory_per_request";
+  PROPERTY(int32_t, prism_max_models_per_instance) = 4;
+  PROPERTY(int32_t, prism_backend_queue_threshold) = 10;
+
+  // ServerlessLLM baseline options
+  PROPERTY(double, sllm_schedule_interval_s) = 1.0;
+  PROPERTY(double, sllm_idle_threshold_s) = 60.0;
+  PROPERTY(double, sllm_d2d_speed_gbps) = 25.0;
+  PROPERTY(double, sllm_h2d_speed_gbps) = 6.0;
+  PROPERTY(double, sllm_drain_alpha) = 0.001;
+  PROPERTY(double, sllm_drain_beta) = 0.5;
+  PROPERTY(int32_t, sllm_target_ongoing_requests) = 8;
+  PROPERTY(int32_t, sllm_min_instances) = 0;
+  PROPERTY(int32_t, sllm_max_instances) = 8;
+  PROPERTY(bool, sllm_enable_knapsack) = true;
+  PROPERTY(int32_t, sllm_max_models_per_instance) = 4;
+
+  // BlitzScale baseline options
+  PROPERTY(double, blitzscale_schedule_interval_s) = 1.0;
+  PROPERTY(double, blitzscale_scale_down_threshold_ms) = 5000.0;
+  PROPERTY(uint32_t, blitzscale_tokens_prefilled_per_sec) = 4096;
+  PROPERTY(uint32_t, blitzscale_tokens_transferred_per_sec) = 4096;
+  PROPERTY(uint32_t, blitzscale_max_blocks_per_replica) = 16384;
+  PROPERTY(double, blitzscale_prefill_lower_bound) = 0.5;
+  PROPERTY(double, blitzscale_prefill_upper_bound) = 0.8;
+  PROPERTY(double, blitzscale_decode_lower_bound) = 0.5;
+  PROPERTY(double, blitzscale_decode_upper_bound) = 0.8;
+  PROPERTY(double, blitzscale_migration_lower_bound) = 0.5;
+  PROPERTY(double, blitzscale_migration_upper_bound) = 0.8;
+  PROPERTY(int32_t, blitzscale_min_prefill_instances) = 1;
+  PROPERTY(int32_t, blitzscale_max_prefill_instances) = 8;
+  PROPERTY(int32_t, blitzscale_min_decode_instances) = 1;
+  PROPERTY(int32_t, blitzscale_max_decode_instances) = 8;
+  PROPERTY(int32_t, blitzscale_max_models_per_instance) = 4;
+
+  // Llumnix baseline options
+  PROPERTY(double, llumnix_schedule_interval_s) = 1.0;
+  PROPERTY(double, llumnix_idle_threshold_s) = 60.0;
+  PROPERTY(double, llumnix_migrate_out_load_threshold) = 0.8;
+  PROPERTY(int32_t, llumnix_topk_random_dispatch) = 1;
+  PROPERTY(int32_t, llumnix_max_models_per_instance) = 4;
+  PROPERTY(int32_t, llumnix_min_instances) = 0;
+  PROPERTY(int32_t, llumnix_max_instances) = 8;
+  PROPERTY(std::string, llumnix_dispatch_load_metric) = "remaining_steps";
+  PROPERTY(std::string, llumnix_migration_load_metric) = "remaining_steps";
+  PROPERTY(std::string, llumnix_dispatch_policy) = "load";
+  PROPERTY(std::string, llumnix_migration_policy) = "defrag";
+  PROPERTY(double, llumnix_dispatch_busy_threshold) = 1.0;
+  PROPERTY(double, llumnix_dispatch_busy_threshold_remaining_steps) = 10.0;
 };
 
 }  // namespace xllm_service

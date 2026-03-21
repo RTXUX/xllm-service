@@ -32,7 +32,7 @@ DEFINE_int32(http_server_idle_timeout_s,
 DEFINE_int32(http_server_num_threads, 32, "Maximum number of threads to use");
 
 DEFINE_int32(http_server_max_concurrency,
-             128,
+             12800,
              "Limit number of requests processed in parallel");
 
 DEFINE_int32(rpc_server_port, 8889, "Port for xllm rpc service to listen on");
@@ -45,7 +45,7 @@ DEFINE_int32(rpc_server_idle_timeout_s,
 DEFINE_int32(rpc_server_num_threads, 32, "Maximum number of threads to use");
 
 DEFINE_int32(rpc_server_max_concurrency,
-             128,
+             12800,
              "Limit number of requests processed in parallel");
 
 DEFINE_string(etcd_addr,
@@ -59,7 +59,7 @@ DEFINE_int32(port, 8888, "Port for xllm service to listen on");
 DEFINE_int32(num_threads, 32, "Number of threads to process requests");
 
 DEFINE_int32(max_concurrency,
-             128,
+             12800,
              "Limit number of requests processed in parallel");
 
 DEFINE_int32(timeout_ms,
@@ -167,3 +167,208 @@ DEFINE_int32(elastic_instance_count,
              "Fixed number of instances per model when disable_steady_pool is "
              "true. 0 means use all available instances. Must be >= 2 if set "
              "to a positive value.");
+
+// Prism baseline flags
+DEFINE_string(baseline_type,
+              "",
+              "Baseline scheduling type. Empty = default dual-pool, "
+              "\"PRISM\" = Prism multi-model scheduling, "
+              "\"SERVERLESS_LLM\" = ServerlessLLM scheduling, "
+              "\"LLUMNIX\" = Llumnix scheduling, "
+              "\"BLITZSCALE\" = BlitzScale disaggregated scheduling.");
+
+DEFINE_double(prism_schedule_interval_s,
+              5.0,
+              "Prism global scheduling interval in seconds.");
+
+DEFINE_double(prism_memory_pool_budget_gb,
+              6.0,
+              "Prism KV cache memory pool budget per model in GB.");
+
+DEFINE_double(prism_idle_threshold_s,
+              50.0,
+              "Prism idle model eviction threshold in seconds.");
+
+DEFINE_string(prism_migrate_policy,
+              "memory_per_request",
+              "Prism migration policy: \"memory_per_request\" or \"violation\".");
+
+DEFINE_int32(prism_max_models_per_instance,
+             4,
+             "Prism maximum number of models colocated on one instance.");
+
+DEFINE_int32(prism_backend_queue_threshold,
+             10,
+             "Prism maximum running requests per instance for admission control.");
+
+// ServerlessLLM baseline flags
+DEFINE_double(sllm_schedule_interval_s,
+              1.0,
+              "ServerlessLLM global scheduling interval in seconds.");
+
+DEFINE_double(sllm_idle_threshold_s,
+              60.0,
+              "ServerlessLLM LRU idle model eviction threshold in seconds.");
+
+DEFINE_double(sllm_d2d_speed_gbps,
+              25.0,
+              "ServerlessLLM D2D transfer speed in GB/s (Tier 1).");
+
+DEFINE_double(sllm_h2d_speed_gbps,
+              6.0,
+              "ServerlessLLM H2D transfer speed in GB/s (Tier 2).");
+
+DEFINE_double(sllm_drain_alpha,
+              0.001,
+              "ServerlessLLM drain time linear coefficient (alpha * tokens).");
+
+DEFINE_double(sllm_drain_beta,
+              0.5,
+              "ServerlessLLM drain time constant (seconds).");
+
+DEFINE_int32(sllm_target_ongoing_requests,
+             8,
+             "ServerlessLLM target concurrent requests per instance for auto-scaling.");
+
+DEFINE_int32(sllm_min_instances,
+             0,
+             "ServerlessLLM minimum instances per model.");
+
+DEFINE_int32(sllm_max_instances,
+             8,
+             "ServerlessLLM maximum instances per model.");
+
+DEFINE_bool(sllm_enable_knapsack,
+            true,
+            "ServerlessLLM enable 0/1 knapsack DP eviction.");
+
+DEFINE_bool(enable_d2d,
+            true,
+            "Enable D2D weight transfer. Set to false to force H2D.");
+
+DEFINE_int32(sllm_max_models_per_instance,
+             4,
+             "ServerlessLLM maximum number of models colocated on one instance.");
+
+// BlitzScale baseline flags
+DEFINE_double(blitzscale_schedule_interval_s,
+              1.0,
+              "BlitzScale control-loop interval in seconds.");
+
+DEFINE_double(blitzscale_scale_down_threshold_ms,
+              5000.0,
+              "BlitzScale hysteresis before applying scale-down, in milliseconds.");
+
+DEFINE_uint32(blitzscale_tokens_prefilled_per_sec,
+              4096,
+              "BlitzScale per-replica prefill throughput in tokens/sec.");
+
+DEFINE_uint32(blitzscale_tokens_transferred_per_sec,
+              4096,
+              "BlitzScale per-replica migration/decode throughput in tokens/sec.");
+
+DEFINE_uint32(blitzscale_max_blocks_per_replica,
+              16384,
+              "BlitzScale maximum KV blocks per replica.");
+
+DEFINE_double(blitzscale_prefill_lower_bound,
+              0.5,
+              "BlitzScale lower prefill throughput bound.");
+
+DEFINE_double(blitzscale_prefill_upper_bound,
+              0.8,
+              "BlitzScale upper prefill throughput bound.");
+
+DEFINE_double(blitzscale_decode_lower_bound,
+              0.5,
+              "BlitzScale lower decode memory-pressure bound.");
+
+DEFINE_double(blitzscale_decode_upper_bound,
+              0.8,
+              "BlitzScale upper decode memory-pressure bound.");
+
+DEFINE_double(blitzscale_migration_lower_bound,
+              0.5,
+              "BlitzScale lower migration-bandwidth bound.");
+
+DEFINE_double(blitzscale_migration_upper_bound,
+              0.8,
+              "BlitzScale upper migration-bandwidth bound.");
+
+DEFINE_int32(blitzscale_min_prefill_instances,
+             1,
+             "BlitzScale minimum prefill replicas for an active model.");
+
+DEFINE_int32(blitzscale_max_prefill_instances,
+             8,
+             "BlitzScale maximum prefill replicas for an active model.");
+
+DEFINE_int32(blitzscale_min_decode_instances,
+             1,
+             "BlitzScale minimum decode replicas for an active model.");
+
+DEFINE_int32(blitzscale_max_decode_instances,
+             8,
+             "BlitzScale maximum decode replicas for an active model.");
+
+DEFINE_int32(blitzscale_max_models_per_instance,
+             4,
+             "BlitzScale maximum number of models colocated on one instance.");
+
+// Llumnix baseline flags
+DEFINE_double(llumnix_schedule_interval_s,
+              1.0,
+              "Llumnix global scheduling interval in seconds.");
+
+DEFINE_double(llumnix_idle_threshold_s,
+              60.0,
+              "Llumnix idle model eviction threshold in seconds.");
+
+DEFINE_double(llumnix_migrate_out_load_threshold,
+              0.8,
+              "Llumnix load threshold above which an instance is a migration source. "
+              "Note: Python default is -3.0 in raw remaining_steps scale; C++ uses "
+              "normalized [0,1] load, so 0.8 is the equivalent reasonable threshold.");
+
+DEFINE_int32(llumnix_topk_random_dispatch,
+             1,
+             "Llumnix top-K for random selection in load-based dispatch.");
+
+DEFINE_int32(llumnix_max_models_per_instance,
+             4,
+             "Llumnix maximum number of models colocated on one instance.");
+
+DEFINE_int32(llumnix_min_instances,
+             0,
+             "Llumnix minimum instances per model.");
+
+DEFINE_int32(llumnix_max_instances,
+             8,
+             "Llumnix maximum instances per model.");
+
+DEFINE_string(llumnix_dispatch_load_metric,
+              "remaining_steps",
+              "Llumnix dispatch load metric: kv_blocks_ratio or remaining_steps.");
+
+DEFINE_string(llumnix_migration_load_metric,
+              "remaining_steps",
+              "Llumnix migration load metric: kv_blocks_ratio or remaining_steps.");
+
+DEFINE_string(llumnix_dispatch_policy,
+              "load",
+              "Llumnix dispatch policy: load, balanced, queue, or rr.");
+
+DEFINE_string(llumnix_migration_policy,
+              "defrag",
+              "Llumnix migration policy: balanced or defrag.");
+
+DEFINE_double(llumnix_dispatch_busy_threshold,
+              1.0,
+              "Llumnix busy threshold for dispatch filtering. "
+              "Source default: KVBLOCKSRATIO_BUSY_THRESHOLD=1.0.");
+
+DEFINE_double(llumnix_dispatch_busy_threshold_remaining_steps,
+              10.0,
+              "Llumnix busy threshold for REMAINING_STEPS dispatch filtering. "
+              "Uses raw remaining_steps scale. Source default: "
+              "REMAININGSTEPS_BUSY_THRESHOLD=10.0.");

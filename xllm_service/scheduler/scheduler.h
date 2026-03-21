@@ -21,10 +21,14 @@ limitations under the License.
 #include "common/options.h"
 #include "common/threadpool.h"
 #include "common/xllm/output.h"
+#include "blitzscale/blitzscale_instance_mgr.h"
 #include "etcd_client/etcd_client.h"
 #include "loadbalance_policy/loadbalance_policy.h"
 #include "managers/global_kvcache_mgr.h"
 #include "managers/instance_mgr.h"
+#include "prism/prism_instance_mgr.h"
+#include "serverless_llm/serverless_llm_instance_mgr.h"
+#include "llumnix/llumnix_instance_mgr.h"
 #include "request/request.h"
 #include "response_handler.h"
 #include "tokenizer/tokenizer.h"
@@ -83,12 +87,24 @@ class Scheduler final {
  private:
   DISALLOW_COPY_AND_ASSIGN(Scheduler);
 
-  void update_master_service_heartbeat();
+  CoroTask heartbeat_coro();
 
   void handle_master_service_watch(const etcd::Response& response,
                                    const uint64_t& prefix_len);
 
   void process_request_queue(const std::string& model_name);
+
+  // Prism mode: process request through PrismInstanceMgr
+  void process_prism_request(std::shared_ptr<Request> request);
+
+  // ServerlessLLM mode: process request through ServerlessLLMInstanceMgr
+  void process_serverless_llm_request(std::shared_ptr<Request> request);
+
+  // BlitzScale mode: process request through BlitzScaleInstanceMgr
+  void process_blitzscale_request(std::shared_ptr<Request> request);
+
+  // Llumnix mode: process request through LlumnixInstanceMgr
+  void process_llumnix_request(std::shared_ptr<Request> request);
 
   Tokenizer* get_tls_tokenizer();
 
@@ -98,6 +114,18 @@ class Scheduler final {
   bool exited_ = false;
 
   bool is_master_service_ = false;
+
+  // Prism mode flag
+  bool prism_mode_ = false;
+
+  // ServerlessLLM mode flag
+  bool serverless_llm_mode_ = false;
+
+  // BlitzScale mode flag
+  bool blitzscale_mode_ = false;
+
+  // Llumnix mode flag
+  bool llumnix_mode_ = false;
 
   TokenizerArgs tokenizer_args_;
 
@@ -114,7 +142,6 @@ class Scheduler final {
 
   std::unique_ptr<LoadBalancePolicy> lb_policy_;
 
-  std::unique_ptr<std::thread> heartbeat_thread_;
 
   // `model name` -> `request queue` map
   std::unordered_map<std::string,

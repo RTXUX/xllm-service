@@ -167,10 +167,10 @@ class CustomProgressiveReader : public brpc::ProgressiveReader {
 }  // namespace
 
 template <typename T>
-void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
-                                 const std::string& req_attachment,
-                                 std::shared_ptr<Request> request,
-                                 const std::string& method) {
+CoroTask XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
+                                     const std::string& req_attachment,
+                                     std::shared_ptr<Request> request,
+                                     const std::string& method) {
   // record request when enable_decode_response_to_service.
   if (enable_decode_response_to_service_) {
     bool success = scheduler_->record_new_request(call_data, request);
@@ -178,7 +178,7 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
       LOG(ERROR) << "rpc service add new request error: "
                  << request->service_request_id;
       call_data->finish_with_error("Internal runtime error.");
-      return;
+      co_return;
     }
   }
 
@@ -189,7 +189,7 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
 
   if (channel_ptr == nullptr) {
     call_data->finish_with_error("Internal error: channel not found.");
-    return;
+    co_return;
   }
 
   brpc::Controller* redirect_cntl = new brpc::Controller();
@@ -218,9 +218,9 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
       scheduler_->finish_request(request->service_request_id, /*error=*/true);
       delete done;
       delete redirect_cntl;
-      return;
+      co_return;
     }
-    return;
+    co_return;
   }
 
   // 2. tokens will be received via http channel.
@@ -229,13 +229,15 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
     // receive tokens in progressive mode.
     redirect_cntl->response_will_be_read_progressively();
 
-    // Because `done'(last parameter) is NULL, this function waits until
-    // the response comes back or error occurs(including timeout).
-    channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, NULL);
+    // Suspend the coroutine instead of blocking the thread while waiting for
+    // the streaming response.
+    AwaitDone done;
+    channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, &done);
+    co_await done.awaitable();
     if (redirect_cntl->Failed()) {
       call_data->finish_with_error(redirect_cntl->ErrorText());
       delete redirect_cntl;
-      return;
+      co_return;
     }
     auto reader = new CustomProgressiveReader<T>(redirect_cntl, call_data);
     // redirect_cntl and reader will be deleted in CustomProgressiveReader.
@@ -248,9 +250,10 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
       call_data->finish_with_error(redirect_cntl->ErrorText());
       delete done;
       delete redirect_cntl;
-      return;
+      co_return;
     }
   }
+  co_return;
 }
 
 template <typename T>
@@ -278,6 +281,10 @@ std::shared_ptr<Request> XllmHttpServiceImpl::generate_request(
             const std::string& message) {
           request_tracer_->log(service_request_id, message);
         };
+  }
+
+  if (req_pb->has_max_tokens()) {
+    request->max_tokens = static_cast<int32_t>(req_pb->max_tokens());
   }
 
   // Set arrival time and TTFT SLO
@@ -334,11 +341,11 @@ void XllmHttpServiceImpl::get_serving(
                                         call_data,
                                         cntl,
                                         serving_method,
-                                        done]() {
+                                        done]() -> CoroTask {
     auto service_request = weak_service_request.lock();
     if (service_request == nullptr) {
       call_data->finish_with_error("Internal error: request expired.");
-      return;
+      co_return;
     }
     brpc::Channel* channel_ptr =
         scheduler_->get_channel(service_request->routing.prefill_name).get();
@@ -346,7 +353,7 @@ void XllmHttpServiceImpl::get_serving(
       LOG(ERROR) << "Get channel failed for target: "
                  << service_request->routing.prefill_name;
       call_data->finish_with_error("Internal error: channel not found.");
-      return;
+      co_return;
     }
     std::string target_uri =
         service_request->routing.prefill_name + serving_method;
@@ -358,8 +365,6 @@ void XllmHttpServiceImpl::get_serving(
     google::protobuf::Closure* callback_done = brpc::NewCallback(
         &handle_get_response, redirect_cntl, call_data, done);
 
-    // Because `done'(last parameter) is NULL, this function waits until
-    // the response comes back or error occurs(including timeout).
     channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, callback_done);
     if (redirect_cntl->Failed()) {
       LOG(ERROR) << "Redirect to instance error: "
@@ -368,6 +373,7 @@ void XllmHttpServiceImpl::get_serving(
       delete callback_done;
       delete redirect_cntl;
     }
+    co_return;
   };
 
   if (!scheduler_->schedule(service_request)) {
@@ -419,11 +425,11 @@ void XllmHttpServiceImpl::Completions(
                                         weak_service_request,
                                         req_pb,
                                         call_data,
-                                        cntl]() {
+                                        cntl]() -> CoroTask {
     auto service_request = weak_service_request.lock();
     if (service_request == nullptr) {
       call_data->finish_with_error("Internal error: request expired.");
-      return;
+      co_return;
     }
 
     // update request protobuf
@@ -457,10 +463,11 @@ void XllmHttpServiceImpl::Completions(
       // cntl->SetFailed("proto to json failed");
       LOG(ERROR) << "proto to json failed";
       call_data->finish_with_error("proto to json failed");
-      return;
+      co_return;
     }
 
-    handle(call_data, req_attachment, service_request, "/v1/completions");
+    co_await handle(call_data, req_attachment, service_request, "/v1/completions");
+    co_return;
   };
 
   if (!req_pb->prompt().empty()) {
@@ -524,11 +531,11 @@ void XllmHttpServiceImpl::ChatCompletions(
                                         weak_service_request,
                                         req_pb,
                                         call_data,
-                                        cntl]() {
+                                        cntl]() -> CoroTask {
     auto service_request = weak_service_request.lock();
     if (service_request == nullptr) {
       call_data->finish_with_error("Internal error: request expired.");
-      return;
+      co_return;
     }
     // update request protobuf
     req_pb->set_service_request_id(service_request->service_request_id);
@@ -561,10 +568,11 @@ void XllmHttpServiceImpl::ChatCompletions(
       // cntl->SetFailed("proto to json failed");
       LOG(ERROR) << "proto to json failed";
       call_data->finish_with_error("proto to json failed");
-      return;
+      co_return;
     }
 
-    handle(call_data, req_attachment, service_request, "/v1/chat/completions");
+    co_await handle(call_data, req_attachment, service_request, "/v1/chat/completions");
+    co_return;
   };
 
   if (req_pb->messages_size() > 0) {

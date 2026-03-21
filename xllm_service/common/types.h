@@ -91,17 +91,37 @@ enum class ModelState : int32_t {
 
 
 struct LoadMetrics {
-  LoadMetrics() : waiting_requests_num(0), gpu_cache_usage_perc(0) {};
+  LoadMetrics() : waiting_requests_num(0), gpu_cache_usage_perc(0),
+      num_used_gpu_blocks(0), num_total_gpu_blocks(0),
+      num_blocks_all_waiting_requests(0), num_running_requests(0),
+      num_blocks_last_running_request(0), num_killed_requests(0) {};
   LoadMetrics(const uint64_t& waiting_reqs_num, const float& usage)
-      : waiting_requests_num(waiting_reqs_num), gpu_cache_usage_perc(usage) {};
+      : waiting_requests_num(waiting_reqs_num), gpu_cache_usage_perc(usage),
+        num_used_gpu_blocks(0), num_total_gpu_blocks(0),
+        num_blocks_all_waiting_requests(0), num_running_requests(0),
+        num_blocks_last_running_request(0), num_killed_requests(0) {};
 
   uint64_t waiting_requests_num;
   float gpu_cache_usage_perc;
+
+  // Extended fields for Llumnix load computation (populated from heartbeat if available)
+  uint64_t num_used_gpu_blocks;
+  uint64_t num_total_gpu_blocks;
+  uint64_t num_blocks_all_waiting_requests;
+  uint64_t num_running_requests;
+  uint64_t num_blocks_last_running_request;
+  uint64_t num_killed_requests;
 
   nlohmann::json serialize_to_json() const {
     nlohmann::json json_val;
     json_val["waiting_requests_num"] = waiting_requests_num;
     json_val["gpu_cache_usage_perc"] = gpu_cache_usage_perc;
+    json_val["num_used_gpu_blocks"] = num_used_gpu_blocks;
+    json_val["num_total_gpu_blocks"] = num_total_gpu_blocks;
+    json_val["num_blocks_all_waiting_requests"] = num_blocks_all_waiting_requests;
+    json_val["num_running_requests"] = num_running_requests;
+    json_val["num_blocks_last_running_request"] = num_blocks_last_running_request;
+    json_val["num_killed_requests"] = num_killed_requests;
     return json_val;
   }
 
@@ -114,6 +134,20 @@ struct LoadMetrics {
       waiting_requests_num =
           json_value.at("waiting_requests_num").get<uint64_t>();
       gpu_cache_usage_perc = json_value.at("gpu_cache_usage_perc").get<float>();
+
+      // Extended fields (optional, backward-compatible with old heartbeat format)
+      if (json_value.contains("num_used_gpu_blocks"))
+        num_used_gpu_blocks = json_value["num_used_gpu_blocks"].get<uint64_t>();
+      if (json_value.contains("num_total_gpu_blocks"))
+        num_total_gpu_blocks = json_value["num_total_gpu_blocks"].get<uint64_t>();
+      if (json_value.contains("num_blocks_all_waiting_requests"))
+        num_blocks_all_waiting_requests = json_value["num_blocks_all_waiting_requests"].get<uint64_t>();
+      if (json_value.contains("num_running_requests"))
+        num_running_requests = json_value["num_running_requests"].get<uint64_t>();
+      if (json_value.contains("num_blocks_last_running_request"))
+        num_blocks_last_running_request = json_value["num_blocks_last_running_request"].get<uint64_t>();
+      if (json_value.contains("num_killed_requests"))
+        num_killed_requests = json_value["num_killed_requests"].get<uint64_t>();
 
     } catch (const std::exception& e) {
       LOG(ERROR) << "json str:" << json_str
@@ -602,6 +636,86 @@ struct JsonTool {
   JsonTool() : type("function") {}
   JsonTool(const std::string& tool_type, const JsonFunction& func)
       : type(tool_type), function(func) {}
+};
+
+// ServerlessLLM baseline configuration
+struct ServerlessLLMConfig {
+  double schedule_interval_s = 1.0;              // Global scheduling interval (faster than Prism)
+  double model_idle_threshold_s = 60.0;          // LRU idle eviction threshold
+  double d2d_speed_gbps = 25.0;                  // D2D transfer speed (Tier 1)
+  double h2d_speed_gbps = 6.0;                   // H2D transfer speed (Tier 2)
+  double drain_alpha = 0.001;                    // Drain time: alpha * running_tokens + beta
+  double drain_beta = 0.5;                       // Drain time constant
+  int32_t target_ongoing_requests = 8;           // Target concurrent requests per instance
+  int32_t min_instances_per_model = 0;           // Minimum instances per model
+  int32_t max_instances_per_model = 8;           // Maximum instances per model
+  bool enable_knapsack_migration = true;         // Enable 0/1 knapsack DP eviction
+  int32_t max_models_per_instance = 4;           // Max colocated models per instance
+  double dispatch_timeout_s = 30.0;              // Request dispatch timeout
+  double dispatch_poll_interval_ms = 100.0;      // Dispatch polling interval
+};
+
+// BlitzScale baseline configuration
+struct BlitzScaleConfig {
+  double schedule_interval_s = 1.0;              // Global scheduling interval
+  double scale_down_threshold_ms = 5000.0;       // Hysteresis before scale-down
+  uint32_t tokens_prefilled_per_sec = 4096;      // Prefill throughput per replica
+  uint32_t tokens_transferred_per_sec = 4096;    // Migration/decode throughput per replica
+  uint32_t max_blocks_per_replica = 16384;       // KV blocks per replica
+  uint32_t block_size = 16;                      // Tokens per KV block
+  double prefill_lower_bound = 0.5;              // Lower utilization bound
+  double prefill_upper_bound = 0.8;              // Upper utilization bound
+  double decode_lower_bound = 0.5;               // Lower memory-pressure bound
+  double decode_upper_bound = 0.8;               // Upper memory-pressure bound
+  double migration_lower_bound = 0.5;            // Lower migration-bandwidth bound
+  double migration_upper_bound = 0.8;            // Upper migration-bandwidth bound
+  int32_t min_prefill_instances = 1;             // Min prefill replicas when active
+  int32_t max_prefill_instances = 8;             // Max prefill replicas
+  int32_t min_decode_instances = 1;              // Min decode replicas when active
+  int32_t max_decode_instances = 8;              // Max decode replicas
+  int32_t max_models_per_instance = 4;           // Max colocated models per instance
+};
+
+// Llumnix baseline configuration
+struct LlumnixConfig {
+  double schedule_interval_s = 1.0;              // Global scheduling interval
+  double model_idle_threshold_s = 60.0;          // Idle eviction threshold
+  double migrate_out_load_threshold = 0.8;       // Migration source threshold
+  int32_t topk_random_dispatch = 1;              // Top-K for random dispatch
+  int32_t max_models_per_instance = 4;           // Max colocated models per instance
+  int32_t min_instances_per_model = 0;           // Min instances per model
+  int32_t max_instances_per_model = 8;           // Max instances per model
+  std::string dispatch_load_metric = "remaining_steps";   // kv_blocks_ratio|remaining_steps
+  std::string migration_load_metric = "remaining_steps";  // kv_blocks_ratio|remaining_steps
+  std::string dispatch_policy = "load";          // load|balanced|queue|rr
+  std::string migration_policy = "defrag";       // balanced|defrag
+  // Busy threshold for dispatch filtering (matches LLUMNIX_KVBLOCKSRATIO_BUSY_THRESHOLD /
+  // LLUMNIX_REMAININGSTEPS_BUSY_THRESHOLD from source). Default 1.0 matches Python's
+  // KVBLOCKSRATIO_BUSY_THRESHOLD. For KV_BLOCKS_RATIO, busy when load >= threshold.
+  // For REMAINING_STEPS, busy when normalized load >= threshold.
+  double dispatch_busy_threshold = 1.0;
+  // R3-4: Separate busy threshold for REMAINING_STEPS metric, matching Python's
+  // REMAININGSTEPS_BUSY_THRESHOLD = 10.0 (raw remaining_steps scale).
+  // KV_BLOCKS_RATIO uses dispatch_busy_threshold (normalized load >= 1.0).
+  double dispatch_busy_threshold_remaining_steps = 10.0;
+};
+
+}  // namespace xllm_service
+
+// Prism baseline configuration
+namespace xllm_service {
+
+struct PrismConfig {
+  double schedule_interval_s = 5.0;              // Global scheduling interval
+  double memory_pool_budget_gb = 6.0;            // KV cache budget per model
+  double model_idle_threshold_s = 50.0;          // Idle eviction threshold
+  double violation_proportion_threshold = 0.1;   // SLO violation diff threshold (10%)
+  double memory_per_request_ratio_threshold = 15.0; // Memory ratio threshold
+  double gpu_cluster_threshold_gb = 5.0;         // GPU clustering threshold
+  std::string migrate_policy = "memory_per_request"; // or "violation"
+  double model_transfer_speed_gbps = 6.0;        // Model weight transfer speed
+  int32_t max_models_per_instance = 4;           // Max colocated models per instance
+  int32_t backend_queue_threshold = 10;          // Max running requests per instance for admission control
 };
 
 }  // namespace xllm_service

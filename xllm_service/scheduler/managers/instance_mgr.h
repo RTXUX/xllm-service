@@ -40,7 +40,7 @@ limitations under the License.
 
 namespace xllm_service {
 
-class InstanceMgr final {
+class InstanceMgr {
  public:
 
   const std::vector<std::pair<std::string, std::string>> MODELS = {
@@ -261,8 +261,7 @@ class InstanceMgr final {
   void link_instance_bidirectional(const std::string& instance_name,
                                    const std::vector<std::string>& peer_names);
 
- private:
-
+ protected:
   // send_http_request(instance_name, ...) uses inst_mutex to get_channel()
   // send_http_request(channel, ...) does not use inst_mutex
   bool send_http_request(const std::string& instance_name,
@@ -272,6 +271,9 @@ class InstanceMgr final {
   bool send_http_request(std::shared_ptr<brpc::Channel> channel,
                          const std::string& uri,
                          const std::string& request_body);
+
+  // Get LoadMetrics for a specific instance (thread-safe read)
+  std::optional<LoadMetrics> get_instance_load_metrics(const std::string& instance_name);
 
  private:
   DISALLOW_COPY_AND_ASSIGN(InstanceMgr);

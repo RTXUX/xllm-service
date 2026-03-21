@@ -82,10 +82,10 @@ class XllmHttpServiceImpl : public proto::XllmHttpService {
                                             const std::string& method);
 
   template <typename T>
-  void handle(std::shared_ptr<T> call_data,
-              const std::string& req_attachment,
-              std::shared_ptr<Request> request,
-              const std::string& method);
+  CoroTask handle(std::shared_ptr<T> call_data,
+                  const std::string& req_attachment,
+                  std::shared_ptr<Request> request,
+                  const std::string& method);
 
   void get_serving(const std::string& serving_method,
                    ::google::protobuf::RpcController* controller,

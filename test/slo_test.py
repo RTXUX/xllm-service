@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 os.environ['no_proxy'] = '*'
 
 # Configuration
-URL = "http://127.0.0.1:27888/v1/completions"
+URL = "http://127.0.0.1:37888/v1/completions"
 MODELS = ["Qwen3-8B"]
 # MODELS = ["Qwen3-8B", "Qwen2-7B"]
 AVG_TOKENS_PER_SECOND = 15000  # Target average input token throughput

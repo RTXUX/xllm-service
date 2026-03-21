@@ -102,6 +102,14 @@ void InstanceMgr::init() {
   init_model_memory_specs();
   init_model_resource_coefficients();
 
+  {
+    std::unique_lock<std::shared_mutex> mgr_lock(model_instance_mgr_mutex_);
+    for (const auto& model_pair : MODELS) {
+      model_instance_mgrs_.try_emplace(
+          model_pair.first, std::make_shared<ModelInstanceMgr>(model_pair.first));
+    }
+  }
+
   if (!options_.disable_steady_pool()) {
     // Start steady pool repack timer thread
     static constexpr int kRepackIntervalSeconds = 30;
@@ -448,6 +456,14 @@ bool InstanceMgr::send_http_request(std::shared_ptr<brpc::Channel> channel,
     return false;
   }
   return true;
+}
+
+std::optional<LoadMetrics> InstanceMgr::get_instance_load_metrics(
+    const std::string& instance_name) {
+  std::shared_lock<std::shared_mutex> lock(load_metric_mutex_);
+  auto it = load_metrics_.find(instance_name);
+  if (it == load_metrics_.end()) return std::nullopt;
+  return it->second;
 }
 
 void InstanceMgr::get_load_metrics(LoadBalanceInfos* infos) {
@@ -1243,7 +1259,10 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
   std::shared_ptr<brpc::Channel> channel = get_channel(instance_name);
 
   // Try to find a D2D source instance (also acquires D2D lock if found)
-  auto d2d_info = find_d2d_source(model_id, instance_name);
+  std::optional<D2DWakeupInfo> d2d_info;
+  if (FLAGS_enable_d2d) {
+    d2d_info = find_d2d_source(model_id, instance_name);
+  }
 
   bool wakeup_success = false;
   if (d2d_info.has_value()) {

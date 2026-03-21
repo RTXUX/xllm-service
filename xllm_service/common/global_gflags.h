@@ -90,3 +90,59 @@ DECLARE_string(gp_dynamic_data_path);
 DECLARE_bool(disable_steady_pool);
 
 DECLARE_int32(elastic_instance_count);
+
+// Prism baseline flags
+DECLARE_string(baseline_type);
+DECLARE_double(prism_schedule_interval_s);
+DECLARE_double(prism_memory_pool_budget_gb);
+DECLARE_double(prism_idle_threshold_s);
+DECLARE_string(prism_migrate_policy);
+DECLARE_int32(prism_max_models_per_instance);
+DECLARE_int32(prism_backend_queue_threshold);
+
+// ServerlessLLM baseline flags
+DECLARE_double(sllm_schedule_interval_s);
+DECLARE_double(sllm_idle_threshold_s);
+DECLARE_double(sllm_d2d_speed_gbps);
+DECLARE_double(sllm_h2d_speed_gbps);
+DECLARE_double(sllm_drain_alpha);
+DECLARE_double(sllm_drain_beta);
+DECLARE_int32(sllm_target_ongoing_requests);
+DECLARE_int32(sllm_min_instances);
+DECLARE_int32(sllm_max_instances);
+DECLARE_bool(sllm_enable_knapsack);
+DECLARE_bool(enable_d2d);
+DECLARE_int32(sllm_max_models_per_instance);
+
+// BlitzScale baseline flags
+DECLARE_double(blitzscale_schedule_interval_s);
+DECLARE_double(blitzscale_scale_down_threshold_ms);
+DECLARE_uint32(blitzscale_tokens_prefilled_per_sec);
+DECLARE_uint32(blitzscale_tokens_transferred_per_sec);
+DECLARE_uint32(blitzscale_max_blocks_per_replica);
+DECLARE_double(blitzscale_prefill_lower_bound);
+DECLARE_double(blitzscale_prefill_upper_bound);
+DECLARE_double(blitzscale_decode_lower_bound);
+DECLARE_double(blitzscale_decode_upper_bound);
+DECLARE_double(blitzscale_migration_lower_bound);
+DECLARE_double(blitzscale_migration_upper_bound);
+DECLARE_int32(blitzscale_min_prefill_instances);
+DECLARE_int32(blitzscale_max_prefill_instances);
+DECLARE_int32(blitzscale_min_decode_instances);
+DECLARE_int32(blitzscale_max_decode_instances);
+DECLARE_int32(blitzscale_max_models_per_instance);
+
+// Llumnix baseline flags
+DECLARE_double(llumnix_schedule_interval_s);
+DECLARE_double(llumnix_idle_threshold_s);
+DECLARE_double(llumnix_migrate_out_load_threshold);
+DECLARE_int32(llumnix_topk_random_dispatch);
+DECLARE_int32(llumnix_max_models_per_instance);
+DECLARE_int32(llumnix_min_instances);
+DECLARE_int32(llumnix_max_instances);
+DECLARE_string(llumnix_dispatch_load_metric);
+DECLARE_string(llumnix_migration_load_metric);
+DECLARE_string(llumnix_dispatch_policy);
+DECLARE_string(llumnix_migration_policy);
+DECLARE_double(llumnix_dispatch_busy_threshold);
+DECLARE_double(llumnix_dispatch_busy_threshold_remaining_steps);

@@ -18,6 +18,7 @@ limitations under the License.
 #include <absl/synchronization/mutex.h>
 
 #include "chat_template/jinja_chat_template.h"
+#include "common/coro.h"
 #include "common/types.h"
 #include "common/xllm/output.h"
 
@@ -80,14 +81,17 @@ struct Request {
   int64_t expected_prefill_done_ms = 0;
 
   // dispatch callback
-  // This callback will be called in a new thread after the request is scheduled.
-  std::function<void()> dispatch_callback = nullptr;
+  // This callback will be called in a detached coroutine after the request is scheduled.
+  std::function<CoroTask()> dispatch_callback = nullptr;
 
   absl::Mutex mutex;
   bool is_scheduled = false;
 
   // true for elastic pool requests: forces max_tokens=1 (prefill-only)
   bool prefill_only = false;
+
+  // max output tokens requested by the client; 0 means unset
+  int32_t max_tokens = 0;
 
   // LstImhPolicy coordinator pre-updates metrics after assigning an instance;
   // process_request_queue checks this flag to avoid double-updating.

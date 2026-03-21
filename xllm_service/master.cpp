@@ -201,7 +201,65 @@ int main(int argc, char* argv[]) {
       .slo_penalty_factor(FLAGS_slo_penalty_factor)
       .max_slo_expansions(FLAGS_max_slo_expansions)
       .disable_steady_pool(FLAGS_disable_steady_pool)
-      .elastic_instance_count(FLAGS_elastic_instance_count);
+      .elastic_instance_count(FLAGS_elastic_instance_count)
+      .baseline_type(FLAGS_baseline_type)
+      .prism_schedule_interval_s(FLAGS_prism_schedule_interval_s)
+      .prism_memory_pool_budget_gb(FLAGS_prism_memory_pool_budget_gb)
+      .prism_idle_threshold_s(FLAGS_prism_idle_threshold_s)
+      .prism_migrate_policy(FLAGS_prism_migrate_policy)
+      .prism_max_models_per_instance(FLAGS_prism_max_models_per_instance)
+      .sllm_schedule_interval_s(FLAGS_sllm_schedule_interval_s)
+      .sllm_idle_threshold_s(FLAGS_sllm_idle_threshold_s)
+      .sllm_d2d_speed_gbps(FLAGS_sllm_d2d_speed_gbps)
+      .sllm_h2d_speed_gbps(FLAGS_sllm_h2d_speed_gbps)
+      .sllm_drain_alpha(FLAGS_sllm_drain_alpha)
+      .sllm_drain_beta(FLAGS_sllm_drain_beta)
+      .sllm_target_ongoing_requests(FLAGS_sllm_target_ongoing_requests)
+      .sllm_min_instances(FLAGS_sllm_min_instances)
+      .sllm_max_instances(FLAGS_sllm_max_instances)
+      .sllm_enable_knapsack(FLAGS_sllm_enable_knapsack)
+      .sllm_max_models_per_instance(FLAGS_sllm_max_models_per_instance)
+      .blitzscale_schedule_interval_s(FLAGS_blitzscale_schedule_interval_s)
+      .blitzscale_scale_down_threshold_ms(
+          FLAGS_blitzscale_scale_down_threshold_ms)
+      .blitzscale_tokens_prefilled_per_sec(
+          FLAGS_blitzscale_tokens_prefilled_per_sec)
+      .blitzscale_tokens_transferred_per_sec(
+          FLAGS_blitzscale_tokens_transferred_per_sec)
+      .blitzscale_max_blocks_per_replica(
+          FLAGS_blitzscale_max_blocks_per_replica)
+      .blitzscale_prefill_lower_bound(FLAGS_blitzscale_prefill_lower_bound)
+      .blitzscale_prefill_upper_bound(FLAGS_blitzscale_prefill_upper_bound)
+      .blitzscale_decode_lower_bound(FLAGS_blitzscale_decode_lower_bound)
+      .blitzscale_decode_upper_bound(FLAGS_blitzscale_decode_upper_bound)
+      .blitzscale_migration_lower_bound(
+          FLAGS_blitzscale_migration_lower_bound)
+      .blitzscale_migration_upper_bound(
+          FLAGS_blitzscale_migration_upper_bound)
+      .blitzscale_min_prefill_instances(
+          FLAGS_blitzscale_min_prefill_instances)
+      .blitzscale_max_prefill_instances(
+          FLAGS_blitzscale_max_prefill_instances)
+      .blitzscale_min_decode_instances(
+          FLAGS_blitzscale_min_decode_instances)
+      .blitzscale_max_decode_instances(
+          FLAGS_blitzscale_max_decode_instances)
+      .blitzscale_max_models_per_instance(
+          FLAGS_blitzscale_max_models_per_instance)
+      .llumnix_schedule_interval_s(FLAGS_llumnix_schedule_interval_s)
+      .llumnix_idle_threshold_s(FLAGS_llumnix_idle_threshold_s)
+      .llumnix_migrate_out_load_threshold(FLAGS_llumnix_migrate_out_load_threshold)
+      .llumnix_topk_random_dispatch(FLAGS_llumnix_topk_random_dispatch)
+      .llumnix_max_models_per_instance(FLAGS_llumnix_max_models_per_instance)
+      .llumnix_min_instances(FLAGS_llumnix_min_instances)
+      .llumnix_max_instances(FLAGS_llumnix_max_instances)
+      .llumnix_dispatch_load_metric(FLAGS_llumnix_dispatch_load_metric)
+      .llumnix_migration_load_metric(FLAGS_llumnix_migration_load_metric)
+      .llumnix_dispatch_policy(FLAGS_llumnix_dispatch_policy)
+      .llumnix_migration_policy(FLAGS_llumnix_migration_policy)
+      .llumnix_dispatch_busy_threshold(FLAGS_llumnix_dispatch_busy_threshold)
+      .llumnix_dispatch_busy_threshold_remaining_steps(
+          FLAGS_llumnix_dispatch_busy_threshold_remaining_steps);
 
   if (options.disable_steady_pool()) {
     LOG(INFO) << "Steady pool DISABLED: all models will use elastic pool "

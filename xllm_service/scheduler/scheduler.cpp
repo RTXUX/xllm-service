@@ -15,11 +15,18 @@ limitations under the License.
 
 #include "scheduler/scheduler.h"
 
+#include "common/coro.h"
+
 #include "common/xllm/status.h"
 #include "loadbalance_policy/cache_aware_routing.h"
 #include "loadbalance_policy/lst_imh_policy.h"
 #include "loadbalance_policy/round_robin.h"
 #include "loadbalance_policy/slo_aware_policy.h"
+#include "scheduler/blitzscale/blitzscale_instance_mgr.h"
+#include "scheduler/prism/prism_instance_mgr.h"
+#include "scheduler/prism/prism_request_tracker.h"
+#include "scheduler/serverless_llm/serverless_llm_instance_mgr.h"
+#include "scheduler/llumnix/llumnix_instance_mgr.h"
 #include "tokenizer/tokenizer_factory.h"
 
 #include <absl/time/clock.h>
@@ -46,8 +53,115 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
     LOG(INFO) << "Set current service as master!";
   }
 
-  instance_mgr_ =
-      std::make_unique<InstanceMgr>(options, etcd_client_, is_master_service_);
+  prism_mode_ = (options.baseline_type() == "PRISM");
+  serverless_llm_mode_ = (options.baseline_type() == "SERVERLESS_LLM");
+  blitzscale_mode_ = (options.baseline_type() == "BLITZSCALE");
+  llumnix_mode_ = (options.baseline_type() == "LLUMNIX");
+
+  if (prism_mode_) {
+    PrismConfig prism_config;
+    prism_config.schedule_interval_s = options.prism_schedule_interval_s();
+    prism_config.memory_pool_budget_gb = options.prism_memory_pool_budget_gb();
+    prism_config.model_idle_threshold_s = options.prism_idle_threshold_s();
+    prism_config.migrate_policy = options.prism_migrate_policy();
+    prism_config.max_models_per_instance = options.prism_max_models_per_instance();
+    prism_config.backend_queue_threshold = options.prism_backend_queue_threshold();
+
+    auto prism_mgr = std::make_shared<PrismInstanceMgr>(
+        options, etcd_client_, is_master_service_, prism_config);
+    prism_mgr->start_global_scheduler();
+    instance_mgr_ = prism_mgr;  // polymorphic assignment
+
+    LOG(INFO) << "Scheduler: Prism mode enabled";
+  } else if (serverless_llm_mode_) {
+    ServerlessLLMConfig sllm_config;
+    sllm_config.schedule_interval_s = options.sllm_schedule_interval_s();
+    sllm_config.model_idle_threshold_s = options.sllm_idle_threshold_s();
+    sllm_config.d2d_speed_gbps = options.sllm_d2d_speed_gbps();
+    sllm_config.h2d_speed_gbps = options.sllm_h2d_speed_gbps();
+    sllm_config.drain_alpha = options.sllm_drain_alpha();
+    sllm_config.drain_beta = options.sllm_drain_beta();
+    sllm_config.target_ongoing_requests = options.sllm_target_ongoing_requests();
+    sllm_config.min_instances_per_model = options.sllm_min_instances();
+    sllm_config.max_instances_per_model = options.sllm_max_instances();
+    sllm_config.enable_knapsack_migration = options.sllm_enable_knapsack();
+    sllm_config.max_models_per_instance = options.sllm_max_models_per_instance();
+
+    auto sllm_mgr = std::make_shared<ServerlessLLMInstanceMgr>(
+        options, etcd_client_, is_master_service_, sllm_config);
+    sllm_mgr->start_global_scheduler();
+    instance_mgr_ = sllm_mgr;  // polymorphic assignment
+
+    LOG(INFO) << "Scheduler: ServerlessLLM mode enabled";
+  } else if (blitzscale_mode_) {
+    BlitzScaleConfig blitzscale_config;
+    blitzscale_config.schedule_interval_s =
+        options.blitzscale_schedule_interval_s();
+    blitzscale_config.scale_down_threshold_ms =
+        options.blitzscale_scale_down_threshold_ms();
+    blitzscale_config.tokens_prefilled_per_sec =
+        options.blitzscale_tokens_prefilled_per_sec();
+    blitzscale_config.tokens_transferred_per_sec =
+        options.blitzscale_tokens_transferred_per_sec();
+    blitzscale_config.max_blocks_per_replica =
+        options.blitzscale_max_blocks_per_replica();
+    blitzscale_config.block_size = options.block_size();
+    blitzscale_config.prefill_lower_bound =
+        options.blitzscale_prefill_lower_bound();
+    blitzscale_config.prefill_upper_bound =
+        options.blitzscale_prefill_upper_bound();
+    blitzscale_config.decode_lower_bound =
+        options.blitzscale_decode_lower_bound();
+    blitzscale_config.decode_upper_bound =
+        options.blitzscale_decode_upper_bound();
+    blitzscale_config.migration_lower_bound =
+        options.blitzscale_migration_lower_bound();
+    blitzscale_config.migration_upper_bound =
+        options.blitzscale_migration_upper_bound();
+    blitzscale_config.min_prefill_instances =
+        options.blitzscale_min_prefill_instances();
+    blitzscale_config.max_prefill_instances =
+        options.blitzscale_max_prefill_instances();
+    blitzscale_config.min_decode_instances =
+        options.blitzscale_min_decode_instances();
+    blitzscale_config.max_decode_instances =
+        options.blitzscale_max_decode_instances();
+    blitzscale_config.max_models_per_instance =
+        options.blitzscale_max_models_per_instance();
+
+    auto blitzscale_mgr = std::make_shared<BlitzScaleInstanceMgr>(
+        options, etcd_client_, is_master_service_, blitzscale_config);
+    blitzscale_mgr->start_global_scheduler();
+    instance_mgr_ = blitzscale_mgr;
+
+    LOG(INFO) << "Scheduler: BlitzScale mode enabled";
+  } else if (llumnix_mode_) {
+    LlumnixConfig llumnix_config;
+    llumnix_config.schedule_interval_s = options.llumnix_schedule_interval_s();
+    llumnix_config.model_idle_threshold_s = options.llumnix_idle_threshold_s();
+    llumnix_config.migrate_out_load_threshold = options.llumnix_migrate_out_load_threshold();
+    llumnix_config.topk_random_dispatch = options.llumnix_topk_random_dispatch();
+    llumnix_config.max_models_per_instance = options.llumnix_max_models_per_instance();
+    llumnix_config.min_instances_per_model = options.llumnix_min_instances();
+    llumnix_config.max_instances_per_model = options.llumnix_max_instances();
+    llumnix_config.dispatch_load_metric = options.llumnix_dispatch_load_metric();
+    llumnix_config.migration_load_metric = options.llumnix_migration_load_metric();
+    llumnix_config.dispatch_policy = options.llumnix_dispatch_policy();
+    llumnix_config.migration_policy = options.llumnix_migration_policy();
+    llumnix_config.dispatch_busy_threshold = options.llumnix_dispatch_busy_threshold();
+    llumnix_config.dispatch_busy_threshold_remaining_steps =
+        options.llumnix_dispatch_busy_threshold_remaining_steps();
+
+    auto llumnix_mgr = std::make_shared<LlumnixInstanceMgr>(
+        options, etcd_client_, is_master_service_, llumnix_config);
+    llumnix_mgr->start_global_scheduler();
+    instance_mgr_ = llumnix_mgr;  // polymorphic assignment
+
+    LOG(INFO) << "Scheduler: Llumnix mode enabled";
+  } else {
+    instance_mgr_ =
+        std::make_shared<InstanceMgr>(options, etcd_client_, is_master_service_);
+  }
 
   global_kvcache_mgr_ = std::make_shared<GlobalKVCacheMgr>(
       options, etcd_client_, is_master_service_);
@@ -64,8 +178,7 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
   }
 
   if (is_master_service_) {
-    heartbeat_thread_ = std::make_unique<std::thread>(
-        &Scheduler::update_master_service_heartbeat, this);
+    Coroutine(heartbeat_coro(), /*detach=*/true);
   } else {
     auto handle_master = std::bind(&Scheduler::handle_master_service_watch,
                                    this,
@@ -162,6 +275,30 @@ void Scheduler::process_request_queue(const std::string& model_name) {
       continue;
     }
 
+    // Prism mode: bypass dual-pool, use PrismInstanceMgr dispatch
+    if (prism_mode_) {
+      process_prism_request(request);
+      continue;
+    }
+
+    // ServerlessLLM mode: bypass dual-pool, use ServerlessLLMInstanceMgr dispatch
+    if (serverless_llm_mode_) {
+      process_serverless_llm_request(request);
+      continue;
+    }
+
+    // BlitzScale mode: bypass dual-pool, use BlitzScaleInstanceMgr dispatch
+    if (blitzscale_mode_) {
+      process_blitzscale_request(request);
+      continue;
+    }
+
+    // Llumnix mode: bypass dual-pool, use LlumnixInstanceMgr dispatch
+    if (llumnix_mode_) {
+      process_llumnix_request(request);
+      continue;
+    }
+
     // Dual-pool routing
     PoolType pool = instance_mgr_->get_model_pool(request->model);
 
@@ -231,7 +368,7 @@ void Scheduler::process_request_queue(const std::string& model_name) {
     }
 
     if (request->dispatch_callback) {
-      dispatch_pool_.schedule([request]() { request->dispatch_callback(); });
+      Coroutine(request->dispatch_callback(), /*detach=*/true);
     }
 
     // Post-dispatch: trigger elastic scaling with try_lock to avoid blocking.
@@ -247,12 +384,140 @@ std::shared_ptr<brpc::Channel> Scheduler::get_channel(
   return instance_mgr_->get_channel(target_name);
 }
 
-void Scheduler::update_master_service_heartbeat() {
+void Scheduler::process_prism_request(std::shared_ptr<Request> request) {
+  auto prism_mgr = std::static_pointer_cast<PrismInstanceMgr>(instance_mgr_);
+
+  // 1. Register request in Prism tracker
+  auto prism_req = std::make_shared<PrismReq>();
+  prism_req->rid = request->service_request_id;
+  prism_req->model = request->model;
+  prism_req->arrival_time = PrismRequestTracker::now_seconds();
+  prism_req->slo = (request->ttft_slo_ms > 0)
+                       ? request->ttft_slo_ms / 1000.0
+                       : 30.0;
+  prism_req->prompt_len = static_cast<int32_t>(request->token_ids.size());
+  prism_req->state = PrismReqState::WAITING;
+  prism_mgr->enqueue_prism_request(request->model, prism_req);
+
+  // 2. Wait for an available instance using CV-based blocking (no busy-poll)
+  bool dispatched = prism_mgr->dispatch_prism_request_blocking(request, 30.0);
+
+  if (!dispatched) {
+    LOG(ERROR) << "Prism: timeout waiting for model " << request->model
+               << " request_id=" << request->service_request_id;
+    prism_mgr->finish_prism_request(prism_req->rid);
+    return;
+  }
+
+  // 3. Mark as running
+  prism_mgr->start_prism_running(prism_req->rid, request->routing.prefill_name);
+
+  DLOG(INFO) << "Prism: dispatched " << request->service_request_id
+             << " to " << request->routing.prefill_name;
+
+  // 4. Update request metrics
+  if (request->prompt.size() != 0 && !request->metrics_already_updated) {
+    instance_mgr_->update_request_metrics(request, RequestAction::SCHEDULE);
+  }
+
+  if (request->dispatch_callback) {
+    Coroutine(request->dispatch_callback(), /*detach=*/true);
+  }
+}
+
+void Scheduler::process_serverless_llm_request(
+    std::shared_ptr<Request> request) {
+  auto sllm_mgr =
+      std::static_pointer_cast<ServerlessLLMInstanceMgr>(instance_mgr_);
+
+  // 1. Register request in ServerlessLLM tracker
+  sllm_mgr->enqueue_request(request->model, request->service_request_id);
+
+  // 2. Wait for an available instance (global scheduler will activate models)
+  bool dispatched = false;
+  for (int retry = 0; retry < 300 && !exited_; ++retry) {
+    if (sllm_mgr->dispatch_request(request)) {
+      dispatched = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  if (!dispatched) {
+    LOG(ERROR) << "ServerlessLLM: timeout waiting for model " << request->model
+               << " request_id=" << request->service_request_id;
+    sllm_mgr->finish_request(request->service_request_id);
+    return;
+  }
+
+  // 3. Mark as running
+  sllm_mgr->start_running(request->service_request_id,
+                           request->routing.prefill_name);
+
+  DLOG(INFO) << "ServerlessLLM: dispatched " << request->service_request_id
+             << " to " << request->routing.prefill_name;
+
+  // 4. Update request metrics
+  if (request->prompt.size() != 0 && !request->metrics_already_updated) {
+    instance_mgr_->update_request_metrics(request, RequestAction::SCHEDULE);
+  }
+
+  if (request->dispatch_callback) {
+    Coroutine(request->dispatch_callback(), /*detach=*/true);
+  }
+}
+
+void Scheduler::process_blitzscale_request(std::shared_ptr<Request> request) {
+  auto blitzscale_mgr =
+      std::static_pointer_cast<BlitzScaleInstanceMgr>(instance_mgr_);
+  blitzscale_mgr->add_pending_request(request);
+}
+
+void Scheduler::process_llumnix_request(std::shared_ptr<Request> request) {
+  auto llumnix_mgr =
+      std::static_pointer_cast<LlumnixInstanceMgr>(instance_mgr_);
+
+  // 1. Register request in Llumnix tracker
+  llumnix_mgr->enqueue_request(request->model, request->service_request_id);
+
+  // 2. Wait for an available instance (global scheduler will activate models)
+  bool dispatched = false;
+  for (int retry = 0; retry < 300 && !exited_; ++retry) {
+    if (llumnix_mgr->dispatch_request(request)) {
+      dispatched = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  if (!dispatched) {
+    LOG(ERROR) << "Llumnix: timeout waiting for model " << request->model
+               << " request_id=" << request->service_request_id;
+    llumnix_mgr->finish_request(request->service_request_id);
+    return;
+  }
+
+  // 3. Mark as running
+  llumnix_mgr->start_running(request->service_request_id,
+                              request->routing.prefill_name);
+
+  DLOG(INFO) << "Llumnix: dispatched " << request->service_request_id
+             << " to " << request->routing.prefill_name;
+
+  // 4. Update request metrics
+  if (request->prompt.size() != 0 && !request->metrics_already_updated) {
+    instance_mgr_->update_request_metrics(request, RequestAction::SCHEDULE);
+  }
+
+  if (request->dispatch_callback) {
+    Coroutine(request->dispatch_callback(), /*detach=*/true);
+  }
+}
+
+CoroTask Scheduler::heartbeat_coro() {
   while (!exited_) {
-    std::this_thread::sleep_for(std::chrono::seconds(kHeartbeatInterval));
-
+    co_await Coroutine::usleep(kHeartbeatInterval * 1'000'000);
     global_kvcache_mgr_->upload_kvcache();
-
     instance_mgr_->upload_load_metrics();
   }
 }
@@ -296,8 +561,7 @@ void Scheduler::handle_master_service_watch(const etcd::Response& response,
                         kHeartbeatInterval)) {
     is_master_service_ = true;
 
-    heartbeat_thread_ = std::make_unique<std::thread>(
-        &Scheduler::update_master_service_heartbeat, this);
+    Coroutine(heartbeat_coro(), /*detach=*/true);
 
     global_kvcache_mgr_->set_as_master();
     instance_mgr_->set_as_master();
@@ -452,6 +716,33 @@ void Scheduler::finish_request(const std::string& service_request_id,
     }
   }
 
+  // Notify Prism tracker of request completion
+  if (prism_mode_) {
+    auto prism_mgr = std::static_pointer_cast<PrismInstanceMgr>(instance_mgr_);
+    prism_mgr->finish_prism_request(service_request_id);
+  }
+
+  // Notify ServerlessLLM tracker of request completion
+  if (serverless_llm_mode_) {
+    auto sllm_mgr =
+        std::static_pointer_cast<ServerlessLLMInstanceMgr>(instance_mgr_);
+    sllm_mgr->finish_request(service_request_id);
+  }
+
+  // Notify BlitzScale tracker of request completion
+  if (blitzscale_mode_) {
+    auto blitzscale_mgr =
+        std::static_pointer_cast<BlitzScaleInstanceMgr>(instance_mgr_);
+    blitzscale_mgr->finish_request(service_request_id);
+  }
+
+  // Notify Llumnix tracker of request completion
+  if (llumnix_mode_) {
+    auto llumnix_mgr =
+        std::static_pointer_cast<LlumnixInstanceMgr>(instance_mgr_);
+    llumnix_mgr->finish_request(service_request_id);
+  }
+
   {
     std::lock_guard<std::mutex> guard(thread_map_mutex_);
     remote_requests_output_thread_map_.erase(service_request_id);
@@ -523,6 +814,13 @@ void Scheduler::update_request_metrics_for_prefill(
   // wake its coordinator, other policies ignore it).
   if (!prefill_instance.empty() && lb_policy_) {
     lb_policy_->on_prefill_done(prefill_instance);
+  }
+
+  // Notify BlitzScale dispatch thread: this prefill instance is now idle
+  if (blitzscale_mode_ && !prefill_instance.empty()) {
+    auto blitzscale_mgr =
+        std::static_pointer_cast<BlitzScaleInstanceMgr>(instance_mgr_);
+    blitzscale_mgr->notify_prefill_done(prefill_instance);
   }
 
 }
