@@ -529,12 +529,12 @@ BlitzScaleInstanceMgr::gen_model_actions(const std::string& model_id) {
 
   
 
-  const int32_t active_count = get_active_count(model_id);
+  // const int32_t active_count = get_active_count(model_id);
   const int32_t waiting_prefill_tokens = get_waiting_prefill_tokens(model_id);
   const int32_t waiting_decode_blocks =
-      (active_count > 0) ? compute_waiting_decode_blocks(model_id) : 0;
+      /* (active_count > 0) ?  */compute_waiting_decode_blocks(model_id)/*  : 0 */;
   const int32_t prefill_tokens =
-      (active_count > 0) ? compute_prefill_tokens(model_id) : 0;
+     /*  (active_count > 0) ?  */compute_prefill_tokens(model_id)/*  : 0 */;
 
   LOG(INFO) << "BlitzScale: planning actions for model " << model_id
             << " waiting_count=" << waiting_count
