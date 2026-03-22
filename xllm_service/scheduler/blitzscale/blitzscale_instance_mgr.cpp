@@ -104,9 +104,6 @@ void BlitzScaleInstanceMgr::add_pending_request(
 void BlitzScaleInstanceMgr::enqueue_idle_prefill(
     const std::string& model_id, const std::string& instance_name) {
   idle_prefill_queues_[model_id]->push(instance_name);
-  LOG(INFO) << "BlitzScale: idle_prefill enqueue model=" << model_id
-            << " instance=" << instance_name
-            << " queue_size=" << idle_prefill_queues_[model_id]->size();
   dispatch_notify_.push(model_id);
 }
 
@@ -392,11 +389,6 @@ void BlitzScaleInstanceMgr::dispatch_pending_requests() {
 
       const std::string& prefill_instance = *prefill_opt;
       const auto& front = *front_opt;
-
-      LOG(INFO) << "BlitzScale: dispatch selecting model=" << model
-                << " prefill=" << prefill_instance
-                << " idle_queue_size=" << idle_q->size()
-                << " pending=" << pq->size();
 
       // Check timeout via enqueue_time stored in ReqInfo (shared read lock).
       double enqueue_time = 0.0;
