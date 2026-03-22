@@ -798,11 +798,13 @@ bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
 void Scheduler::update_request_metrics_for_prefill(
     const std::string& service_request_id) {
   std::string prefill_instance;
+  std::string model_id;
   {
     std::lock_guard<std::mutex> guard(request_mutex_);
     auto it = requests_.find(service_request_id);
     if (it != requests_.end()) {
       prefill_instance = it->second->routing.prefill_name;
+      model_id = it->second->model;
       it->second->num_generated_tokens += 1;
       // update instance request metrics for prefill finished request
       instance_mgr_->update_request_metrics(it->second,
@@ -820,7 +822,7 @@ void Scheduler::update_request_metrics_for_prefill(
   if (blitzscale_mode_ && !prefill_instance.empty()) {
     auto blitzscale_mgr =
         std::static_pointer_cast<BlitzScaleInstanceMgr>(instance_mgr_);
-    blitzscale_mgr->notify_prefill_done(prefill_instance);
+    blitzscale_mgr->notify_prefill_done(prefill_instance, model_id);
   }
 
 }

@@ -41,8 +41,10 @@ class BlitzScaleInstanceMgr : public InstanceMgr {
   void add_pending_request(std::shared_ptr<Request> request);
 
   // Called when prefill_instance finishes a prefill: marks it idle and wakes
-  // the dispatch thread so it can pull the next pending request
-  void notify_prefill_done(const std::string& prefill_instance);
+  // the dispatch thread so it can pull the next pending request.
+  // model_id must be the model of the request that just completed.
+  void notify_prefill_done(const std::string& prefill_instance,
+                           const std::string& model_id);
 
   void start_running(const std::string& request_id,
                      const std::string& prefill_instance,

@@ -104,34 +104,22 @@ void BlitzScaleInstanceMgr::add_pending_request(
 void BlitzScaleInstanceMgr::enqueue_idle_prefill(
     const std::string& model_id, const std::string& instance_name) {
   idle_prefill_queues_[model_id]->push(instance_name);
+  LOG(INFO) << "BlitzScale: idle_prefill enqueue model=" << model_id
+            << " instance=" << instance_name
+            << " queue_size=" << idle_prefill_queues_[model_id]->size();
   dispatch_notify_.push(model_id);
 }
 
 void BlitzScaleInstanceMgr::notify_prefill_done(
-    const std::string& prefill_instance) {
-  // Find which model(s) this instance serves as prefill, then re-enqueue it
-  // as idle so the dispatch thread can pair it with the next pending request.
-  std::vector<std::string> models;
-  {
-    std::lock_guard<std::mutex> lk(role_mutex_);
-    for (const auto& [model_id, instances] : prefill_instances_) {
-      if (instances.count(prefill_instance)) {
-        models.push_back(model_id);
-      }
-    }
-  }
-  if (models.empty()) {
-    DEBUG_LOG(WARNING,
-              "BlitzScale: notify_prefill_done({}) found no model in prefill_instances_"
-              " — likely removed by concurrent sync_role_state."
-              " Will recover within {}s.",
-              prefill_instance, config_.schedule_interval_s);
-  }
-  for (const auto& model_id : models) {
-    DEBUG_LOG(INFO, "BlitzScale: notify_prefill_done re-enqueuing {} for model={}",
-              prefill_instance, model_id);
-    enqueue_idle_prefill(model_id, prefill_instance);
-  }
+    const std::string& prefill_instance, const std::string& model_id) {
+  // Re-enqueue only for the model whose request just completed. Enqueueing for
+  // all registered models would cause idle-queue accumulation when the same
+  // physical instance is registered for multiple models (e.g. during scaler
+  // role reassignment).
+  if (model_id.empty()) return;
+  DEBUG_LOG(INFO, "BlitzScale: notify_prefill_done re-enqueuing {} for model={}",
+            prefill_instance, model_id);
+  enqueue_idle_prefill(model_id, prefill_instance);
 }
 
 void BlitzScaleInstanceMgr::start_running(const std::string& request_id,
@@ -404,6 +392,11 @@ void BlitzScaleInstanceMgr::dispatch_pending_requests() {
 
       const std::string& prefill_instance = *prefill_opt;
       const auto& front = *front_opt;
+
+      LOG(INFO) << "BlitzScale: dispatch selecting model=" << model
+                << " prefill=" << prefill_instance
+                << " idle_queue_size=" << idle_q->size()
+                << " pending=" << pq->size();
 
       // Check timeout via enqueue_time stored in ReqInfo (shared read lock).
       double enqueue_time = 0.0;
@@ -1190,7 +1183,7 @@ std::pair<int32_t, int32_t> BlitzScaleInstanceMgr::compute_scale_plan(
   int32_t min_decode = std::max(min_decode_mem, min_decode_kv);
   int32_t max_decode = std::max({max_decode_mem, max_decode_kv, min_decode});
   if (current_decode == 0) {
-    desired_decode = std::max(1, config_.min_decode_instances);
+    desired_decode = config_.min_decode_instances;
   } else if (min_decode > current_decode) {
     desired_decode = (min_decode + max_decode + 1) / 2;
   } else if (max_decode < current_decode) {
